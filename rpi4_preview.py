@@ -2,6 +2,8 @@
 
 #switch from using environment variables to pulling variables from setup.py
 #figure out how to both run from command line and using the variables set by setup.py
+#testing the commit functionality in VS code!
+
 from picamera2 import Picamera2, Preview
 import time
 import argparse

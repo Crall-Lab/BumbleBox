@@ -273,20 +273,22 @@ def trackTagsFromVid(filepath, todays_folder_path, filename, tag_dictionary, box
 
 			frame_num += 1
 			print(f"processed frame {frame_num}")  
-		
-		df = pd.DataFrame(raw)
-		df = df.rename(columns = {0:'filename', 1:'colony number', 2:'datetime', 3:'frame', 4:'ID', 5:'centroidX', 6:'centroidY', 7:'frontX', 8:'frontY'})
-		df.to_csv(todays_folder_path + "/" + filename + '_raw.csv')
-		print('saved raw csv')
-		
-		df2 = pd.DataFrame(noID)
-		df2 = df2.rename(columns = {0:'filename', 1:'colony number', 2:'datetime', 3:'frame', 4:'ID', 5:'centroidX', 6:'centroidY', 7:'frontX', 8:'frontY'})
-		df2.to_csv(todays_folder_path + "/" + filename + '_noID.csv')
-		print('saved noID csv')
+		else:
+			break
+			
+	df = pd.DataFrame(raw)
+	df = df.rename(columns = {0:'filename', 1:'colony number', 2:'datetime', 3:'frame', 4:'ID', 5:'centroidX', 6:'centroidY', 7:'frontX', 8:'frontY'})
+	df.to_csv(todays_folder_path + "/" + filename + '_raw.csv')
+	print('saved raw csv')
+	
+	df2 = pd.DataFrame(noID)
+	df2 = df2.rename(columns = {0:'filename', 1:'colony number', 2:'datetime', 3:'frame', 4:'ID', 5:'centroidX', 6:'centroidY', 7:'frontX', 8:'frontY'})
+	df2.to_csv(todays_folder_path + "/" + filename + '_noID.csv')
+	print('saved noID csv')
 
-		print("Average number of tags found: " + str(len(df.index)/frame_num))
-		tracking_time = time.time() - start
-		print(f"Tag tracking took {tracking_time} seconds, an average of {tracking_time / frame_num} seconds per frame") 
+	print("Average number of tags found: " + str(len(df.index)/frame_num))
+	tracking_time = time.time() - start
+	print(f"Tag tracking took {tracking_time} seconds, an average of {tracking_time / frame_num} seconds per frame") 
 		return df, df2, frame_num
 
 
