@@ -17,14 +17,14 @@ from libcamera import controls
 import os
 import behavioral_metrics
 import setup
-import logging
+#import logging
 from data_cleaning import interpolate
 import pwd
 
 username = pwd.getpwuid(os.getuid())[0]
-logging.basicConfig(filename=f'/home/{username}/Desktop/BumbleBox/logs/log.log',encoding='utf-8',format='%(filename)s %(asctime)s: %(message)s', filemode='a', level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+#logging.basicConfig(filename=f'/home/{username}/Desktop/BumbleBox/logs/log.log',encoding='utf-8',format='%(filename)s %(asctime)s: %(message)s', filemode='a', level=logging.DEBUG)
+#logger = logging.getLogger(__name__)
+#logger.setLevel(logging.DEBUG)
 
 # to do - 
 # transfer tag tracking code to video recording so it happens after videos record as well
@@ -201,7 +201,8 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
         df.to_csv(todays_folder_path + "/" + filename + '_raw.csv', index=False)
         print(f'saved raw csv to {todays_folder_path}{filename}_raw.csv')
     except Exception as e:
-        logger.exception("Exception occurred: %s", str(e))
+        print("Exception occurred: %s", str(e))
+        #logger.exception("Exception occurred: %s", str(e))
         
     try:
         df2 = pd.DataFrame(noID)
@@ -209,7 +210,8 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
         df2.to_csv(todays_folder_path + "/" + filename + '_noID.csv', index=False)
         print(f'saved noID csv to {todays_folder_path}{filename}_noID.csv')
     except Exception as e:
-        logger.exception("Exception occurred: %s", str(e))
+        print("Exception occurred: %s", str(e))
+        #logger.exception("Exception occurred: %s", str(e))
         
     
 
@@ -218,10 +220,12 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
     print(f"Tag tracking took {round(tracking_time,2)} seconds, an average of {round(tracking_time / frame_num,2)} seconds per frame") 
     
     if df.empty == True:
-        logger.warning("df is empty")
+        print("df is empty")
+        #logger.warning("df is empty")
         
     if df2.empty == True:
-        logger.warning("df2 is empty")
+        print("df2 is empty")
+        #logger.warning("df2 is empty")
     
     return df, df2, frame_num
     
@@ -231,9 +235,9 @@ def main():
     #check whether this script is being run via cron or in terminal/via Geany or some other text editor
     if sys.stdout.isatty():
         print("Running tag tracking script from terminal")
-        logger.debug("Running tag tracking script from terminal")
+        #logger.debug("Running tag tracking script from terminal")
     else:
-        logger.debug("Running tag tracking script via crontab")
+        #logger.debug("Running tag tracking script via crontab")
         print("Running tag tracking script via crontab")
     
     if setup.create_composite_nest_images == True:
@@ -242,7 +246,7 @@ def main():
         now = datetime.now()
         
         if gen_im_time.hour == now.hour and gen_im_time.minute == now.minute:
-            logger.debug("Exiting because the generate_nest_images.py script is running now")
+            #logger.debug("Exiting because the generate_nest_images.py script is running now")
             return print("ending now because the image generation function should be running")
         
         
@@ -296,4 +300,4 @@ def main():
 if __name__ == '__main__':
     
     main()
-    logging.shutdown()
+    #logging.shutdown()
