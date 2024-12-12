@@ -2,7 +2,7 @@
 
 import pandas as pd
 import numpy as np
-import logging
+#import logging
 import setup
 from datetime import datetime as dt
 from datetime import date
@@ -14,9 +14,9 @@ from data_cleaning import interpolate
 #Enter a folder path to run this script on data youve already collected without calculating behavior metrics. Type the path to the parent folder of your data
 folder_path = '/mnt/bumblebox/data' #Otherwise it should be set to None
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logger.debug("importing behavioral metrics")
+#logger = logging.getLogger(__name__)
+#logger.setLevel(logging.INFO)
+#logger.debug("importing behavioral metrics")
 
 def compute_speed(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int, moving_threshold: float, todays_folder_path: str, filename: str) -> pd.DataFrame:
  
@@ -208,12 +208,14 @@ def compute_video_averages(df: pd.DataFrame, todays_folder_path: str, filename: 
     try:
         video_tally = video_tally[['filename','ID','average distance from center','average speed','frames tracked in video']]
     except Exception as e:
-        logger.debug("Exception occurred: %s", str(e))
+        print("Exception occurred: %s", str(e))
+        #logger.debug("Exception occurred: %s", str(e))
     try:    
         video_tally.to_csv(f'{todays_folder_path}/{filename}_averages.csv', mode='w', index=False, header=True)
-        logger.debug(f"data written to {todays_folder_path}/{filename}_averages.csv', but as a 1D list:\n%s", str(video_tally.values.flatten()))
+        #logger.debug(f"data written to {todays_folder_path}/{filename}_averages.csv', but as a 1D list:\n%s", str(video_tally.values.flatten()))
     except Exception as e:
-        logger.debug("Exception occurred: %s", str(e))
+        print("Exception occurred: %s", str(e))
+        #logger.debug("Exception occurred: %s", str(e))
     return video_tally
     
     
@@ -271,19 +273,21 @@ def store_cumulative_averages(filename: str):
     try:
         df = pd.read_csv('behavior_quantification.csv', index_col=None, header=0)
     except Exception as e:
-        logger.debug("Exception occurred: %s", str(e))
+        print("Exception occurred: %s", str(e))
+        #logger.debug("Exception occurred: %s", str(e))
         
     try:    
         df_sorted = df.sort_values(by=['ID'])
     except Exception as e:
-        logger.debug("Exception occurred: %s", str(e))
+        print("Exception occurred: %s", str(e))
+        #logger.debug("Exception occurred: %s", str(e))
         
     average_distances = df_sorted.groupby('ID')['average distance from center'].mean()
     average_speed = df_sorted.groupby('ID')['average speed'].mean()
     frame_count = df_sorted.groupby('ID')['frames tracked in video'].sum()
     df_sorted2 = df.sort_values(by=['filename'])
     latest_filename = df_sorted2['filename'].iloc[-1]
-    logger.info("latest_filename: %s", latest_filename)
+    #logger.info("latest_filename: %s", latest_filename)
     cumulative_tally = pd.DataFrame({'filename': latest_filename,
                                   'average distance from center': round(average_distances,2),
                                   'average speed': round(average_speed,2),
@@ -292,11 +296,13 @@ def store_cumulative_averages(filename: str):
     try:
         cumulative_tally = cumulative_tally[['filename','ID','average distance from center','average speed','total tracked frames']]
     except Exception as e:
-        logger.debug("Exception occurred: %s", str(e))
+        print("Exception occurred: %s", str(e))
+        #logger.debug("Exception occurred: %s", str(e))
     try:    
         cumulative_tally.to_csv('cumulative_averages.csv', mode='w', index=False, header=True)
     except Exception as e:
-        logger.debug("Exception occurred: %s", str(e))
+        print("Exception occurred: %s", str(e))
+        #logger.debug("Exception occurred: %s", str(e))
     
     return cumulative_tally
     
@@ -365,7 +371,7 @@ def calculate_behavior_metrics(df, actual_frames_per_second, moving_threshold, t
             print('just computed distance from center')
         except Exception as e:
             print("Exception occurred: %s", str(e))
-            logger.debug("Exception occurred: %s", str(e))
+            #logger.debug("Exception occurred: %s", str(e))
             
             
     if "pairwise distance" in setup.behavior_metrics:
@@ -390,7 +396,7 @@ def calculate_behavior_metrics(df, actual_frames_per_second, moving_threshold, t
             print('just computed video averages!')
         except Exception as e:
             print("Exception occurred: %s", str(e))
-            logger.debug("Exception occurred: %s", str(e))
+            #logger.debug("Exception occurred: %s", str(e))
     
     
     if "cumulative averages" in setup.behavior_metrics:
@@ -399,7 +405,7 @@ def calculate_behavior_metrics(df, actual_frames_per_second, moving_threshold, t
             print('just computed running averages!')
         except Exception as e:
             print("Exception occurred: %s", str(e))
-            logger.debug("Exception occurred: %s", str(e))
+            #logger.debug("Exception occurred: %s", str(e))
         
             if running_averages.empty == True:
                 pass
