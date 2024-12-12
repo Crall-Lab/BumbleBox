@@ -25,9 +25,9 @@ import pwd
 import pandas as pd
 
 username = pwd.getpwuid(os.getuid())[0]
-logging.basicConfig(filename=f'/home/{username}/Desktop/BumbleBox/logs/log.log',encoding='utf-8',format='%(filename)s %(asctime)s: %(message)s', filemode='a', level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+#logging.basicConfig(filename=f'/home/{username}/Desktop/BumbleBox/logs/log.log',encoding='utf-8',format='%(filename)s %(asctime)s: %(message)s', filemode='a', level=logging.DEBUG)
+#logger = logging.getLogger(__name__)
+#logger.setLevel(logging.DEBUG)
 
 def picam2_record_mp4(filename, outdir, recording_time, fps, shutter_speed, width, height, tuning_file, noise_reduction_mode, digital_zoom): #imformat="yuv" #have excluded imformat input because right now only functions by grabbing YUV frames, then converts them to RGB video. Maybe have a grayscale vs color option if possible?
 	
@@ -289,16 +289,16 @@ def trackTagsFromVid(filepath, todays_folder_path, filename, tag_dictionary, box
 	print("Average number of tags found: " + str(len(df.index)/frame_num))
 	tracking_time = time.time() - start
 	print(f"Tag tracking took {tracking_time} seconds, an average of {tracking_time / frame_num} seconds per frame") 
-		return df, df2, frame_num
+	return df, df2, frame_num
 
 
 def main():
 	
 	if sys.stdout.isatty():
 		print("Running video recording script from terminal")
-		logger.debug("Running video recording script from terminal")
+		#logger.debug("Running video recording script from terminal")
 	else:
-		logger.debug("Running video recording script via crontab")
+		#logger.debug("Running video recording script via crontab")
 		print("Running video recording script via crontab")
 		
 	#not sure if we even need this code, images are looking good - for this and ram tag capture
@@ -308,7 +308,7 @@ def main():
 		now = datetime.now()
 		
 		if gen_im_time.hour == now.hour and gen_im_time.minute == now.minute:
-			logger.debug("Exiting because the generate_nest_images.py script is running now")
+			#logger.debug("Exiting because the generate_nest_images.py script is running now")
 			return print("ending now because the image generation function should be running")
 	
 	parser = argparse.ArgumentParser(prog='Record a video, either an mp4 or mjpeg video! Program defaults to mp4 currently.')
@@ -364,5 +364,5 @@ def main():
 if __name__ == '__main__':
 	
 	main()
-	logging.shutdown()
+	#logging.shutdown()
 	
