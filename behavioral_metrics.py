@@ -35,7 +35,7 @@ def compute_speed(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int, moving_
 
     #only calculate speed when moving, otherwise mark as NAN
     sub_df.loc[sub_df['speed'] < 3.16, 'speed'] = np.nan
-	
+    
     df_sorted.loc[:, 'speed'] = sub_df.loc[:, 'speed']
     # Drop temporary columns used for computations
     df_sorted.drop(columns=['deltaX', 'deltaY'], inplace=True)
@@ -59,13 +59,13 @@ def compute_activity(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int, movi
 
     sub_df.loc[sub_df['activity'] < moving_threshold, 'activity'] = 0 
     sub_df.loc[sub_df['activity'] <= moving_threshold, 'activity'] = 1
-	
+    
     df_sorted.loc[:, 'activity'] = sub_df.loc[:, 'activity']
     # Drop temporary columns used for computations
     df_sorted.drop(columns=['deltaX', 'deltaY'], inplace=True)
     df_sorted.to_csv(todays_folder_path + "/" + filename + '_updated.csv', index=False)
     return df_sorted
-	
+    
 def compute_social_center_distance(df: pd.DataFrame, todays_folder_path: str, filename: str) -> pd.DataFrame:
     # Compute the social center for each frame
     social_centers = df.groupby('frame')[['centroidX', 'centroidY']].mean()
@@ -204,7 +204,7 @@ def compute_video_averages(df: pd.DataFrame, todays_folder_path: str, filename: 
                                   'average speed': round(average_speed),
                                   'frames tracked in video':frame_count})
     video_tally.reset_index(inplace=True)
-	#rearrange columns so filename comes first
+    #rearrange columns so filename comes first
     try:
         video_tally = video_tally[['filename','ID','average distance from center','average speed','frames tracked in video']]
     except Exception as e:
@@ -302,33 +302,33 @@ def store_cumulative_averages(filename: str):
     
 
 def create_todays_folder(dirpath):
-	
-	today = date.today()
-	today = today.strftime('%Y-%m-%d')
-	todays_folder_path = dirpath + '/' + today
-	print(todays_folder_path)
-	
-	if not os.path.exists(todays_folder_path):
-		
-		try:
-			os.makedirs(todays_folder_path)
-			return 0, todays_folder_path
-		
-		except Exception as e:
-			print(e)
-			print(e.args)
-			print("Couldn't make today's folder for some reason... trying subprocess!")
-			try:
-				subprocess.call(['sudo', 'mkdir', '-p', todays_folder_path])
-				return 0, todays_folder_path
-			except:
-				print(e)
-				print(e.args)
-				print("That didn't work either! Huh...")
-				return 1, todays_folder_path
-	
-	else:
-		return 0, todays_folder_path
+    
+    today = date.today()
+    today = today.strftime('%Y-%m-%d')
+    todays_folder_path = dirpath + '/' + today
+    print(todays_folder_path)
+    
+    if not os.path.exists(todays_folder_path):
+        
+        try:
+            os.makedirs(todays_folder_path)
+            return 0, todays_folder_path
+        
+        except Exception as e:
+            print(e)
+            print(e.args)
+            print("Couldn't make today's folder for some reason... trying subprocess!")
+            try:
+                subprocess.call(['sudo', 'mkdir', '-p', todays_folder_path])
+                return 0, todays_folder_path
+            except:
+                print(e)
+                print(e.args)
+                print("That didn't work either! Huh...")
+                return 1, todays_folder_path
+    
+    else:
+        return 0, todays_folder_path
         
         
 
@@ -352,12 +352,12 @@ def calculate_behavior_metrics(df, actual_frames_per_second, moving_threshold, t
         #except Exception as e:
         #    print("Exception occurred: %s", str(e))
         #    logger.debug("Exception occurred: %s", str(e))
-				
+                
     if "activity" in setup.behavior_metrics:
         print("Trying activity")
-	df = compute_activity(df,actual_frames_per_second,4, moving_threshold, todays_folder_path, filename)
-	print("Just computed activity")
-	    
+    df = compute_activity(df,actual_frames_per_second,4, moving_threshold, todays_folder_path, filename)
+    print("Just computed activity")
+        
     if "distance from center" in setup.behavior_metrics:
         print("Trying distance from center")
         try:
@@ -400,7 +400,7 @@ def calculate_behavior_metrics(df, actual_frames_per_second, moving_threshold, t
         except Exception as e:
             print("Exception occurred: %s", str(e))
             logger.debug("Exception occurred: %s", str(e))
-		
+        
             if running_averages.empty == True:
                 pass
 
