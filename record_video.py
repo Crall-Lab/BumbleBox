@@ -20,7 +20,7 @@ import behavioral_metrics
 import setup
 from setup import colony_number
 from data_cleaning import interpolate
-import logging
+#import logging
 import pwd
 import pandas as pd
 
