@@ -1,0 +1,62 @@
+# config.yaml
+# this needs to be checked for confirmation that it's correct, some stuff isn't right currently
+
+# BumbleBox ID and system
+colony_number: "01"
+
+# Recording options
+tag_tracking: true
+tag_tracking_frequency: 5
+recording_time: 20
+recording_frequency: 30
+track_recorded_videos: true
+infrared_recording: true
+
+# Camera settings
+width: 4056
+height: 3040
+frames_per_second: 5
+actual_frames_per_second: 4.4
+shutter_speed: 2500
+tuning_file: "imx477_noir.json"
+noise_reduction_mode: "Auto"
+recording_digital_zoom: null
+codec: "mp4"
+quality: 95
+
+# ArUco tracking
+tag_dictionary: "4X4_50"
+box_type: "custom"
+interpolate_data: true
+max_seconds_gap: 3
+
+# Behavior metrics
+calculate_behavior_metrics: true
+behavior_metrics:
+  - speed
+  - activity
+  - distance from center
+  - pairwise distance
+  - contacts
+  - video averages
+contact_distance: 2.0  # in cm
+pixel_contact_distance: 206.1
+moving_threshold: 3.16
+
+# Output
+output_filename: "session_001"
+todays_folder_path: "/mnt/bumblebox/data"
+
+# Preview settings
+preview_time: 120
+preview_width: 3000
+preview_height: 2250
+infrared_preview: true
+preview_tuning_file: "imx477_noir.json"
+preview_window: "QTGL"
+preview_digital_zoom: [275, 0, 3300, 3040]
+
+# Composite nest image settings
+create_composite_nest_images: true
+number_of_images: 60
+composite_images_per_day: 1

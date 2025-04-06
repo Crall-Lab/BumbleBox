@@ -2,12 +2,12 @@
 
 import pandas as pd
 import numpy as np
+import math
 
 # Updated function to interpolate missing frames only if the gap between them is less than or equal to max_frame_gap
 def interpolate(df, max_seconds_gap, actual_frames_per_second):
 
     max_frame_gap = int(max_seconds_gap * actual_frames_per_second)
-    print(max_frame_gap)
     # Ensure the data is sorted by frame
     df.sort_values(by=['ID', 'frame'], inplace=True)
     
@@ -64,6 +64,21 @@ def interpolate(df, max_seconds_gap, actual_frames_per_second):
     
     # Sorting the DataFrame by 'ID' and 'frame' for better readability
     interpolated_df.sort_values(by=['ID', 'frame'], inplace=True)
+    
+    return interpolated_df
+
+def remove_jumps(interpolated_df):
+
+    unique_ids = interpolated_df["ID"].unique() 
+    for bee_id in unique_ids:
+        bee_df = interpolated_df[ interpolated_df['ID'] == bee_id]
+        bee_sub_df = bee_df.loc[:, ['frame', 'centroidX', 'centroidY']]
+        diff_df = bee_sub_df.diff()
+
+    for index, row in diff_df.iterrows():
+        #exclude rows that jump more than 500 pixels over a single frame
+        if row['frame'] == 1 and math.sqrt(row['centroidX']**2 + row['centroidY']**2) > 500:
+            interpolated_df.drop(index, axis=0, inplace=True)
     
     return interpolated_df
 

@@ -1,179 +1,91 @@
+# track_prerecorded_videos.py
+
+"""
+This script processes prerecorded videos (e.g., MP4 or MJPEG) by detecting ArUco tags and, optionally,
+calculating behavioral metrics such as speed, activity, center distance, pairwise distances, and contact matrices.
+
+Typical usage:
+    python3 track_prerecorded_videos.py \
+        -v /path/to/videos \
+        -d 4X4_50 \
+        -b custom \
+        -f 5 \
+        --metrics
+
+Dependencies:
+    - OpenCV (with aruco module)
+    - pandas
+    - behavioral_metrics.py
+    - tag_tracking_utils.py (must be in the same directory or in PYTHONPATH)
+
+Note:
+    Several parameters (e.g., moving threshold, contact distance) are currently hard-coded
+    and should be moved to a centralized config system, such as setup.py or a future GUI.
+"""
+
 import os
-import cv2
-from cv2 import aruco
+import argparse
 import pandas as pd
-import behavioral_metrics
 import time
-import numpy as np
+import behavioral_metrics
+from tag_tracking_utils import track_tags_from_video, load_actual_fps
 
-video_folder = '' #write the path of the video folder here inside the quotes
-frames_per_second = None
+# TODO: Remove these hard-coded constants and place them in setup.py or pass as command-line arguments
+MOVING_THRESHOLD = 3.16  # pixels/frame threshold to determine movement vs noise
+SPEED_CUTOFF_SECONDS = 4  # max gap to interpolate speed values
+PIXEL_CONTACT_DISTANCE = 206.1  # contact distance in pixels (depends on setup)
 
-#for file in x
-#add my csv tracking alternative in for now, along with in the ram_capture script - this so I can add functions quickly 
+def main(video_folder, dictionary, box_type, fallback_fps, run_metrics):
+    for root, _, files in os.walk(video_folder):
+        for file in files:
+            if file.endswith(".mp4") or file.endswith(".mjpeg"):
+                filepath = os.path.join(root, file)
+                filename = os.path.splitext(file)[0]
+                print(f"\nProcessing video: {filename}")
 
-def compute_speed(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int) -> pd.DataFrame:
-    
-    speed_cutoff_frames = fps*speed_cutoff_seconds
-    # Sorting by ID and frame ensures that we compare positions of the same bee across consecutive frames
-    df_sorted = df.sort_values(by=['ID', 'frame'])
-   
-    # Compute the difference between consecutive rows for centroidX and centroidY
-    df_sorted['deltaX'] = df_sorted.groupby('ID')['centroidX'].diff()
-    df_sorted['deltaY'] = df_sorted.groupby('ID')['centroidY'].diff()
-    
-    df_sorted['elapsed frames'] = df_sorted.groupby('ID')['frame'].diff()
-    # Compute the Euclidean distance, which gives speed (assuming frame rate is constant)
-    sub_df = df_sorted[ df_sorted['elapsed frames'] < speed_cutoff_frames ]
-    sub_df['speed'] = np.sqrt(sub_df['deltaX']**2 + sub_df['deltaY']**2)
-    df_sorted.loc[:, 'speed'] = sub_df.loc[:, 'speed']
-    # Drop temporary columns used for computations
-    df_sorted.drop(columns=['deltaX', 'deltaY'], inplace=True)
-    return df_sorted
-    
-    
+                df, df2, frame_num = track_tags_from_video(
+                    filepath=filepath,
+                    output_dir=root,
+                    filename=filename,
+                    tag_dictionary=dictionary,
+                    box_type=box_type
+                )
 
-def compute_social_center_distance(df: pd.DataFrame) -> pd.DataFrame:
-    # Compute the social center for each frame
-    social_centers = df.groupby('frame')[['centroidX', 'centroidY']].mean()
-    social_centers.columns = ['centerX', 'centerY']
-   
-    # Merge the social centers with the main dataframe to calculate distances
-    df = df.merge(social_centers, left_on='frame', right_index=True)
+                fps = load_actual_fps(filepath) or fallback_fps
 
-    # Compute the distance of each bee from the social center of its frame
-    df['distance_from_center'] = np.sqrt((df['centroidX'] - df['centerX'])**2 + (df['centroidY'] - df['centerY'])**2)
-   
-    # Drop temporary columns used for computations
-    df.drop(columns=['centerX', 'centerY'], inplace=True)
-   
-    return df
-
-def trackTagsFromVid(filepath, todays_folder_path, filename, tag_dictionary, box_type):
-	
-	print(tag_dictionary)
-	if tag_dictionary is None:
-		tag_dictionary = '4X4_50'
-		if isinstance(tag_dictionary, str):
-			if 'DICT' not in tag_dictionary:
-				tag_dictionary = "DICT_%s" % tag_dictionary
-			tag_dictionary = tag_dictionary.upper()
-			if not hasattr(cv2.aruco, tag_dictionary):
-				raise ValueError("Unknown tag dictionary: %s" % tag_dictionary)
-			tag_dictionary = getattr(cv2.aruco, tag_dictionary)
-	else:
-		if 'DICT' not in tag_dictionary:
-			tag_dictionary = "DICT_%s" % tag_dictionary
-		tag_dictionary = tag_dictionary.upper()
-		if not hasattr(cv2.aruco, tag_dictionary):
-			raise ValueError("Unknown tag dictionary: %s" % tag_dictionary)
-		tag_dictionary = getattr(cv2.aruco, tag_dictionary)
-	tag_dictionary = aruco.getPredefinedDictionary(tag_dictionary) 
-	parameters = aruco.DetectorParameters()
-	detector = aruco.ArucoDetector(tag_dictionary, parameters)
-	
-	if box_type=='custom':
-		#change these!
-		parameters.minMarkerPerimeterRate=0.03
-		parameters.adaptiveThreshWinSizeMin=5
-		parameters.adaptiveThreshWinSizeStep=6
-		parameters.polygonalApproxAccuracyRate=0.06
-		
-	elif box_type=='koppert':
-		#change these!
-		parameters.minMarkerPerimeterRate=0.03
-		parameters.adaptiveThreshWinSizeMin=5
-		parameters.adaptiveThreshWinSizeStep=6
-		parameters.polygonalApproxAccuracyRate=0.06
-		
-	elif box_type==None:
-		#change these!
-		parameters.minMarkerPerimeterRate=0.03
-		parameters.adaptiveThreshWinSizeMin=5
-		parameters.adaptiveThreshWinSizeStep=6
-		parameters.polygonalApproxAccuracyRate=0.06
+                if run_metrics and not df.empty:
+                    print("Running behavioral metrics...")
+                    df = behavioral_metrics.compute_speed(df, fps, SPEED_CUTOFF_SECONDS, MOVING_THRESHOLD, root, filename)
+                    df = behavioral_metrics.compute_activity(df, fps, SPEED_CUTOFF_SECONDS, MOVING_THRESHOLD, root, filename)
+                    df = behavioral_metrics.compute_social_center_distance(df, root, filename)
+                    pw_df = behavioral_metrics.pairwise_distance(df, root, filename)
+                    contact_df = behavioral_metrics.contact_matrix(pw_df, root, PIXEL_CONTACT_DISTANCE, filename)
+                    _ = behavioral_metrics.compute_video_averages(df, root, filename)
 
 
-	vid = cv2.VideoCapture(filepath)
-	
-	frame_num = 0
-	noID = []
-	raw = []
-	augs_csv = []
-	
-	start = time.time()
-	
-	while(vid.Isopened()):
-		
-		ret,frame = vid.read()
-		if ret == True:
-			try:
-				gray = cv2.cvtColor(frame, cv2.COLOR_YUV2GRAY_I420)
-				clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-				cl1 = clahe.apply(gray)
-				gray = cv2.cvtColor(cl1,cv2.COLOR_GRAY2RGB)
-				
-			except:
-				print('converting to grayscale didnt work...')
-				continue
-				
-			corners, ids, rejectedImgPoints = detector.detectMarkers(gray)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Run tag tracking and behavioral metrics on prerecorded videos.")
+    parser.add_argument('-v', '--video_folder', type=str, required=True, help='Path to the folder containing videos')
+    parser.add_argument('-d', '--dictionary', type=str, default='4X4_50', help='ArUco tag dictionary (e.g., 4X4_50)')
+    parser.add_argument('-b', '--box_type', type=str, default='custom', choices=['custom', 'koppert'], help='Box type for preset tracking parameters')
+    parser.add_argument('-f', '--fps', type=int, default=5, help='Fallback FPS if actual FPS metadata is missing')
+    parser.add_argument('--metrics', action='store_true', help='If set, will calculate behavioral metrics')
 
-			for i in range(len(rejectedImgPoints)):
-				c = rejectedImgPoints[i][0]
-				xmean = c[:,0].mean() #for calculating the centroid
-				ymean = c[:,1].mean() #for calculating the centroid
-				xmean_top_point = (c[0,0] + c[1,0]) / 2 #for calculating the top point of the tag
-				ymean_top_point = (c[0,1] + c[1,1]) / 2 #for calculating the top point of the tag
-				noID.append( [frame_num, "X", float(xmean), float(ymean), float(xmean_top_point), float(ymean_top_point)] )
-				#noID.append( [frame_num, "X", float(xmean), float(ymean), float(xmean_top_point), float(ymean_top_point), 100, None] ) #[[float(xmean), float(ymean)], [float(xmean_top_point), float(ymean_top_point)]] )
-			
-			if ids is not None:
-				for i in range(len(ids)):
-					c = corners[i][0]
-					xmean = c[:,0].mean() #for calculating the centroid
-					ymean = c[:,1].mean() #for calculating the centroid
-					xmean_top_point = (c[0,0] + c[1,0]) / 2 #for calculating the top point of the tag
-					ymean_top_point = (c[0,1] + c[1,1]) / 2 #for calculating the top point of the tag
-					raw.append( [frame_num, int(ids[i]), float(xmean), float(ymean), float(xmean_top_point), float(ymean_top_point)] )
-					#raw.append( [frame_num, int(ids[i]),float(xmean), float(ymean), float(xmean_top_point), float(ymean_top_point), 100, None] ) #[[float(xmean), float(ymean)], [float(xmean_top_point), float(ymean_top_point)]] )
+    args = parser.parse_args()
 
-			frame_num += 1
-			print(f"processed frame {frame_num}")  
-		
-		df = pd.DataFrame(raw)
-		df = df.rename(columns = {0:'frame', 1:'ID', 2:'centroidX', 3:'centroidY', 4:'frontX', 5:'frontY'})
-		df.to_csv(todays_folder_path + filename + '_raw.csv')
-		print('saved raw csv')
-		#df.to_csv('/home/pi/Desktop/BumbleBox/testing/identified_csv.csv', index=False)
-		df2 = pd.DataFrame(noID)
-		df2 = df2.rename(columns = {0:'frame', 1:'ID', 2:'centroidX', 3:'centroidY', 4:'frontX', 5:'frontY'})
-		df2.to_csv(todays_folder_path + filename + '_noID.csv')
-		print('saved noID csv')
-		#df2.to_csv('/home/pi/Desktop/BumbleBox/testing/potential_csv.csv', index=False)
+    print(f"Video folder: {args.video_folder}")
+    print(f"Aruco dictionary: {args.dictionary}")
+    print(f"Box type for Aruco parameters: {args.box_type}")
+    print(f"Fallback FPS for metrics: {args.fps}")
+    print(f"Behavioral metrics being run: {args.metrics}")
+    print("Starting processing...")
 
-		print("Average number of tags found: " + str(len(df.index)/frame_num))
-		tracking_time = time.time() - start
-		print(f"Tag tracking took {tracking_time} seconds, an average of {tracking_time / frame_num} seconds per frame") 
-		return df, df2, frame_num
-		
-		
+    main(
+        video_folder=args.video_folder,
+        dictionary=args.dictionary,
+        box_type=args.box_type,
+        fallback_fps=args.fps,
+        run_metrics=args.metrics
+    )
 
-def main(video_folder, dictionary):
-	
-	for path, directories, files in os.walk(video_folder):
-		
-		for file in files:
-			
-			filename = os.path.basename(file)
-			name, datetime = filename.split('_', maxsplit=1)
-			
-			print('starting to track tags from the saved video!')
-			df, df2, frame_num = trackTagsFromVid(path, video_folder, filename, dictionary, "custom")
-			
-			if df.empty == False:
-				df = behavioral_metrics.compute_speed(df,frames_per_second,4)
-				df = compute_social_center_distance(df)
-				df.to_csv(video_folder + '/' + filename + '_updated.csv', index=False)
-				
-				
+    print("Processing complete.")

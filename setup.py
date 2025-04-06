@@ -72,7 +72,7 @@ recording_digital_zoom = None
 
 tag_dictionary = '4X4_50'
 
-'''the options are None, 'custom', or 'koppert' - set this to either custom or koppert to access preset tracking settings for'''
+'''the options are None, 'custom', or 'koppert' - set this to either custom or koppert to access preset tracking settings for those boxes'''
 box_type = 'custom'
 
 ''' Interpolates data between missing frames if set to True. For example, if a bee is tracked in frames 2,3, and 6, this would draw a line

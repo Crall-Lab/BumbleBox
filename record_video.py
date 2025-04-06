@@ -4,6 +4,8 @@
 
 from picamera2 import Picamera2, Preview
 from picamera2.encoders import JpegEncoder
+from picamera2.encoders import H264Encoder
+from picamera2.outputs import FileOutput
 import time
 from datetime import date
 from datetime import datetime
@@ -29,89 +31,82 @@ username = pwd.getpwuid(os.getuid())[0]
 #logger = logging.getLogger(__name__)
 #logger.setLevel(logging.DEBUG)
 
-def picam2_record_mp4(filename, outdir, recording_time, fps, shutter_speed, width, height, tuning_file, noise_reduction_mode, digital_zoom): #imformat="yuv" #have excluded imformat input because right now only functions by grabbing YUV frames, then converts them to RGB video. Maybe have a grayscale vs color option if possible?
-	
-	tuning = Picamera2.load_tuning_file(tuning_file)
-	picam2 = Picamera2(tuning=tuning)
-	preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
-	picam2.align_configuration(preview) #might cause an issue?
-	picam2.configure(preview)
-	
-	'''set shutterspeed (or exposure time)'''
-	picam2.set_controls({"ExposureTime": shutter_speed}) #"NoiseReductionMode": controls.draft.NoiseReductionModeEnum.Fast})
-	
-	'''set noise reduction mode'''
-	if noise_reduction_mode != "Auto":
-		try:
-			noise_reduction_mode = getattr(controls.draft.NoiseReductionModeEnum, noise_reduction_mode)
-			picam2.set_controls({"NoiseReductionMode": noise_reduction_mode})
-		except:
-			print("The variable 'noise_reduction_mode' in the setup.py script is set incorrectly. Please change it and save that script. It should be 'Auto', 'Off', 'Fast', or 'HighQuality'")
-	
-	'''set digital zoom'''
-	if digital_zoom == type(tuple) and len(digital_zoom) == 4:
-		picam2.set_controls({"ScalerCrop": digital_zoom})
-	
-	elif digital_zoom != None:
-		print("The variable 'recording_digital_zoom' in the setup.py script is set incorrectly. It should be either 'None' or a value that looks like this: (offset_x,offset_y,new_width,new_height) for ex. (1000,2000,300,300)")
-	
-	'''start the camera'''
-	picam2.start()
-	
-	print("Initializing recording...")
-	print("Recording parameters:\n")
-	print(f"	filename: {filename}")
-	print(f"	directory: {outdir}")
-	print(f"	recording time: {recording_time}s")
-	print(f"	frames per second: {fps}")
-	print(f"	image width: {width}")
-	print(f"	image width: {height}")
-	print(f"	output image format: RGB888")
-	print(f"    output video format: mp4")
+def picam2_record_mp4(filename, outdir, recording_time, fps, shutter_speed, width, height, tuning_file, noise_reduction_mode, digital_zoom):
 
-	time.sleep(2)
-	start_time = time.time()
+    tuning = Picamera2.load_tuning_file(tuning_file)
+    picam2 = Picamera2(tuning=tuning)
+    preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
+    picam2.align_configuration(preview)
+    picam2.configure(preview)
+
+    picam2.set_controls({"ExposureTime": shutter_speed})
+
+    if noise_reduction_mode != "Auto":
+        try:
+            noise_reduction_mode = getattr(controls.draft.NoiseReductionModeEnum, noise_reduction_mode)
+            picam2.set_controls({"NoiseReductionMode": noise_reduction_mode})
+        except:
+            print("The variable 'noise_reduction_mode' in the setup.py script is set incorrectly.")
+
+    if isinstance(digital_zoom, tuple) and len(digital_zoom) == 4:
+        picam2.set_controls({"ScalerCrop": digital_zoom})
+    elif digital_zoom is not None:
+        print("'recording_digital_zoom' in setup.py is set incorrectly.")
+
+    picam2.start()
+
+    print("Initializing recording...")
+    print("Recording parameters:\n")
+    print(f"\tfilename: {filename}")
+    print(f"\tdirectory: {outdir}")
+    print(f"\trecording time: {recording_time}s")
+    print(f"\tframes per second: {fps}")
+    print(f"\timage size: {width}x{height}")
+    print(f"\toutput format: mp4")
+
+    time.sleep(2)
+    start_recording_time = time.perf_counter()
+    target_interval = 1.0 / fps
+
+    frames_list = []
+    frame_index = 0
+
+    print("Beginning video capture...")
+    while (time.perf_counter() - start_recording_time) < recording_time:
+        now = time.perf_counter()
+        expected_time = start_recording_time + frame_index * target_interval
+
+        if now >= expected_time:
+            yuv420 = picam2.capture_array()
+            frames_list.append(yuv420)
+            frame_index += 1
+
+    finished = time.perf_counter() - start_recording_time
+    actual_fps = frame_index / finished
+    print(f"Finished capturing {frame_index} frames in {finished:.2f} seconds")
+    print(f"Actual average FPS: {actual_fps:.2f}")
+
+    output_path = os.path.join(outdir, filename + '.mp4')
+    vid_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, vid_fourcc, 10, (width, height))
+
+    for j, im_array in enumerate(frames_list):
+        rgb_im = cv2.cvtColor(im_array, cv2.COLOR_YUV420p2RGB)
+        out.write(rgb_im)
+        print(f"Wrote frame {j+1}/{len(frames_list)}")
+
+    out.release()
+    cv2.destroyAllWindows()
+
+    # Save FPS metadata
+    fps_metadata_path = os.path.join(outdir, filename + '_actual_fps.txt')
+    with open(fps_metadata_path, 'w') as f:
+        f.write(f"{actual_fps:.3f}\n")
+    print(f"Saved actual FPS to {fps_metadata_path}")
+
+    return output_path
+
 	
-	frames_list = []
-	i = 0
-	
-	print("beginning video capture")
-	while ( (time.time() - start_time) < recording_time):
-		timestamp = time.time() - start_time
-		
-		yuv420 = picam2.capture_array()
-		frames_list.append([yuv420])
-		#yuv420 = yuv420[0:3040, :]
-		#frames_dict[f"frame_{i:03d}"] = [yuv420, timestamp]
-		time.sleep(1/(fps+1))
-		i += 1
-		
-	finished = time.time()-start_time
-	print(f'finished capturing frames to arrays, captured {i} frames in {finished} seconds')
-	rate = i / finished
-	print(f'thats {rate} frames per second!\nMake sure this corresponds well to your desired framerate. FPS is a bit experimental for tag tracking and mp4 recording at the moment... Thats the tradeoff for allowing a higher framerate.')
-	
-	output = outdir+'/'+filename+'.mp4'
-	print(output)
-	vid_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-	out = cv2.VideoWriter(output,vid_fourcc,10,(4032,3040))
-	
-	for i, im_array in enumerate(frames_list):
-		frame = im_array[0]
-		rgb_im = cv2.cvtColor(frame, cv2.COLOR_YUV420p2RGB)
-		out.write(rgb_im)
-		print("wrote another frame!")
-
-	out.release()
-	cv2.destroyAllWindows()
-	return output
-	
-
-
-
-
-
-
 def picam2_record_mjpeg(filename, outdir, recording_time, quality, fps, shutter_speed, width, height, tuning_file, noise_reduction_mode, digital_zoom, imformat="RGB888", buffer_count=2):
 	
 	print("Initializing recording...")

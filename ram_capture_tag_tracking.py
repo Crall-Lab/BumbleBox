@@ -20,6 +20,7 @@ import setup
 #import logging
 from data_cleaning import interpolate
 import pwd
+from tag_tracking_utils import load_actual_fps
 
 username = pwd.getpwuid(os.getuid())[0]
 #logging.basicConfig(filename=f'/home/{username}/Desktop/BumbleBox/logs/log.log',encoding='utf-8',format='%(filename)s %(asctime)s: %(message)s', filemode='a', level=logging.DEBUG)
@@ -30,69 +31,67 @@ username = pwd.getpwuid(os.getuid())[0]
 # transfer tag tracking code to video recording so it happens after videos record as well
 # figure out how to fine tune frames per second
 
-def array_capture(recording_time, fps, shutter_speed, width, height, tuning_file, noise_reduction_mode, digital_zoom):
-    
-    '''load tuning file and initialize the camera (setting the format and the image size)'''
+def array_capture(recording_time, fps, shutter_speed, width, height, tuning_file, noise_reduction_mode, digital_zoom, outdir=None, filename=None):
+
     tuning = Picamera2.load_tuning_file(tuning_file)
     picam2 = Picamera2(tuning=tuning)
-    preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width,height)})
-    picam2.align_configuration(preview) #might cause an issue?
+    preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
+    picam2.align_configuration(preview)
     picam2.configure(preview)
-    
-    '''set shutterspeed (or exposure time)'''
-    picam2.set_controls({"ExposureTime": shutter_speed}) #"NoiseReductionMode": controls.draft.NoiseReductionModeEnum.Fast})
-    
-    '''set noise reduction mode'''
+
+    picam2.set_controls({"ExposureTime": shutter_speed})
+
     if noise_reduction_mode != "Auto":
         try:
+            noise_reduction_mode = getattr(controls.draft.NoiseReductionModeEnum, noise_reduction_mode)
             picam2.set_controls({"NoiseReductionMode": noise_reduction_mode})
         except:
             print("The variable 'noise_reduction_mode' in the setup.py script is set incorrectly. Please change it and save that script. It should be 'Auto', 'Off', 'Fast', or 'HighQuality'")
-    
-    '''set digital zoom'''
-    if digital_zoom == type(tuple) and len(digital_zoom) == 4:
+
+    if isinstance(digital_zoom, tuple) and len(digital_zoom) == 4:
         picam2.set_controls({"ScalerCrop": digital_zoom})
-    
-    elif digital_zoom != None:
+    elif digital_zoom is not None:
         print("The variable 'recording_digital_zoom' in the setup.py script is set incorrectly. It should be either 'None' or a value that looks like this: (offset_x,offset_y,new_width,new_height) for ex. (1000,2000,300,300)")
-    
-    '''start the camera'''
+
     picam2.start()
     time.sleep(2)
-    
-    print("Initializing data capture...")
+
+    print("Initializing RAM-based frame capture...")
     print("Recording parameters:\n")
-    print(f"recording time: {recording_time}s")
-    print(f"frames per second: {fps}")
-    print(f"image width: {width} pixels")
-    print(f"image width: {height} pixels")
-    print(f"shutter speed: {shutter_speed} microseconds")
-    
-    start_time = time.time()
-    
+    print(f"\trecording time: {recording_time}s")
+    print(f"\tframes per second: {fps}")
+    print(f"	image resolution: {width}x{height} pixels")
+    print(f"\toutput image format: RGB888")
+    print(f"\toutput storage format: YUV420 frame array (RAM only)")
+
+    target_interval = 1.0 / fps
+    start_time = time.perf_counter()
+    frame_index = 0
     frames_list = []
-    i = 0
-    
-    while ( (time.time() - start_time) < recording_time):
-        
-        timestamp = time.time() - start_time
-        print(f'frame {i} timestamp: {round(timestamp,2)} seconds')
-        yuv420 = picam2.capture_array()
-        frames_list.append([yuv420])
-        #yuv420 = yuv420[0:3040, :]
-        #frames_dict[f"frame_{i:03d}"] = [yuv420, timestamp]
-        time.sleep(1/(fps+1))
-        i += 1
-    
-    finished = time.time()-start_time
-    print(f'finished capturing frames to arrays, captured {i} frames in {round(finished,2)} seconds')
-    rate = i / finished
-    print(f'\nthats {round(rate,2)} frames per second!\n\n\nMake sure this corresponds well to your desired framerate and write this number into the actual_frame_rate setting in settings.py. FPS is a bit experimental for tag tracking and mp4 recording at the moment... Thats the tradeoff for allowing a higher framerate.')
-    sizeof = getsizeof(frames_list)
-    
-    return frames_list
-        
-        
+
+    print("Beginning video capture")
+    while (time.perf_counter() - start_time) < recording_time:
+        now = time.perf_counter()
+        expected_time = start_time + frame_index * target_interval
+        if now >= expected_time:
+            yuv420 = picam2.capture_array()
+            frames_list.append([yuv420])
+            frame_index += 1
+
+    finished = time.perf_counter() - start_time
+    actual_fps = frame_index / finished
+    print(f"\nFinished capturing frames to arrays, captured {frame_index} frames in {round(finished, 2)} seconds")
+    print(f"That's {round(actual_fps, 2)} frames per second!")
+    print("Make sure this corresponds well to your desired framerate. FPS is a bit experimental for RAM capture — that's the tradeoff for allowing a higher framerate.")
+
+    if outdir and filename:
+        fps_path = os.path.join(outdir, filename + '_actual_fps.txt')
+        with open(fps_path, 'w') as f:
+            f.write(f"{actual_fps:.3f}\n")
+        print(f"Saved actual FPS to {fps_path}")
+
+    return frames_list, actual_fps
+
         
 def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, box_type, now, hostname, colony_number):
 
@@ -175,7 +174,7 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
         #cv2.imshow("frame",resized)
         #cv2.waitKey(5000)
 
-        for i in range(len(rejectedImgPoints)):
+        for i in range(len(rejectedIemgPoints)):
             c = rejectedImgPoints[i][0]
             xmean = c[:,0].mean() #for calculating the centroid
             ymean = c[:,1].mean() #for calculating the centroid
@@ -254,7 +253,6 @@ def main():
     parser.add_argument('-p', '--data_folder_path', type=str, default=setup.data_folder_path, help='a path to the folder you want to collect data in. Default is /mnt/bumblebox/data')
     parser.add_argument('-t', '--recording_time', type=int, default=setup.recording_time, help='the video recording time in seconds')
     parser.add_argument('-fps', '--frames_per_second', type=int, default=setup.frames_per_second, choices=range(0,11), help='the number of frames recorded per second of video capture. At the moment this is still a bit experimental, we have gotten up to 6fps to work for mjpeg, and up to 10fps for mp4 videos.')
-    parser.add_argument('-afps', '--actual_frames_per_second', type=float, default=setup.actual_frames_per_second, help='the number of frames recorded per second of video capture. At the moment this is still a bit experimental, we have gotten up to 6fps to work for mjpeg, and up to 10fps for mp4 videos.')
     parser.add_argument('-sh', '--shutter', type=int, default=setup.shutter_speed, help='the exposure time, or shutter speed, of the camera in microseconds (1,000,000 microseconds in a second!!)')
     parser.add_argument('-w', '--width', type=int, default=setup.width, help='the width of the image in pixels')
     parser.add_argument('-ht', '--height', type=int, default=setup.height, help='the height of the image in pixels')
@@ -274,6 +272,8 @@ def main():
     now = datetime.now()
     now = now.strftime('%Y-%m-%d_%H-%M-%S')
     filename = hostname + '_' + now
+    fallback_fps = setup.actual_frames_per_second
+
 
     print(filename)
     print(args.data_folder_path)
@@ -281,7 +281,18 @@ def main():
     print(args.recording_time)
     print(args.frames_per_second)
 
-    frames_list = array_capture(args.recording_time, args.frames_per_second, args.shutter, args.width, args.height, args.tuning_file, args.noise_reduction, args.digital_zoom)
+    frames_list, recorded_fps = array_capture(
+        setup.recording_length,
+        fallback_fps,
+        setup.shutter_speed,
+        setup.image_width,
+        setup.image_height,
+        setup.tuning_file,
+        setup.noise_reduction_mode,
+        setup.recording_digital_zoom,
+        outdir=todays_folder_path,
+        filename=filename
+    )
 
     print('about to track tags!')
     df, df2, frame_num = trackTagsFromRAM(filename, todays_folder_path, frames_list, args.dictionary, args.box_type, now, hostname, colony_number)
@@ -289,9 +300,17 @@ def main():
     if setup.interpolate_data == True and df.empty == False:
         df = interpolate(df, setup.max_seconds_gap, setup.actual_frames_per_second)
     
+    # Try to load FPS from metadata file, else use the one returned
+    actual_fps = load_actual_fps(os.path.join(todays_folder_path, filename + '_actual_fps.txt')) or recorded_fps
+
     if df.empty == False and setup.calculate_behavior_metrics == True:
         
-        behavioral_metrics.calculate_behavior_metrics(df, setup.actual_frames_per_second, todays_folder_path, filename)
+        behavioral_metrics.calculate_behavior_metrics(
+        df,
+        actual_fps,
+        todays_folder_path,
+        filename
+    )
         print("Calculating behavior metrics")
         
         
