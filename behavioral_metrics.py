@@ -110,7 +110,7 @@ def pairwise_distance(df: pd.DataFrame, todays_folder_path: str, filename: str) 
         bee_id_column = frame_df.loc[:,'ID'].reset_index(drop=True) #make a new bee ID column to add to the dataframe
         pairwise_distance_df.insert(0, 'ID', bee_id_column)
         pairwise_distance_df.columns.name = None #this stops bee ID showing up as the name of all the columns in the df, it looks weird and is confusing
-        pairwise_distance_df['frame'] = int(frame_num)#[0])
+        pairwise_distance_df['frame'] = int(frame_num[0])
         #pairwise_distance_df = pd.concat((frame_df['bee ID'], pd.DataFrame(squareform, columns=frame_df['bee ID'])), axis=1) #turns the squareform array into a dataframe indexed by bee ID
         #pairwise_distance_df.replace(0, np.nan, inplace=True) #replace zeros with nan values in order to exclude them from calculations 
 
