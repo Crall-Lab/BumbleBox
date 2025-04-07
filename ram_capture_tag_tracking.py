@@ -291,7 +291,7 @@ def main():
     
     if df.empty == False and setup.calculate_behavior_metrics == True:
         
-        behavioral_metrics.calculate_behavior_metrics(df, setup.actual_frames_per_second, todays_folder_path, filename)
+        behavioral_metrics.calculate_behavior_metrics(df, setup.actual_frames_per_second, setup.moving_threshold, todays_folder_path, filename)
         print("Calculating behavior metrics")
         
         
