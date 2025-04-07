@@ -30,6 +30,14 @@ box_type: "custom"
 interpolate_data: true
 max_seconds_gap: 3
 
+# If box type: "null", then the following custom parameters can be used
+aruco_params:
+  minMarkerPerimeterRate: 0.03
+  adaptiveThreshWinSizeMin: 5
+  adaptiveThreshWinSizeStep: 6
+  polygonalApproxAccuracyRate: 0.06
+
+
 # Behavior metrics
 calculate_behavior_metrics: true
 behavior_metrics:
@@ -44,8 +52,9 @@ pixel_contact_distance: 206.1
 moving_threshold: 3.16
 
 # Output
-output_filename: "session_001"
-todays_folder_path: "/mnt/bumblebox/data"
+# I don't think we need these variables, need to check
+#output_filename: "session_001"
+#todays_folder_path: "/mnt/bumblebox/data"
 
 # Preview settings
 preview_time: 120

@@ -1,44 +1,58 @@
-'''script that contains the video recording functions for BumbleBox - which is used is determined by the variables set in setup.py''' 
+# record_video.py
 
-#!/usr/bin/env python
-
+import os
+import sys
+import cv2
+import time
+import pwd
+import argparse
+import socket
+import subprocess
+import pandas as pd
+from datetime import date, datetime
 from picamera2 import Picamera2, Preview
 from picamera2.encoders import JpegEncoder
-from picamera2.encoders import H264Encoder
-from picamera2.outputs import FileOutput
-import time
-from datetime import date
-from datetime import datetime
-import socket
-import argparse
-import os
-import subprocess
-import sys
-from sys import getsizeof
-import cv2
-from cv2 import aruco
 from libcamera import controls
+from config_loader import load_config
 import behavioral_metrics
-import setup
-from setup import colony_number
 from data_cleaning import interpolate
-#import logging
-import pwd
-import pandas as pd
+from tag_tracking_utils import load_actual_fps
+from tag_tracking_utils import trackTagsFromVid
 
+config = load_config()
 username = pwd.getpwuid(os.getuid())[0]
-#logging.basicConfig(filename=f'/home/{username}/Desktop/BumbleBox/logs/log.log',encoding='utf-8',format='%(filename)s %(asctime)s: %(message)s', filemode='a', level=logging.DEBUG)
-#logger = logging.getLogger(__name__)
-#logger.setLevel(logging.DEBUG)
 
-def picam2_record_mp4(filename, outdir, recording_time, fps, shutter_speed, width, height, tuning_file, noise_reduction_mode, digital_zoom):
+def create_todays_folder(dirpath):
+    today = date.today().strftime('%Y-%m-%d')
+    todays_folder_path = os.path.join(dirpath, today)
+    print(todays_folder_path)
+    if not os.path.exists(todays_folder_path):
+        try:
+            os.makedirs(todays_folder_path)
+        except Exception as e:
+            print("Attempting subprocess mkdir due to:", e)
+            try:
+                subprocess.call(['sudo', 'mkdir', '-p', todays_folder_path])
+            except Exception as e:
+                print("Subprocess mkdir failed:", e)
+                return 1, todays_folder_path
+    return 0, todays_folder_path
+
+def picam2_record_mp4(filename, outdir):
+    fps = config["frames_per_second"]
+    shutter_speed = config["shutter_speed"]
+    width = config["width"]
+    height = config["height"]
+    tuning_file = config["tuning_file"]
+    noise_reduction_mode = config["noise_reduction_mode"]
+    digital_zoom = config["recording_digital_zoom"]
+    recording_time = config["recording_time"]
 
     tuning = Picamera2.load_tuning_file(tuning_file)
     picam2 = Picamera2(tuning=tuning)
     preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
     picam2.align_configuration(preview)
     picam2.configure(preview)
-
     picam2.set_controls({"ExposureTime": shutter_speed})
 
     if noise_reduction_mode != "Auto":
@@ -46,12 +60,12 @@ def picam2_record_mp4(filename, outdir, recording_time, fps, shutter_speed, widt
             noise_reduction_mode = getattr(controls.draft.NoiseReductionModeEnum, noise_reduction_mode)
             picam2.set_controls({"NoiseReductionMode": noise_reduction_mode})
         except:
-            print("The variable 'noise_reduction_mode' in the setup.py script is set incorrectly.")
+            print("Invalid noise_reduction_mode in config.yaml")
 
     if isinstance(digital_zoom, tuple) and len(digital_zoom) == 4:
         picam2.set_controls({"ScalerCrop": digital_zoom})
     elif digital_zoom is not None:
-        print("'recording_digital_zoom' in setup.py is set incorrectly.")
+        print("Invalid recording_digital_zoom in config.yaml")
 
     picam2.start()
 
@@ -61,303 +75,112 @@ def picam2_record_mp4(filename, outdir, recording_time, fps, shutter_speed, widt
     print(f"\tdirectory: {outdir}")
     print(f"\trecording time: {recording_time}s")
     print(f"\tframes per second: {fps}")
-    print(f"\timage size: {width}x{height}")
+    print(f"\timage resolution: {width}x{height} pixels")
     print(f"\toutput format: mp4")
 
     time.sleep(2)
-    start_recording_time = time.perf_counter()
+    start_time = time.perf_counter()
     target_interval = 1.0 / fps
-
     frames_list = []
     frame_index = 0
 
     print("Beginning video capture...")
-    while (time.perf_counter() - start_recording_time) < recording_time:
+    while (time.perf_counter() - start_time) < recording_time:
         now = time.perf_counter()
-        expected_time = start_recording_time + frame_index * target_interval
-
+        expected_time = start_time + frame_index * target_interval
         if now >= expected_time:
             yuv420 = picam2.capture_array()
             frames_list.append(yuv420)
             frame_index += 1
 
-    finished = time.perf_counter() - start_recording_time
+    finished = time.perf_counter() - start_time
     actual_fps = frame_index / finished
     print(f"Finished capturing {frame_index} frames in {finished:.2f} seconds")
     print(f"Actual average FPS: {actual_fps:.2f}")
 
     output_path = os.path.join(outdir, filename + '.mp4')
-    vid_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, vid_fourcc, 10, (width, height))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    for j, im_array in enumerate(frames_list):
-        rgb_im = cv2.cvtColor(im_array, cv2.COLOR_YUV420p2RGB)
-        out.write(rgb_im)
-        print(f"Wrote frame {j+1}/{len(frames_list)}")
+    for idx, frame in enumerate(frames_list):
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_YUV420p2RGB)
+        out.write(rgb_frame)
+        print(f"Wrote frame {idx + 1}/{len(frames_list)}")
 
     out.release()
     cv2.destroyAllWindows()
 
-    # Save FPS metadata
-    fps_metadata_path = os.path.join(outdir, filename + '_actual_fps.txt')
-    with open(fps_metadata_path, 'w') as f:
-        f.write(f"{actual_fps:.3f}\n")
-    print(f"Saved actual FPS to {fps_metadata_path}")
+    # Save actual FPS to file (optional)
+    with open(os.path.join(outdir, filename + '_actual_fps.txt'), 'w') as f:
+        f.write(f"{actual_fps:.3f}")
 
-    return output_path
-
-	
-def picam2_record_mjpeg(filename, outdir, recording_time, quality, fps, shutter_speed, width, height, tuning_file, noise_reduction_mode, digital_zoom, imformat="RGB888", buffer_count=2):
-	
-	print("Initializing recording...")
-	print("Recording parameters:\n")
-	print(f"	filename: {filename}")
-	print(f"	directory: {outdir}")
-	print(f"	recording time: {recording_time}s")
-	print(f"	quality (0-100): {quality}")
-	print(f"	frames per second: {fps}")
-	print(f"	image width: {width}")
-	print(f"	image width: {height}")
-	print(f"	image format: {imformat}")
-	print(f"    output video format: mjpeg")
-	print(f"	buffer count: {buffer_count}")
-		    
-		    
-	frame_duration_microseconds = int(1/fps * 10**6)
-	
-	tuning = Picamera2.load_tuning_file(tuning_file)
-	picam2 = Picamera2(tuning=tuning)
-	picam2.set_controls({"ExposureTime": shutter_speed})
-	video_config = picam2.create_video_configuration(main={"size": (width, height), "format": imformat}, controls={"FrameDurationLimits": (frame_duration_microseconds, frame_duration_microseconds)}, buffer_count=2)
-	picam2.align_configuration(video_config)
-	picam2.configure(video_config)
-
-	picam2.start_preview()
-	encoder = JpegEncoder(q=quality)
-	output = outdir+'/'+filename+'.mjpeg'
-
-	picam2.start()
-	time.sleep(2)
-	picam2.start_encoder(encoder,output,pts=outdir+filename+"_pts.txt")
-
-	time.sleep(recording_time)
-	
-	picam2.stop()
-	picam2.stop_encoder()
-	return output
-	
-	
-def create_todays_folder(dirpath):
-	
-	today = date.today()
-	today = today.strftime('%Y-%m-%d')
-	todays_folder_path = dirpath + '/' + today
-	print(todays_folder_path)
-	
-	if not os.path.exists(todays_folder_path):
-		
-		try:
-			os.makedirs(todays_folder_path)
-			return 0, todays_folder_path
-		
-		except Exception as e:
-			print(e)
-			print(e.args)
-			print("Couldn't make today's folder for some reason... trying subprocess!")
-			try:
-				subprocess.call(['sudo', 'mkdir', '-p', todays_folder_path])
-				return 0, todays_folder_path
-			except:
-				print(e)
-				print(e.args)
-				print("That didn't work either! Huh...")
-				return 1, todays_folder_path
-	
-	else:
-		return 0, todays_folder_path
-	
-
-#add my csv tracking alternative in for now, along with in the ram_capture script - this so I can add functions quickly 
-def trackTagsFromVid(filepath, todays_folder_path, filename, tag_dictionary, box_type, now):
-	print('got here')
-	print(tag_dictionary)
-	if tag_dictionary is None:
-		tag_dictionary = '4X4_50'
-		if isinstance(tag_dictionary, str):
-			if 'DICT' not in tag_dictionary:
-				tag_dictionary = "DICT_%s" % tag_dictionary
-			tag_dictionary = tag_dictionary.upper()
-			if not hasattr(cv2.aruco, tag_dictionary):
-				raise ValueError("Unknown tag dictionary: %s" % tag_dictionary)
-			tag_dictionary = getattr(cv2.aruco, tag_dictionary)
-	else:
-		if 'DICT' not in tag_dictionary:
-			tag_dictionary = "DICT_%s" % tag_dictionary
-		tag_dictionary = tag_dictionary.upper()
-		if not hasattr(cv2.aruco, tag_dictionary):
-			raise ValueError("Unknown tag dictionary: %s" % tag_dictionary)
-		tag_dictionary = getattr(cv2.aruco, tag_dictionary)
-	tag_dictionary = aruco.getPredefinedDictionary(tag_dictionary) 
-	parameters = aruco.DetectorParameters()
-	detector = aruco.ArucoDetector(tag_dictionary, parameters)
-	
-	if box_type=='custom':
-		#change these!
-		parameters.minMarkerPerimeterRate=0.03
-		parameters.adaptiveThreshWinSizeMin=5
-		parameters.adaptiveThreshWinSizeStep=6
-		parameters.polygonalApproxAccuracyRate=0.06
-		
-	elif box_type=='koppert':
-		#change these!
-		parameters.minMarkerPerimeterRate=0.03
-		parameters.adaptiveThreshWinSizeMin=5
-		parameters.adaptiveThreshWinSizeStep=6
-		parameters.polygonalApproxAccuracyRate=0.06
-		
-	elif box_type==None:
-		#change these!
-		parameters.minMarkerPerimeterRate=0.03
-		parameters.adaptiveThreshWinSizeMin=5
-		parameters.adaptiveThreshWinSizeStep=6
-		parameters.polygonalApproxAccuracyRate=0.06
-
-	print('got here 1')
-	vid = cv2.VideoCapture(filepath)
-	
-	frame_num = 0
-	noID = []
-	raw = []
-	augs_csv = []
-	
-	start = time.time()
-	print('got here 2')
-	while(vid.isOpened()):
-		print('got here 3')
-		ret,frame = vid.read()
-		if ret == True:
-			print(frame.shape)
-			try:
-				gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-				clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-				cl1 = clahe.apply(gray)
-				gray = cv2.cvtColor(cl1,cv2.COLOR_GRAY2RGB)
-				
-			except:
-				print('converting to grayscale didnt work...')
-				continue
-				
-			corners, ids, rejectedImgPoints = detector.detectMarkers(gray)
-
-			for i in range(len(rejectedImgPoints)):
-				c = rejectedImgPoints[i][0]
-				xmean = c[:,0].mean() #for calculating the centroid
-				ymean = c[:,1].mean() #for calculating the centroid
-				xmean_top_point = (c[0,0] + c[1,0]) / 2 #for calculating the top point of the tag
-				ymean_top_point = (c[0,1] + c[1,1]) / 2 #for calculating the top point of the tag
-				noID.append( [filename, setup.colony_number, now, frame_num, "X", float(xmean), float(ymean), float(xmean_top_point), float(ymean_top_point)] )
-			
-			if ids is not None:
-				for i in range(len(ids)):
-					c = corners[i][0]
-					xmean = c[:,0].mean() #for calculating the centroid
-					ymean = c[:,1].mean() #for calculating the centroid
-					xmean_top_point = (c[0,0] + c[1,0]) / 2 #for calculating the top point of the tag
-					ymean_top_point = (c[0,1] + c[1,1]) / 2 #for calculating the top point of the tag
-					raw.append( [filename, setup.colony_number, now, frame_num, int(ids[i]), float(xmean), float(ymean), float(xmean_top_point), float(ymean_top_point)] )
-
-			frame_num += 1
-			print(f"processed frame {frame_num}")  
-		else:
-			break
-			
-	df = pd.DataFrame(raw)
-	df = df.rename(columns = {0:'filename', 1:'colony number', 2:'datetime', 3:'frame', 4:'ID', 5:'centroidX', 6:'centroidY', 7:'frontX', 8:'frontY'})
-	df.to_csv(todays_folder_path + "/" + filename + '_raw.csv')
-	print('saved raw csv')
-	
-	df2 = pd.DataFrame(noID)
-	df2 = df2.rename(columns = {0:'filename', 1:'colony number', 2:'datetime', 3:'frame', 4:'ID', 5:'centroidX', 6:'centroidY', 7:'frontX', 8:'frontY'})
-	df2.to_csv(todays_folder_path + "/" + filename + '_noID.csv')
-	print('saved noID csv')
-
-	print("Average number of tags found: " + str(len(df.index)/frame_num))
-	tracking_time = time.time() - start
-	print(f"Tag tracking took {tracking_time} seconds, an average of {tracking_time / frame_num} seconds per frame") 
-	return df, df2, frame_num
+    return output_path, actual_fps
 
 
 def main():
-	
-	if sys.stdout.isatty():
-		print("Running video recording script from terminal")
-		#logger.debug("Running video recording script from terminal")
-	else:
-		#logger.debug("Running video recording script via crontab")
-		print("Running video recording script via crontab")
-		
-	#not sure if we even need this code, images are looking good - for this and ram tag capture
-	if setup.create_composite_nest_images == True:
-		
-		gen_im_time = datetime(1970, 1, 1, 23, 0, 0)
-		now = datetime.now()
-		
-		if gen_im_time.hour == now.hour and gen_im_time.minute == now.minute:
-			#logger.debug("Exiting because the generate_nest_images.py script is running now")
-			return print("ending now because the image generation function should be running")
-	
-	parser = argparse.ArgumentParser(prog='Record a video, either an mp4 or mjpeg video! Program defaults to mp4 currently.')
-	parser.add_argument('-p', '--data_folder_path', type=str, default=setup.data_folder_path, help='a path to the folder you want to collect data in. Default path is: /mnt/bumblebox/data/')
-	parser.add_argument('-t', '--recording_time', type=int, default=setup.recording_time, help='the video recording time in seconds')
-	parser.add_argument('-q', '--quality', type=int, default=setup.quality, choices=range(0,100), help='jpg image quality setting from 0-100. The higher the number, the better quality, and the bigger the file.')
-	parser.add_argument('-fps', '--frames_per_second', type=int, default=setup.frames_per_second, choices=range(0,10), help='the number of frames recorded per second of video capture. At the moment this is still a bit experimental, we have gotten up to 6fps to work for mjpeg, and up to 10fps for mp4 videos.')
-	parser.add_argument('-sh', '--shutter', type=int, default=setup.shutter_speed, help='the exposure time, or shutter speed, of the camera in microseconds (1,000,000 microseconds in a second!!)')
-	parser.add_argument('-w', '--width', type=int, default=setup.width, help='the width of the image in pixels')
-	parser.add_argument('-ht', '--height', type=int, default=setup.height, help='the height of the image in pixels')
-	parser.add_argument('-d', '--dictionary', type=str, default=setup.tag_dictionary, help='type "aruco.DICT_" followed by the size of the tag youre using (either 4X4 (this is the default), 5X5, 6X6, or 7X7) and the number of tags in the dictionary (either 50 (also the default), 100, 250, or 1000).')
-	parser.add_argument('-b', '--box_type', type=str, default=setup.box_type, choices=['custom','koppert'], help='an option to choose a default set of tracking parameters for either the custom bumblebox or the koppert box adaptation')
-	parser.add_argument('-cd', '--codec', type=str, default=setup.codec, choices=['mp4','mjpeg'], help='choose to save either mp4 videos or mjpeg videos!')
-	parser.add_argument('-tf', '--tuning_file', type=str, default=setup.tuning_file, help='this is a file that helps improve image quality by running algorithms tailored to particular camera sensors.\nBecause the BumbleBox by default images in IR, we use the \'imx477_noir.json\' file by default')
-	parser.add_argument('-nr', '--noise_reduction', type=str, default=setup.noise_reduction_mode, choices=['Auto', 'Off', 'Fast', 'HighQuality'], help='an option to "digitally zoom in" by just recording from a portion of the sensor. This overrides height and width values, and can be useful to crop out glare that is negatively impacting image quality. Takes 4 values inside parentheses, separated by commas: 1: number of pixels to offset from the left side of the image 2: number of pixels to offset from the top of the image 3: width of the new cropped frame in pixels 4: height of the new cropped frame in pixels')
-	parser.add_argument('-z', '--digital_zoom', type=tuple, default=setup.recording_digital_zoom, help='an option to "digitally zoom in" by just recording from a portion of the sensor. This overrides height and width values, and can be useful to crop out glare that is negatively impacting image quality. Takes 4 values inside parentheses, separated by commas: 1: number of pixels to offset from the left side of the image 2: number of pixels to offset from the top of the image 3: width of the new cropped frame in pixels 4: height of the new cropped frame in pixels')
-	args = parser.parse_args()
-    
-	ret, todays_folder_path = create_todays_folder(args.data_folder_path)
-	if ret == 1:
-		print("Couldn't create todays folder to store data in. Exiting program. Sad!")
-		return 1
-		
-	hostname = socket.gethostname()
-	now = datetime.now()
-	now = now.strftime('_%Y-%m-%d_%H_%M_%S')
-	filename = hostname + now
-	
-	print(filename)
-	print(args.data_folder_path)
-	print(todays_folder_path)
-	print(args.recording_time)
-	print(args.quality)
-	print(args.frames_per_second)
-	
-	if args.codec == 'mp4':
-		filepath = picam2_record_mp4(filename,todays_folder_path, args.recording_time, args.frames_per_second, args.shutter, args.width, args.height, args.tuning_file, args.noise_reduction, args.digital_zoom)
-	if args.codec == 'mjpeg':
-		filepath = picam2_record_mjpeg(filename,todays_folder_path, args.recording_time, args.quality, args.frames_per_second, args.width, args.height, args.tuning_file, args.noise_reduction, args.digital_zoom)
-	
-	if setup.track_recorded_videos == True:
-		print('starting to track tags from the saved video!')
-		df, df2, frame_num = trackTagsFromVid(filepath, todays_folder_path, filename, args.dictionary, args.box_type, now)
-		
-		if setup.interpolate_data == True and df.empty == False:
-			df = interpolate(df, setup.max_seconds_gap, setup.actual_frames_per_second)
-		
-		if df.empty == False and setup.calculate_behavior_metrics == True:
-		
-			behavioral_metrics.calculate_behavior_metrics(df, setup.actual_frames_per_second, todays_folder_path, filename)
-			print("Calculating behavior metrics")
-		
-if __name__ == '__main__':
-	
-	main()
-	#logging.shutdown()
-	
+    if sys.stdout.isatty():
+        print("Running video recording script from terminal")
+    else:
+        print("Running video recording script via crontab")
+
+    if config["create_composite_nest_images"]:
+        now = datetime.now()
+        if now.hour == 23 and now.minute == 0:
+            return print("Exiting to allow composite image generation to run")
+
+    ret, todays_folder_path = create_todays_folder(config["todays_folder_path"])
+    if ret == 1:
+        return print("Failed to create today's folder")
+
+    hostname = socket.gethostname()
+    now = datetime.now().strftime('_%Y-%m-%d_%H_%M_%S')
+    filename = hostname + now
+
+    print("Filename:", filename)
+
+    filepath, actual_fps = picam2_record_mp4(filename, todays_folder_path)
+
+    if config["track_recorded_videos"]:
+
+        # Optional: load user-defined ArUco params if present in config.yaml
+        aruco_params = config.get("aruco_params", None)
+
+		# Choose tracking call depending on box_type and whether custom params are provided
+        if config["box_type"] is None and aruco_params:
+            df, df2, frame_num = trackTagsFromVid(
+				filepath,
+				todays_folder_path,
+				filename,
+				config["tag_dictionary"],
+				None,  # No preset box_type
+				now,
+				config["colony_number"],
+				aruco_params=aruco_params
+			)
+        else:
+            df, df2, frame_num = trackTagsFromVid(
+				filepath,
+				todays_folder_path,
+				filename,
+				config["tag_dictionary"],
+				config["box_type"],
+				now,
+				config["colony_number"]
+			)
+
+
+        if config["interpolate_data"] and not df.empty:
+            # already have actual_fps from recording
+            df = interpolate(df, config["max_seconds_gap"], actual_fps)
+
+        if not df.empty and config["calculate_behavior_metrics"]:
+            behavioral_metrics.calculate_behavior_metrics(
+                df,
+                actual_fps,
+                todays_folder_path,
+                filename
+            )
+            print("Behavioral metrics calculated.")
+
+if __name__ == "__main__":
+    main()

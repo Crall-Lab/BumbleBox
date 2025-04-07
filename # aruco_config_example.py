@@ -1,4 +1,4 @@
-# aruco_config_example.py
+#aruco_config_example.py
 
 # This file defines a custom ArUco DetectorParameters dictionary
 # You can import this into your tracking script or load it dynamically.
