@@ -95,18 +95,12 @@ def picam2_record_mp4(filename, outdir, recording_time, fps, shutter_speed, widt
     print(output)
     vid_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output,vid_fourcc,10,(4032,3040))
-    out2 = cv2.VideoWriter('/home/pi/Desktop/bbox-02-local/latest-02.mp4',vid_fourcc,10,(4032,3040))
     
     for i, im_array in enumerate(frames_list):
         frame = im_array[0]
         rgb_im = cv2.cvtColor(frame, cv2.COLOR_YUV420p2RGB)
         out.write(rgb_im)
-        out2.write(rgb_im)
         print("wrote another frame!")
-    
-    f = open('/home/pi/Desktop/bbox-02-local/info.txt', 'w')
-    f.write(f'{output}: written at {datetime.now()}') 
-    f.close()
     
     out.release()
     cv2.destroyAllWindows()
@@ -297,7 +291,6 @@ def trackTagsFromVid_MP4(frames_list, todays_folder_path, filename, tag_dictiona
         df = df.rename(columns = {0:'filename', 1:'colony number', 2:'datetime', 3:'frame', 4:'ID', 5:'centroidX', 6:'centroidY', 7:'frontX', 8:'frontY'})
         df.to_csv(todays_folder_path + "/" + filename + '_raw.csv', index=False)
         print(f'saved raw csv to {todays_folder_path}{filename}_raw.csv')
-        df.to_csv('~/Desktop/bbox-02-local/latest_tracking.csv', index=False)
 
     except Exception as e:
         logger.exception("Exception occurred: %s", str(e))
