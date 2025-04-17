@@ -82,6 +82,29 @@ def remove_jumps(interpolated_df):
     
     return interpolated_df
 
+#Calculate the angle between the center of the ArUco tag and the top of the tag (make sure it points towards the head!), 
+#which are automatically calculated and stored in the raw.csv
+#Store it in a column as radians and in a column as degrees
+#Return the updated matrix with these two new columns
+def compute_heading_angle(df):
+    """
+    Computes the heading angle (in radians and degrees) for each bee, based on
+    the vector from centroid to front. Adds two columns:
+      - 'heading_angle': angle in radians, range [-π, π]
+      - 'heading_angle_deg': angle in degrees, range [0, 360)
+    """
+    dx = df['frontX'] - df['centroidX']
+    dy = df['frontY'] - df['centroidY']
+    
+    # Radians: [-pi, pi]
+    df['heading_angle'] = np.arctan2(dy, dx)
+    
+    # Degrees: [0, 360)
+    df['heading_angle_deg'] = np.degrees(df['heading_angle']) % 360
+    
+    return df
+	
+
 def main():
 	print("I am a python module, I am not run by myself. I just contain functions that are imported by other scripts to use!")
 	
