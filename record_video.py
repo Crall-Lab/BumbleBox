@@ -15,7 +15,7 @@ from picamera2.encoders import JpegEncoder
 from libcamera import controls
 from config_loader import load_config
 import behavioral_metrics
-from data_cleaning import interpolate
+import data_cleaning
 from tag_tracking_utils import load_actual_fps
 from tag_tracking_utils import trackTagsFromVid
 
@@ -168,10 +168,17 @@ def main():
 				config["colony_number"]
 			)
 
+	if config["remove_jumps"] and not df.empty:
+
+	    df = data_cleaning.remove_jumps(df)
 
         if config["interpolate_data"] and not df.empty:
             # already have actual_fps from recording
-            df = interpolate(df, config["max_seconds_gap"], actual_fps)
+            df = data_cleaning.interpolate(df, config["max_seconds_gap"], actual_fps)
+
+	if config["compute_heading_angle"] and not df.empty:
+
+	    df = data_cleaning.compute_heading_angle(df)
 
         if not df.empty and config["calculate_behavior_metrics"]:
             behavioral_metrics.calculate_behavior_metrics(
