@@ -1,34 +1,41 @@
 # config.yaml
+
+#TO DO!
 # this needs to be checked for confirmation that it's correct, some stuff isn't right currently
+#need to make sure the jump threshold pixels value is correct for the BumbleBox by default! Not the new rig (as of 2024)
+#Contact distance config - is this even integrated into the code??? I don't think so currently, I THINK it's just based on pixel contact distance - CHECK!
+#Add angular velocity metric, with the caveat that you haven't tested it for bugs yet - needs to be tested before integrating it, obviously
+#Add something like "are bees facing each other" function to behavioral metrics, and add that to the behavioral function list here
+#Need to add delete duplicate function and at least make note of it here
 
 # BumbleBox ID and system
 colony_number: "01"
 
 # Recording options
-tag_tracking: true
-tag_tracking_frequency: 5
-recording_time: 20
-recording_frequency: 30
-track_recorded_videos: true
-infrared_recording: true
+recording_options:
+  tag_tracking: true
+  tag_tracking_frequency: 5
+  recording_time: 20
+  recording_frequency: 30
+  track_recorded_videos: true
+  infrared_recording: true
 
 # Camera settings
-width: 4056
-height: 3040
-frames_per_second: 5
-actual_frames_per_second: 4.4
-shutter_speed: 2500
-tuning_file: "imx477_noir.json"
-noise_reduction_mode: "Auto"
-recording_digital_zoom: null
-codec: "mp4"
-quality: 95
+camera_settings:
+  width: 4056
+  height: 3040
+  frames_per_second: 5
+  actual_frames_per_second: 4.4
+  shutter_speed: 2500
+  tuning_file: "imx477_noir.json"
+  noise_reduction_mode: "Auto"
+  recording_digital_zoom: null
+  codec: "mp4"
+  quality: 95
 
 # ArUco tracking
 tag_dictionary: "4X4_50"
 box_type: "custom"
-interpolate_data: true
-max_seconds_gap: 3
 
 # If box type: "null", then the following custom parameters can be used
 aruco_params:
@@ -36,6 +43,23 @@ aruco_params:
   adaptiveThreshWinSizeMin: 5
   adaptiveThreshWinSizeStep: 6
   polygonalApproxAccuracyRate: 0.06
+
+#data cleaning module
+#need to make sure the jump threshold pixels value is correct for the BumbleBox by default! Not the new rig (as of 2024)
+#Fyi, the module removes frame-level duplicate tag readings by default
+date cleaning:
+  #drop_unresolvable refers to duplicate tags, where we cant figure out which one is more likely to be the correct tag, so we drop them both if set to true
+  #otherwise, both are flagged as being "unresolvable" but are kept in the dataframe so we know roughly how many unresolved duplicates there are
+  drop_unresolvable: true
+  remove_jumps: true
+  jump_threshold_pixels: 500
+  interpolate_data: true
+  #maximum number of seconds to interpolate data between two tag reads - if max_seconds_gap is set to 3 seconds, if tag 0 is read in a frame and then only read again
+  #in another frame 4 seconds later, the BumbleBox software won't interpolate between those two tag reads
+  #the software uses the max_seconds_gap value and the framerate of the video to determine the threshold number of frames 
+  max_seconds_gap: 3
+  compute_heading_angle: true
+  
 
 
 # Behavior metrics
@@ -47,7 +71,8 @@ behavior_metrics:
   - pairwise distance
   - contacts
   - video averages
-contact_distance: 2.0  # in cm
+#Contact distance - is this even integrated into the code??? I don't think so currently, I THINK it's just based on pixel contact distance - CHECK!
+contact_distance: 2.0  # in cm 
 pixel_contact_distance: 206.1
 moving_threshold: 3.16
 
