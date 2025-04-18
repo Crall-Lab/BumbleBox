@@ -39,14 +39,15 @@ def create_todays_folder(dirpath):
     return 0, todays_folder_path
 
 def picam2_record_mp4(filename, outdir):
-    fps = config["frames_per_second"]
-    shutter_speed = config["shutter_speed"]
-    width = config["width"]
-    height = config["height"]
-    tuning_file = config["tuning_file"]
-    noise_reduction_mode = config["noise_reduction_mode"]
-    digital_zoom = config["recording_digital_zoom"]
-    recording_time = config["recording_time"]
+    fps = config["camera_settings"]["frames_per_second"]
+    shutter_speed = config["camera_settings"]["shutter_speed"]
+    width = config["camera_settings"]["width"]
+    height = config["camera_settings"]["height"]
+    tuning_file = config["camera_settings"]["tuning_file"]
+    noise_reduction_mode = config["camera_settings"]["noise_reduction_mode"]
+    digital_zoom = config["camera_settings"]["recording_digital_zoom"]
+    
+    recording_time = config["recording_options"]["recording_time"]
 
     tuning = Picamera2.load_tuning_file(tuning_file)
     picam2 = Picamera2(tuning=tuning)
@@ -140,7 +141,7 @@ def main():
 
     filepath, actual_fps = picam2_record_mp4(filename, todays_folder_path)
 
-    if config["track_recorded_videos"]:
+    if config["recording_options"]["track_recorded_videos"]:
 
         # Optional: load user-defined ArUco params if present in config.yaml
         aruco_params = config.get("aruco_params", None)
@@ -167,16 +168,23 @@ def main():
 				now,
 				config["colony_number"]
 			)
-
-	if config["remove_jumps"] and not df.empty:
+	#The duplicate related functions do the following:
+	#find and remove any completely duplicate rows 
+	#find duplicated tags in the same frame that have different XY coordinates - this happens in Aruco tracking
+	#the severity usually depends on aruco parameters you're using, so if you're experimenting with those, watch out for duplicates
+	#remove the duplicate tag that is further away from the most recent instance of that tag being tracked (on either side of the frame with the duplicate tags)
+	#based on the value of ______ in the config.yaml file, either remove both duplicate tags if there isn't a tag near enough to check against
+	#OR flag both of them as being unresolvable duplicates - they'll have a True value in the "unresolvable duplicates" column
+	#If 
+	if config["data_cleaning"]["remove_jumps"] and not df.empty:
 
 	    df = data_cleaning.remove_jumps(df)
 
-        if config["interpolate_data"] and not df.empty:
+        if config["data_cleaning"]["interpolate_data"] and not df.empty:
             # already have actual_fps from recording
             df = data_cleaning.interpolate(df, config["max_seconds_gap"], actual_fps)
 
-	if config["compute_heading_angle"] and not df.empty:
+	if config["data_cleaning"]["compute_heading_angle"] and not df.empty:
 
 	    df = data_cleaning.compute_heading_angle(df)
 
