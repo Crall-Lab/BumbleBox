@@ -27,14 +27,17 @@ import os
 import argparse
 import pandas as pd
 import time
+from datetime import datetime
 import behavioral_metrics
-from tag_tracking_utils import track_tags_from_video, load_actual_fps
+from tag_tracking_utils import trackTagsFromVid, load_actual_fps
 
 # TODO: Remove these hard-coded constants and place them in setup.py or pass as command-line arguments
 MOVING_THRESHOLD = 3.16  # pixels/frame threshold to determine movement vs noise
 SPEED_CUTOFF_SECONDS = 4  # max gap to interpolate speed values
 PIXEL_CONTACT_DISTANCE = 206.1  # contact distance in pixels (depends on setup)
 
+#need to get rid of now, colony_number, cause these should be found within the function and video and fed to 
+#tracking script 
 def main(video_folder, dictionary, box_type, fallback_fps, run_metrics):
     for root, _, files in os.walk(video_folder):
         for file in files:
@@ -43,12 +46,17 @@ def main(video_folder, dictionary, box_type, fallback_fps, run_metrics):
                 filename = os.path.splitext(file)[0]
                 print(f"\nProcessing video: {filename}")
 
-                df, df2, frame_num = track_tags_from_video(
+                now = NEED TO ADD THESE VALUES
+                colony_number = NEED TO ADD THESE VALUES
+
+                df, df2, frame_num = trackTagsFromVid(
                     filepath=filepath,
                     output_dir=root,
                     filename=filename,
                     tag_dictionary=dictionary,
-                    box_type=box_type
+                    box_type=box_type,
+                    now=now,
+                    colony_number=colony_number
                 )
 
                 fps = load_actual_fps(filepath) or fallback_fps
@@ -73,17 +81,23 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    now = datetime.now()
+    colony_number = config["colony_number"]
+    
     print(f"Video folder: {args.video_folder}")
     print(f"Aruco dictionary: {args.dictionary}")
     print(f"Box type for Aruco parameters: {args.box_type}")
+    print(f"Current datetime: {}")
     print(f"Fallback FPS for metrics: {args.fps}")
     print(f"Behavioral metrics being run: {args.metrics}")
     print("Starting processing...")
-
+    #video_folder, dictionary, box_type, now, colony_number, fallback_fps, run_metrics
     main(
         video_folder=args.video_folder,
         dictionary=args.dictionary,
         box_type=args.box_type,
+        now=now,
+        colony_number=colony_number,
         fallback_fps=args.fps,
         run_metrics=args.metrics
     )
