@@ -183,6 +183,8 @@ def main():
     else:
         from tag_tracking_utils import trackTagsFromRAM as trackRAM
 
+    print(f"Running {'parallel' if use_parallel else 'serial'} RAM-based ArUco tracking.")
+
     df, df2, frame_num = trackRAM(
         filename,
         todays_folder_path,
