@@ -115,7 +115,7 @@ def picam2_record_mp4(filename, outdir):
     with open(os.path.join(outdir, filename + '_actual_fps.txt'), 'w') as f:
         f.write(f"{actual_fps:.3f}")
 
-    return output_path, actual_fps
+    return frames_list, output_path, actual_fps
 
 
 def main():
@@ -139,9 +139,10 @@ def main():
 
     print("Filename:", filename)
 
-    filepath, actual_fps = picam2_record_mp4(filename, todays_folder_path)
+    frames_list, filepath, actual_fps = picam2_record_mp4(filename, todays_folder_path)
 
-    if config["recording_options"]["track_recorded_videos"]:
+    #Idk why I got rid of MJPEG recording, but for when I bring it back - we'll use this function for MJPEG and the trackRAM for MP4
+    if config["recording_options"]["track_recorded_videos"] and config["camera_settings"]["codec"] == ".mjpeg":
 
         # Optional: load user-defined ArUco params if present in config.yaml
         aruco_params = config.get("aruco_params", None)
@@ -168,6 +169,38 @@ def main():
 				now,
 				config["colony_number"]
 			)
+
+	#leverage the RAM tracking script to better use the multiprocessing function
+    elif config["recording_options"]["track_recorded_videos"] and config["camera_settings"]["codec"] == ".mp4":
+
+        # Optional: load user-defined ArUco params if present in config.yaml
+        aruco_params = config.get("aruco_params", None)
+
+		# Choose tracking call depending on box_type and whether custom params are provided
+        if config["box_type"] is None and aruco_params:
+            df, df2, frame_num = trackTagsFromRAM(
+				filename,
+				todays_folder_path,
+		    		frames_list,
+				config["tag_dictionary"],
+				None,  # No preset box_type
+				now,
+				config["colony_number"],
+				aruco_params=aruco_params
+			)
+        else:
+            df, df2, frame_num = trackTagsFromRAM(
+				filename,
+				todays_folder_path,
+		    		frames_list,
+				config["tag_dictionary"],
+				config["box_type"],
+				now,
+		    		hostname,
+				config["colony_number"]
+			)
+
+	
 	#The duplicate related functions do the following:
 	#find and remove any completely duplicate rows 
 	#find duplicated tags in the same frame that have different XY coordinates - this happens in Aruco tracking
