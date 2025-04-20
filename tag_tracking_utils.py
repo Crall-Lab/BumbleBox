@@ -30,13 +30,14 @@ def trackTagsFromVid(filepath, todays_folder_path, filename, tag_dictionary, box
 
     parameters = aruco.DetectorParameters()
   
-       # Apply preset parameters for specific box types
-    #Change these to match the BumbleBox!
+    #Apply preset parameters for specific box types
+    #Optimized custom BumbleBox parameters:  
     if box_type == 'custom':
-        parameters.minMarkerPerimeterRate = 0.03
-        parameters.adaptiveThreshWinSizeMin = 5
-        parameters.adaptiveThreshWinSizeStep = 6
-        parameters.polygonalApproxAccuracyRate = 0.06
+        parameters.minMarkerPerimeterRate = 0.02
+        parameters.adaptiveThreshWinSizeMin = 3
+        parameters.adaptiveThreshWinSizMax = 31
+        parameters.adaptiveThreshWinSizeStep = 3
+        parameters.polygonalApproxAccuracyRate = 0.08
 
     elif box_type == 'koppert':
         print("Note: 'koppert' box_type selected, but no presets defined yet.")
@@ -124,13 +125,14 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
 
     parameters = aruco.DetectorParameters()
   
-       # Apply preset parameters for specific box types
-    #Change these to match the BumbleBox!
+    #Apply preset parameters for specific box types
+    #Optimized custom BumbleBox parameters:  
     if box_type == 'custom':
-        parameters.minMarkerPerimeterRate = 0.03
-        parameters.adaptiveThreshWinSizeMin = 5
-        parameters.adaptiveThreshWinSizeStep = 6
-        parameters.polygonalApproxAccuracyRate = 0.06
+        parameters.minMarkerPerimeterRate = 0.02
+        parameters.adaptiveThreshWinSizeMin = 3
+        parameters.adaptiveThreshWinSizMax = 31
+        parameters.adaptiveThreshWinSizeStep = 3
+        parameters.polygonalApproxAccuracyRate = 0.08
 
     elif box_type == 'koppert':
         print("Note: 'koppert' box_type selected, but no presets defined yet.")
@@ -262,11 +264,15 @@ def trackTagsFromRAM_parallel(filename, todays_folder_path, frames_list, tag_dic
 
     parameters = aruco.DetectorParameters()
 
+    #Apply preset parameters for specific box types
+    #Optimized custom BumbleBox parameters:  
     if box_type == 'custom':
-        parameters.minMarkerPerimeterRate = 0.03
-        parameters.adaptiveThreshWinSizeMin = 5
-        parameters.adaptiveThreshWinSizeStep = 6
-        parameters.polygonalApproxAccuracyRate = 0.06
+        parameters.minMarkerPerimeterRate = 0.02
+        parameters.adaptiveThreshWinSizeMin = 3
+        parameters.adaptiveThreshWinSizMax = 31
+        parameters.adaptiveThreshWinSizeStep = 3
+        parameters.polygonalApproxAccuracyRate = 0.08
+        
     elif aruco_params:
         print("Applying user-defined ArUco parameters:")
         for param_name, param_value in aruco_params.items():
