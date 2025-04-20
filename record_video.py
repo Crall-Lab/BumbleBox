@@ -18,6 +18,8 @@ import behavioral_metrics
 import data_cleaning
 from tag_tracking_utils import load_actual_fps
 from tag_tracking_utils import trackTagsFromVid
+from tag_tracking_utils import trackTagsFromRAM #for if we want to integrate a flag to turn multiprocessing on/off
+from tag_tracking_utils import trackTagsFromRAM_parallel
 
 config = load_config()
 username = pwd.getpwuid(os.getuid())[0]
@@ -170,35 +172,28 @@ def main():
 				config["colony_number"]
 			)
 
-	#leverage the RAM tracking script to better use the multiprocessing function
+    #leverage the RAM tracking script for faster multiprocessing and use the flag for whether multiprocessing is on/off
     elif config["recording_options"]["track_recorded_videos"] and config["camera_settings"]["codec"] == ".mp4":
 
-        # Optional: load user-defined ArUco params if present in config.yaml
-        aruco_params = config.get("aruco_params", None)
+    aruco_params = config.get("aruco_params", None)
+    use_parallel = config["recording_options"].get("use_parallel_ram_tracking", False)
 
-		# Choose tracking call depending on box_type and whether custom params are provided
-        if config["box_type"] is None and aruco_params:
-            df, df2, frame_num = trackTagsFromRAM(
-				filename,
-				todays_folder_path,
-		    		frames_list,
-				config["tag_dictionary"],
-				None,  # No preset box_type
-				now,
-				config["colony_number"],
-				aruco_params=aruco_params
-			)
-        else:
-            df, df2, frame_num = trackTagsFromRAM(
-				filename,
-				todays_folder_path,
-		    		frames_list,
-				config["tag_dictionary"],
-				config["box_type"],
-				now,
-		    		hostname,
-				config["colony_number"]
-			)
+    if use_parallel:
+        from tag_tracking_utils import trackTagsFromRAM_parallel as trackRAM
+    else:
+        from tag_tracking_utils import trackTagsFromRAM as trackRAM
+
+    df, df2, frame_num = trackRAM(
+        filename,
+        todays_folder_path,
+        frames_list,
+        config["tag_dictionary"],
+        config["box_type"],
+        now,
+        config["colony_number"],
+        aruco_params=aruco_params
+    )
+
 
 	
 	#The duplicate related functions do the following:
