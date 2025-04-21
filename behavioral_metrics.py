@@ -65,20 +65,15 @@ def compute_activity(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int, movi
     df_sorted.drop(columns=['deltaX', 'deltaY'], inplace=True)
     df_sorted.to_csv(todays_folder_path + "/" + filename + '_updated.csv', index=False)
     return df_sorted
-    
-def compute_social_center_distance(df: pd.DataFrame, todays_folder_path: str, filename: str) -> pd.DataFrame:
-    # Compute the social center for each frame
-    social_centers = df.groupby('frame')[['centroidX', 'centroidY']].mean()
-    social_centers.columns = ['centerX', 'centerY']
-   
-    # Merge the social centers with the main dataframe to calculate distances
-    df = df.merge(social_centers, left_on='frame', right_index=True)
 
+
+def compute_social_center_distance(df: pd.DataFrame, todays_folder_path: str, filename: str) -> pd.DataFrame:
+    # Compute the social center across the whole video
+    social_centers = df[['centroidX', 'centroidY']].mean() 
+    print(social_centers[0])
+    print(social_centers[1])
     # Compute the distance of each bee from the social center of its frame
-    df['distance_from_center'] = np.sqrt((df['centroidX'] - df['centerX'])**2 + (df['centroidY'] - df['centerY'])**2)
-   
-    # Drop temporary columns used for computations
-    df.drop(columns=['centerX', 'centerY'], inplace=True)
+    df['distance_from_center'] = np.sqrt((df['centroidX'] - social_centers[0])**2 + (df['centroidY'] - social_centers[1])**2)
     df_sorted = df.sort_values(by=['frame','ID'])
     df_sorted.to_csv(todays_folder_path + "/" + filename + '_updated.csv', index=False)
     return df_sorted
@@ -219,10 +214,6 @@ def compute_video_averages(df: pd.DataFrame, todays_folder_path: str, filename: 
     return video_tally
     
     
-
-
-
-
 def compile_dfs(directory_path, start_filename = None, end_filename = None, format = None, end_of_filename = 'averages.csv'):
     #not done yet!
     if format == None:
@@ -254,11 +245,6 @@ def compile_dfs(directory_path, start_filename = None, end_filename = None, form
                             df = pd.DataFrame(path)
                             
             
-            
-            
-            
-            
-
 def store_cumulative_averages(filename: str):
     #finished?
     #datetimes need to be strings in this format: "yyyy-mm-dd_HH-MM-SS"
