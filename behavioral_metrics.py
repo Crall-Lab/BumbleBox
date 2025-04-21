@@ -79,19 +79,6 @@ def compute_social_center_distance(df: pd.DataFrame, todays_folder_path: str, fi
     return df_sorted
     
     
-# function to calculate the average distance of each bee to every other tagged bee by frame of video
-def video_avg_min_max_distances(pairwise_distance_df):
-
-    avg_pd_df = 'None'
-
-    pairwise_v1 = pairwise_distance_df.drop(columns={'ID','frame'}) #drop non-data columns from new dataframe in order to calculate the min, max of the data without interference
-    pairwise_distance_df['avg_distance'] = pairwise_v1.mean(axis=1, numeric_only=True, skipna=True)
-    pairwise_distance_df['min_distance'] = pairwise_v1.min(axis=1, numeric_only=True, skipna=True) #makes sure to get the min from each row, excluding nans 
-    pairwise_distance_df['max_distance'] = pairwise_v1.max(axis=1, numeric_only=True, skipna=True)
-
-    return pairwise_distance_df
-
-
 def pairwise_distance(df: pd.DataFrame, todays_folder_path: str, filename: str) -> pd.DataFrame:
 
     video_pd_df = 'None'
@@ -175,7 +162,7 @@ def contact_matrix(df: pd.DataFrame, todays_folder_path: str, pixel_contact_dist
 
 def summary_contact_df(contact_df):
     
-    if type(contact_df) == 1:
+    if type(contact_df) == int:
         return 1
         
     contact_df.drop(columns={'frame'}, inplace=True)
@@ -246,14 +233,6 @@ def compile_dfs(directory_path, start_filename = None, end_filename = None, form
                             
             
 def store_cumulative_averages(filename: str):
-    #finished?
-    #datetimes need to be strings in this format: "yyyy-mm-dd_HH-MM-SS"
-    
-    #if type(start_datetime) == str and type(end_datetime) == str:
-    #    try:
-    #        start_filename = 
-    #        end_filename = 
-            
             
     print('computing cumulative averages')
     try:
