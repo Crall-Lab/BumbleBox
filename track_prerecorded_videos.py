@@ -30,6 +30,7 @@ import time
 from datetime import datetime
 import behavioral_metrics
 from tag_tracking_utils import trackTagsFromVid, load_actual_fps
+import re
 
 # TODO: Remove these hard-coded constants and place them in setup.py or pass as command-line arguments
 MOVING_THRESHOLD = 3.16  # pixels/frame threshold to determine movement vs noise
@@ -46,8 +47,15 @@ def main(video_folder, dictionary, box_type, fallback_fps, run_metrics):
                 filename = os.path.splitext(file)[0]
                 print(f"\nProcessing video: {filename}")
 
-                now = NEED TO ADD THESE VALUES
-                colony_number = NEED TO ADD THESE VALUES
+                #filename structure: bumblebox-XX_yyyy-mm-dd_HH_MM_SS
+                # Find the time from the filename, create a datetime object called now with the video time
+                delimiters = r"[-_]+"
+                result = re.split(delimiters, filename)
+                #result is list containing: [ bumblebox, XX, yyyy, mm, dd, HH, MM, SS ]
+                dt = result[2:]
+                dt = [ int(x) for x in dt ]
+                now = datetime.datetime(year=dt[0], month=dt[1], day=dt[2], hour=dt[3], minute=dt[4], seconds=dt[5])
+                colony_number = result[1]
 
                 df, df2, frame_num = trackTagsFromVid(
                     filepath=filepath,
@@ -80,9 +88,6 @@ if __name__ == '__main__':
     parser.add_argument('--metrics', action='store_true', help='If set, will calculate behavioral metrics')
 
     args = parser.parse_args()
-
-    now = datetime.now()
-    colony_number = config["colony_number"]
     
     print(f"Video folder: {args.video_folder}")
     print(f"Aruco dictionary: {args.dictionary}")
