@@ -18,6 +18,7 @@ recording_options:
   recording_time: 20
   recording_frequency: 30
   track_recorded_videos: true
+  use_parallel_ram_tracking: true
   infrared_recording: true
 
 # Camera settings
@@ -37,12 +38,14 @@ camera_settings:
 tag_dictionary: "4X4_50"
 box_type: "custom"
 
-# If box type: "null", then the following custom parameters can be used
+# If box type: "null", then the following custom parameters can be set manually by the user
+#Use the tracking optimization script to find the best combination of parameters
 aruco_params:
-  minMarkerPerimeterRate: 0.03
-  adaptiveThreshWinSizeMin: 5
-  adaptiveThreshWinSizeStep: 6
-  polygonalApproxAccuracyRate: 0.06
+  minMarkerPerimeterRate: 0.02
+  adaptiveThreshWinSizeMin: 3
+  adaptiveThreshWinSizeMax: 31
+  adaptiveThreshWinSizeStep: 3
+  polygonalApproxAccuracyRate: 0.08
 
 #data cleaning module
 #need to make sure the jump threshold pixels value is correct for the BumbleBox by default! Not the new rig (as of 2024)
@@ -72,7 +75,7 @@ behavior_metrics:
   - contacts
   - video averages
 #Contact distance - is this even integrated into the code??? I don't think so currently, I THINK it's just based on pixel contact distance - CHECK!
-contact_distance: 2.0  # in cm 
+contact_distance: 2.0
 pixel_contact_distance: 206.1
 moving_threshold: 3.16
 
