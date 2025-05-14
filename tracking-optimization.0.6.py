@@ -78,7 +78,7 @@ def main():
     data_path = "bumblebox-17_2025-02-14_17_30_03.mp4"
     num_frames_to_test = 50
 
-    if data_path[-1:-4] == ".mp4":
+    if data_path.endswith(".mp4") or data_path.endswith(".mjpeg"):
         cap = cv2.VideoCapture(data_path)
         if not cap.isOpened():
             raise IOError("Cannot open video file: " + data_path)
