@@ -4,6 +4,16 @@ import pandas as pd
 import numpy as np
 import math
 
+#August added back into data_cleaning.py on May 14th, 2025
+#Remove tag detections that jump over a threshold number of pixels from one frame to the very next frame
+#NOTE: this is not yet robust and its effect needs to be tested - the following scenario presents an issue for the current code:
+#Tag 20 is detected in frame 5, 6, and 7
+#The first detection, upon review, is the false detection - it is across the nest from where bee 20 actually is.
+#The next detection jumps back to the correct position. But which detection actually gets dropped?
+#My current understanding upon review and without testing is that the true tag detection would be dropped, which is incorrect.
+#I think the third detection would be fine in this case.
+#BUT WAIT: in the scenario where bee 20 is tracked in 5,6,7: if detection 6 is the false detection, the diff row between 6 and 7
+#would also be flagged, and would detection 7 be removed? Needs testing!
 def remove_jumps(interpolated_df):
 
     unique_ids = interpolated_df["ID"].unique() 
