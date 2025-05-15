@@ -15,7 +15,7 @@ For more information and detail, see the BumbleBox preprint available [here](htt
 
 ## Animations of BumbleBox construction
 
-Youtube link to the animations playlist here: [here](https://www.youtube.com/playlist?list=PLHFFPE_W56kkKZQcCbZdQC42oRvphlQpn)
+Youtube link to the animations playlist [here](https://www.youtube.com/playlist?list=PLHFFPE_W56kkKZQcCbZdQC42oRvphlQpn)
 <br /><br />
 ## BumbleBox Construction Instructions
 
