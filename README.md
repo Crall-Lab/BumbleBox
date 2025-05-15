@@ -9,6 +9,8 @@ https://github.com/Crall-Lab/BumbleBox/assets/102829182/92d87284-6381-4c2a-ad78-
 ## About the BumbleBox
 
 The BumbleBox is an open-source system for automated tracking and behavioral quantification of individual bumblebees that can be built using low-cost consumer components and DIY fabrication (i.e., 3D-printing and laser-cutting). Here we provide an integrated pipeline for data collection and analysis, including nest arena design, software for automated collection of video data, and the quantification of individual behavior. The BumbleBox system is designed to be (a) accessible, requiring no prior experience with programming or hardware design to operate; (b) scalable, allowing long-term, automated tracking across many units in parallel at low-cost; and (c) modular, allowing for flexible adoption to unique applications in bumblebees and other systems.
+
+For more information and detail, see the BumbleBox preprint available here: [here](https://www.biorxiv.org/content/10.1101/2024.11.07.622358v1)
 <br /><br />
 
 ## Animations of BumbleBox construction
