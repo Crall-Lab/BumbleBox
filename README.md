@@ -22,6 +22,11 @@ Youtube link to the animations playlist [here](https://www.youtube.com/playlist?
 See building instructions in a google document [here](https://docs.google.com/document/d/14RvdYWr2pkWZVl2kxIvVvCeMsCQhhuTJNkAIiLYHth8/edit?usp=sharing)
 <br /><br />
 
+## BumbleBox Tag Printing Instructions
+
+See tag printing instructions in a google document [here]([https://docs.google.com/document/d/14RvdYWr2pkWZVl2kxIvVvCeMsCQhhuTJNkAIiLYHth8/edit?usp=sharing](https://drive.google.com/drive/u/0/folders/1Vo9fvq7aNfH8e6DbP0gsfipdG1OiTIls))
+<br /><br />
+
 ## Software Installation and Setup
 
 See instruction videos [here](https://www.youtube.com/channel/UCykbaZYtgNcFspMfKnfSwYA)
