@@ -67,22 +67,13 @@ def compute_activity(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int, movi
     return df_sorted
     
 def compute_social_center_distance(df: pd.DataFrame, todays_folder_path: str, filename: str) -> pd.DataFrame:
-    # Compute the social center for each frame
-    social_centers = df.groupby('frame')[['centroidX', 'centroidY']].mean()
-    social_centers.columns = ['centerX', 'centerY']
-   
-    # Merge the social centers with the main dataframe to calculate distances
-    df = df.merge(social_centers, left_on='frame', right_index=True)
-
+        # Compute the social center across the whole video
+    social_centers = df[['centroidX', 'centroidY']].mean() 
     # Compute the distance of each bee from the social center of its frame
-    df['distance_from_center'] = np.sqrt((df['centroidX'] - df['centerX'])**2 + (df['centroidY'] - df['centerY'])**2)
-   
-    # Drop temporary columns used for computations
-    df.drop(columns=['centerX', 'centerY'], inplace=True)
+    df['distance_from_center'] = np.sqrt((df['centroidX'] - social_centers[0])**2 + (df['centroidY'] - social_centers[1])**2)
     df_sorted = df.sort_values(by=['frame','ID'])
     df_sorted.to_csv(todays_folder_path + "/" + filename + '_updated.csv', index=False)
     return df_sorted
-    
     
 # function to calculate the average distance of each bee to every other tagged bee by frame of video
 def video_avg_min_max_distances(pairwise_distance_df):
