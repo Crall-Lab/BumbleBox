@@ -14,7 +14,7 @@ import math
 #I think the third detection would be fine in this case.
 #BUT WAIT: in the scenario where bee 20 is tracked in 5,6,7: if detection 6 is the false detection, the diff row between 6 and 7
 #would also be flagged, and would detection 7 be removed? Needs testing!
-def remove_jumps(interpolated_df):
+def remove_jumps_old(interpolated_df):
 
     unique_ids = interpolated_df["ID"].unique() 
     for bee_id in unique_ids:
@@ -28,6 +28,99 @@ def remove_jumps(interpolated_df):
             interpolated_df.drop(index, axis=0, inplace=True)
     
     return interpolated_df
+
+import math
+import pandas as pd
+import os
+
+def remove_jumps(df, jump_thresh=500, log_path='jump_log.csv', video_id='unknown_video'):
+    """
+    Flags suspicious jumps in ArUco tag tracking data and logs jump rows + neighbors.
+
+    Args:
+        df (pd.DataFrame): tracking data with columns ['ID', 'frame', 'centroidX', 'centroidY']
+        jump_thresh (float): pixel threshold for detecting jumps
+        log_path (str): path to append the jump log CSV file
+        video_id (str): identifier for the current video
+
+    Returns:
+        pd.DataFrame: DataFrame with 'flagged_as_jump' column added
+    """
+    cleaned_df = df.copy()
+    cleaned_df['flagged_as_jump'] = False
+
+    log_entries = []
+
+    for bee_id in cleaned_df['ID'].unique():
+        bee_df = cleaned_df[cleaned_df['ID'] == bee_id].sort_values('frame')
+        positions = bee_df[['centroidX', 'centroidY']].values
+        frames = bee_df['frame'].values
+        indices = bee_df.index.values
+
+        for i in range(1, len(positions) - 1):
+            frame_prev = frames[i - 1]
+            frame_curr = frames[i]
+            frame_next = frames[i + 1]
+
+            if frame_curr - frame_prev == 1 and frame_next - frame_curr == 1:
+                prev = positions[i - 1]
+                curr = positions[i]
+                next = positions[i + 1]
+
+                dist_prev = math.dist(prev, curr)
+                dist_next = math.dist(curr, next)
+
+                if dist_prev > jump_thresh and dist_next > jump_thresh:
+                    jump_index = indices[i]
+                    prev_index = indices[i - 1]
+                    next_index = indices[i + 1]
+
+                    cleaned_df.loc[jump_index, 'flagged_as_jump'] = True
+
+                    # Add log entries
+                    for idx, label in zip([prev_index, jump_index, next_index], ['neighbor', 'jump', 'neighbor']):
+                        row = cleaned_df.loc[idx].copy()
+                        row['video'] = video_id
+                        row['label'] = label
+                        log_entries.append(row)
+
+    # Append to CSV log
+    if log_entries:
+        log_df = pd.DataFrame(log_entries)
+        log_columns = ['video', 'ID', 'frame', 'centroidX', 'centroidY', 'label']
+        log_df = log_df[log_columns]
+
+        write_header = not os.path.exists(log_path)
+        log_df.to_csv(log_path, mode='a', header=write_header, index=False)
+
+    return cleaned_df
+
+def summarize_jump_log(log_path='jump_log.csv'):
+    """
+    Summarize total jump detections per bee across all videos.
+
+    Args:
+        log_path (str): path to the CSV log file
+
+    Prints:
+        Total jump counts per bee ID and optional per video.
+    """
+    if not os.path.exists(log_path):
+        print("No log file found.")
+        return
+
+    log_df = pd.read_csv(log_path)
+
+    summary = (
+        log_df[log_df['label'] == 'jump']
+        .groupby('ID')
+        .size()
+        .reset_index(name='n_jumps')
+        .sort_values('n_jumps', ascending=False)
+    )
+
+    print("🐝 Jump Summary by Bee ID:")
+    print(summary.to_string(index=False))
 
 
 #check for multiples of the same tag in each frame
