@@ -3,7 +3,6 @@
 import pandas as pd
 import numpy as np
 import math
-import os
 
 #August added back into data_cleaning.py on May 14th, 2025
 #Remove tag detections that jump over a threshold number of pixels from one frame to the very next frame
@@ -30,8 +29,11 @@ def remove_jumps_old(interpolated_df):
     
     return interpolated_df
 
+import math
+import pandas as pd
+import os
 
-def remove_jumps(df, log_path=None, jump_thresh=500):
+def remove_jumps(df, jump_thresh=500, log_path='jump_log.csv', video_id='unknown_video'):
     """
     Flags suspicious jumps in ArUco tag tracking data and logs jump rows + neighbors.
 
@@ -44,16 +46,8 @@ def remove_jumps(df, log_path=None, jump_thresh=500):
     Returns:
         pd.DataFrame: DataFrame with 'flagged_as_jump' column added
     """
-
     cleaned_df = df.copy()
     cleaned_df['flagged_as_jump'] = False
-
-    if log_path is None:
-        colony_number = cleaned_df.loc[0,'colony number']
-        log_dir = "./jump_logs"
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-        log_path = f"./jump_logs/bumblebox-{colony_number}_jump_log.csv"
 
     log_entries = []
 
@@ -86,27 +80,22 @@ def remove_jumps(df, log_path=None, jump_thresh=500):
                     # Add log entries
                     for idx, label in zip([prev_index, jump_index, next_index], ['neighbor', 'jump', 'neighbor']):
                         row = cleaned_df.loc[idx].copy()
-                        #row['filename'] = video_id
-                        #row['ID'] = bee_id
-                        #row['frame'] = frames[idx]
-                        
-                        #row['centroidX'] = curr[0]
-                        #row['centroidY'] = curr[1]
-                        #row['label'] = label
-                        row = row[['filename', 'ID', 'frame', 'centroidX', 'centroidY']]
+                        row['video'] = video_id
                         row['label'] = label
                         log_entries.append(row)
 
     # Append to CSV log
     if log_entries:
-        log_df = pd.DataFrame(log_entries, columns=['filename', 'ID', 'frame', 'centroidX', 'centroidY', 'label'])
+        log_df = pd.DataFrame(log_entries)
+        log_columns = ['video', 'ID', 'frame', 'centroidX', 'centroidY', 'label']
+        log_df = log_df[log_columns]
 
         write_header = not os.path.exists(log_path)
         log_df.to_csv(log_path, mode='a', header=write_header, index=False)
 
     return cleaned_df
 
-def summarize_jump_log(log_path):
+def summarize_jump_log(log_path='jump_log.csv'):
     """
     Summarize total jump detections per bee across all videos.
 
@@ -119,18 +108,8 @@ def summarize_jump_log(log_path):
     if not os.path.exists(log_path):
         print("No log file found.")
         return
-    try:
-        log_df = pd.read_csv(log_path)
-    except pd.errors.EmptyDataError:
-        print("Log file is empty or not formatted correctly.")
-        return
-    
-    if log_df.empty:
-        print("Log file is empty.")
-        return
 
-    # Ensure no duplicate entries
-    log_df.drop_duplicates(inplace=True)
+    log_df = pd.read_csv(log_path)
 
     summary = (
         log_df[log_df['label'] == 'jump']
@@ -139,101 +118,29 @@ def summarize_jump_log(log_path):
         .reset_index(name='n_jumps')
         .sort_values('n_jumps', ascending=False)
     )
-    summary2 = (
-        log_df[log_df['label'] == 'jump']
-        .groupby(['filename'])
-        .size()
-        .reset_index(name='n_jumps_per_video')  # Average jumps per video
-        .sort_values('n_jumps_per_video', ascending=False)
-        #.mean(axis=1, numeric_only=True)  # Calculate the mean
-        #.round(2)
-    )
-    summary1 = summary2['n_jumps_per_video'].mean().round(2)  # Calculate the mean of jumps per video
 
     print("🐝 Jump Summary by Bee ID:")
     print(summary.to_string(index=False))
-    print("\nAverage Jumps per Video:")
-    print(summary1, "\n")
-    print(summary2.to_string(index=False))
 
 
 #check for multiples of the same tag in each frame
-def return_duplicate_bees(df, duplicate_log_path=None):
+def return_duplicate_bees(df):
 
-    df.drop_duplicates(inplace=True, keep='first') #drops second row of two completely duplicate rows before we look for duplicate tags 
-    
-    if duplicate_log_path is None:
-        colony_number = df.loc[0,'colony number']
-        duplicate_log_dir = "./duplicate_logs"
-        if not os.path.exists(duplicate_log_dir):
-            os.makedirs(duplicate_log_dir)
-        duplicate_log_path = f"./duplicate_logs/bumblebox-{colony_number}_duplicate_log.csv"
-        write_header = not os.path.exists(duplicate_log_path)
+    df.drop_duplicates(inplace=True) #drops completely duplicate rows before we look for duplicate tags 
     
     try:
-        df['duplicate'] = df.duplicated(['filename', 'ID', 'frame'], keep = False) #update df to include column that tracks duplicate tag detections based on these columns
-        if True in df['duplicate'].values:#there are any trues in df.duplicated, return the updated df, else return print(no duplicates!)
-            #print('Yes, there are duplicate tag readings in the same frame! Theyve been marked True in the duplicates column.')
-            duplicate_df = df[df['duplicate'] == True]  # Subset to only the duplicate rows
-            duplicate_df = duplicate_df[['filename', 'ID', 'frame', 'centroidX', 'centroidY', 'duplicate']]  # Select relevant columns for the log
-            write_header = not os.path.exists(duplicate_log_path)
-            duplicate_df.to_csv(duplicate_log_path, mode='a', header=write_header, index=False)  # Save the duplicates log
+        df['duplicate_in_frame'] = df.duplicated(['video path', 'bee ID', 'frame number', 'col #'], keep = False) #update df to include column that tracks duplicate tag detections based on these columns
+        if True in df['duplicate_in_frame'].values:#there are any trues in df.duplicated, return the updated df, else return print(no duplicates!)
+            print('Yes, there are duplicate tag readings in the same frame! Theyve been marked True in the duplicates column.')
             return df, 0
             # return None, print('No duplicates in this dataframe!')
         else:
-            #print('There arent any duplicates in this dataframe!')
+            print('There arent any duplicates in this dataframe!')
             return df, 1
-    except Exception as e:
-        print('''An error occured in the function return_duplicate_bees() while trying to create a new column to track whether any tags are duplicates.''')
-        print(e)
+    except:
+        print('''An error occured in the function return_duplicate_bees() while trying to create a new column to track whether any tags are duplicates.
+                 If the error raised looks like this: 'KeyError: Index(['col #'], dtype='object')' it was raised likely because you havent run the function to add colony numbers to the dataframe''')
         return 1, 1
-
-def summarize_duplicate_log(duplicate_path):
-    """
-    Summarize total jump detections per bee across all videos.
-
-    Args:
-        log_path (str): path to the CSV log file
-
-    Prints:
-        Total jump counts per bee ID and optional per video.
-    """
-    if not os.path.exists(duplicate_path):
-        print("No log file found.")
-        return
-    try:
-        log_df = pd.read_csv(duplicate_path)
-    except pd.errors.EmptyDataError:
-        print("Log file is empty or not formatted correctly.")
-        return
-    
-    if log_df.empty:
-        print("Log file is empty.")
-        return
-
-    # Ensure no fully duplicate entries - not the same as dropping the duplicates we're interested in looking for, which will have different centroidX/Y values and thus wont be dropped
-    log_df.drop_duplicates(inplace=True)
-
-    summary = (
-        log_df[log_df['duplicate'] == True]
-        .groupby('ID')
-        .size()
-        .reset_index(name='n_duplicates')
-        .sort_values('n_duplicates', ascending=False)
-    )
-    summary1 = (
-        log_df[log_df['duplicate'] == True]
-        .groupby(['filename'])
-        .size()
-        .reset_index(name='n_jumps_per_video')
-        .mean()  # Average jumps per video
-        .round(2)
-    )
-
-    print("🐝 Duplicate Summary by Bee ID:")
-    print(summary.to_string(index=False))
-    print("\nAverage Duplicates per Video:")
-    print(summary1.to_string(index=False))
 
 
 #Helper function that runs inside of the drop_duplicates_clean function (below)
@@ -255,7 +162,6 @@ def resolve_duplicate_by_proximity(duplicate_rows, nearest_row):
 
     # Loop over each duplicate candidate in the current frame
     for idx, row in duplicate_rows.iterrows():
-        #print("filename:", row['filename'], 'ID: ', row['ID'], "frame: ", row['frame'], "xy: ", (row['centroidX'], row['centroidY']), "nearest xy: ", (nearest_row['centroidX'], nearest_row['centroidY']))
         # Compute Euclidean distance between this candidate and the known nearby position
         dx = row['centroidX'] - nearest_row['centroidX']
         dy = row['centroidY'] - nearest_row['centroidY']
@@ -270,7 +176,7 @@ def resolve_duplicate_by_proximity(duplicate_rows, nearest_row):
     return closest_idx, closest_row
 
 
-def mark_or_drop_duplicates(df, return_val, mark_duplicates=True, drop_unresolvable=True):
+def drop_duplicates_clean(df, return_val, drop_unresolvable=True):
     """
     Resolves duplicate detections of the same bee ID within a single frame based on spatial proximity
     to known positions in neighboring frames. Keeps the most plausible tag and optionally flags or
@@ -293,6 +199,7 @@ def mark_or_drop_duplicates(df, return_val, mark_duplicates=True, drop_unresolva
         return df
 
     # Add helper columns to track which rows were part of a duplicate set and what happened to them
+    df['og_duplicate'] = False
     df['unresolvable_duplicate'] = False
 
     if return_val == 0:
@@ -300,26 +207,29 @@ def mark_or_drop_duplicates(df, return_val, mark_duplicates=True, drop_unresolva
         duplicates = df[df['duplicate'] == True]
 
         # Create a table of unique (video, colony, bee ID, frame) combinations with duplicates
-        dupe_keys = duplicates[['filename', 'ID', 'frame']].drop_duplicates()
+        dupe_keys = duplicates[['video path', 'col #', 'bee ID', 'frame number']].drop_duplicates()
 
         # Loop through each unique duplicated instance
         for _, row in dupe_keys.iterrows():
-            vid = row['filename']
-            bee = row['ID']
-            frame = row['frame']
+            vid = row['video path']
+            col = row['col #']
+            bee = row['bee ID']
+            frame = row['frame number']
 
             # Get all the duplicated rows for this (video, colony, bee ID, frame)
             specific_duplicates = duplicates[
-                (duplicates['filename'] == vid) &
-                (duplicates['ID'] == bee) &
-                (duplicates['frame'] == frame)
+                (duplicates['video path'] == vid) &
+                (duplicates['col #'] == col) &
+                (duplicates['bee ID'] == bee) &
+                (duplicates['frame number'] == frame)
             ]
 
             # Find other positions of the same bee in other frames (same video)
             nearest_position_v1 = df[
-                (df['filename'] == vid) &
-                (df['ID'] == bee) &
-                (df['frame'] != frame)
+                (df['video path'] == vid) &
+                (df['col #'] == col) &
+                (df['bee ID'] == bee) &
+                (df['frame number'] != frame)
             ]
 
             # If no known positions exist in other frames, we can't resolve this duplicate
@@ -329,11 +239,11 @@ def mark_or_drop_duplicates(df, return_val, mark_duplicates=True, drop_unresolva
 
             # Find the position in another frame that is temporally closest to the duplicate frame
             nearest_position_v2 = nearest_position_v1.iloc[
-                (nearest_position_v1['frame'] - frame).abs().argsort()[:1]
+                (nearest_position_v1['frame number'] - frame).abs().argsort()[:1]
             ]
 
             # Skip resolution if the nearest frame is too far away to trust
-            if nearest_position_v2.empty or abs(nearest_position_v2['frame'].values[0] - frame) > 16:
+            if nearest_position_v2.empty or abs(nearest_position_v2['frame number'].values[0] - frame) > 16:
                 df.loc[specific_duplicates.index, 'unresolvable_duplicate'] = True
                 continue
 
@@ -342,37 +252,36 @@ def mark_or_drop_duplicates(df, return_val, mark_duplicates=True, drop_unresolva
                 specific_duplicates, nearest_position_v2.iloc[0]
             )
 
-            if not mark_duplicates:
-                # If not marking duplicates, just keep the best candidate and drop others
-                # Notice that both candidates are marked as duplicates right now, so we don't need to mark these again
-                # Drop all other candidates in the same frame with same ID
-                drop_idxs = df[
-                    (df['filename'] == vid) &
-                    (df['ID'] == bee) &
-                    (df['frame'] == frame) &
-                    ((df['centroidX'] != tag_to_keep['centroidX']) |
-                    (df['centroidY'] != tag_to_keep['centroidY']))
-                ].index
-                df.drop(index=drop_idxs, inplace=True)
-            
+            # Drop all other candidates in the same frame with same ID
+            drop_idxs = df[
+                (df['video path'] == vid) &
+                (df['col #'] == col) &
+                (df['bee ID'] == bee) &
+                (df['frame number'] == frame) &
+                ((df['centroidX'] != tag_to_keep['centroidX']) |
+                 (df['centroidY'] != tag_to_keep['centroidY']))
+            ].index
+            df.drop(index=drop_idxs, inplace=True)
+
             # Mark the kept tag as a resolved original duplicate
-            '''
             good_idx = df[
-                (df['filename'] == vid) &
-                (df['ID'] == bee) &
-                (df['frame'] == frame) &
+                (df['video path'] == vid) &
+                (df['col #'] == col) &
+                (df['bee ID'] == bee) &
+                (df['frame number'] == frame) &
                 (df['centroidX'] == tag_to_keep['centroidX']) &
                 (df['centroidY'] == tag_to_keep['centroidY'])
             ].index
-            '''
-            df.loc[idx_to_keep, 'duplicate'] = False
-            
+            df.loc[good_idx, 'duplicate'] = False
+            df.loc[good_idx, 'og_duplicate'] = True
+
         # Optionally remove any unresolved duplicates
         if drop_unresolvable:
-            df.drop(df[df['unresolvable_duplicate'] == True].index, inplace=True)
+            df.drop(df[df['duplicate'] == True].index, inplace=True)
 
     elif return_val == 1 and isinstance(df, pd.DataFrame):
         # If no duplicates existed, still ensure tracking columns exist
+        df['og_duplicate'] = False
         df['unresolvable_duplicate'] = False
 
     return df
@@ -382,12 +291,6 @@ def mark_or_drop_duplicates(df, return_val, mark_duplicates=True, drop_unresolva
 
 # Updated function to interpolate missing frames only if the gap between them is less than or equal to max_frame_gap
 def interpolate(df, max_seconds_gap, actual_frames_per_second):
-
-    if df.empty:
-        print("The DataFrame is now empty. No interpolation will be performed.")
-        return pd.DataFrame()  # Return an empty DataFrame if input is empty
-    
-    df["interpolated"] = False  # Add a column to track if a row is interpolated
 
     max_frame_gap = int(max_seconds_gap * actual_frames_per_second)
     # Ensure the data is sorted by frame
@@ -405,12 +308,7 @@ def interpolate(df, max_seconds_gap, actual_frames_per_second):
         
         # Calculate the frame difference between consecutive rows
         group['frame_diff'] = group['frame'].diff().fillna(0).astype(int)
-        if sum(group['frame_diff']) == 0 and len(grouped) > 1:
-            #print(f"No frame differences found for bee ID {bee_id}. Skipping interpolation for this group.")
-            continue
-        elif sum(group['frame_diff']) == 0 and len(grouped) == 1:
-            #print(f"Only one group, with no difference between frames. No interpolation needed.")
-            return df
+        
         # Placeholder list to store the interpolated results for this group
         interpolated_rows = []
         
@@ -432,12 +330,9 @@ def interpolate(df, max_seconds_gap, actual_frames_per_second):
                         ratio = n / next_row['frame_diff']
                         # Interpolate numeric columns
                         for col in ['centroidX', 'centroidY', 'frontX', 'frontY']:
-                            interp_row[col] = round((row[col] + (next_row[col] - row[col]) * ratio),2)
+                            interp_row[col] = row[col] + (next_row[col] - row[col]) * ratio
                         # Calculate the correct frame number for the interpolated frame
                         interp_row['frame'] = row['frame'] + n
-                        # Flag this row as interpolated
-                        interp_row['interpolated'] = True
-                        # Append the interpolated row to the list
                         interpolated_rows.append(interp_row)
         
         # Create a DataFrame from the list of rows
@@ -449,22 +344,12 @@ def interpolate(df, max_seconds_gap, actual_frames_per_second):
         # Append the group to the list of DataFrames
         interpolated_dfs.append(interpolated_group)
     
-    try:
-        # Concatenate all the interpolated groups into a single DataFrame
-        interpolated_df = pd.concat(interpolated_dfs, ignore_index=True)
-    except Exception as e:
-        print(e)
-        print("Error concatenating interpolated DataFrames. Maybe there's only one group?")
-        if len(grouped) == 1:
-            print("Only one group found, returning the single interpolated group.")
-            interpolated_df = interpolated_group
-        else:
-            print("Hit error in attempt to interpolate. Returning the original DataFrame without interpolation.")
-            return df
-            
+    # Concatenate all the interpolated groups into a single DataFrame
+    interpolated_df = pd.concat(interpolated_dfs, ignore_index=True)
+    
     # Sorting the DataFrame by 'ID' and 'frame' for better readability
     interpolated_df.sort_values(by=['ID', 'frame'], inplace=True)
-
+    
     return interpolated_df
 
 #Calculate the angle between the center of the ArUco tag and the top of the tag (make sure it points towards the head!), 
@@ -482,10 +367,10 @@ def compute_heading_angle(df):
     dy = df['frontY'] - df['centroidY']
     
     # Radians: [-pi, pi]
-    df['heading_angle'] = round((np.arctan2(dy, dx)),3)
+    df['heading_angle'] = np.arctan2(dy, dx)
     
     # Degrees: [0, 360)
-    df['heading_angle_deg'] = round((np.degrees(df['heading_angle']) % 360),3)
+    df['heading_angle_deg'] = np.degrees(df['heading_angle']) % 360
     
     return df
 	
