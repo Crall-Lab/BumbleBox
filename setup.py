@@ -61,6 +61,10 @@ elif infrared_recording == False:
 	tuning_file = 'imx477.json'
 
 data_folder_path = '/mnt/bumblebox/data'
+storage_mount_point = data_folder_path
+# Use a stable identifier when possible. If this path does not exist, scripts will
+# fall back to auto-detection and then /dev/sda1.
+storage_device = '/dev/disk/by-label/bumblebox'
 
 '''This takes options 'Auto', 'HighQuality', 'Fast', or 'Off'. Would recommend using 'Auto' to start off - using HighQuality will impact the max framerate possible'''
 noise_reduction_mode = 'Auto' 
@@ -124,4 +128,3 @@ create_composite_nest_images = True
 number_of_images = 60 #the number of images that will be used from today's data folder to create the image (if there are fewer than the number listed here, it will use all images)
 
 composite_images_per_day = 1 #Needs to be 1 for now
-

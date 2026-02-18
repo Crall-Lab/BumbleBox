@@ -7,6 +7,7 @@ import setup
 from datetime import datetime as dt
 from datetime import date
 import os
+import subprocess
 from scipy import spatial
 import glob
 from data_cleaning import interpolate
@@ -34,7 +35,7 @@ def compute_speed(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int, moving_
     sub_df['speed'] = np.sqrt(sub_df['deltaX']**2 + sub_df['deltaY']**2)
 
     #only calculate speed when moving, otherwise mark as NAN
-    sub_df.loc[sub_df['speed'] < 3.16, 'speed'] = np.nan
+    sub_df.loc[sub_df['speed'] < moving_threshold, 'speed'] = np.nan
     
     df_sorted.loc[:, 'speed'] = sub_df.loc[:, 'speed']
     # Drop temporary columns used for computations
@@ -57,8 +58,8 @@ def compute_activity(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int, movi
     sub_df = df_sorted[ df_sorted['elapsed frames'] < speed_cutoff_frames ]
     sub_df['activity'] = np.sqrt(sub_df['deltaX']**2 + sub_df['deltaY']**2) #Calculating speed here - we threshold for activity below
 
-    sub_df.loc[sub_df['activity'] < moving_threshold, 'activity'] = 0 
-    sub_df.loc[sub_df['activity'] <= moving_threshold, 'activity'] = 1
+    sub_df.loc[sub_df['activity'] < moving_threshold, 'activity'] = 0
+    sub_df.loc[sub_df['activity'] >= moving_threshold, 'activity'] = 1
     
     df_sorted.loc[:, 'activity'] = sub_df.loc[:, 'activity']
     # Drop temporary columns used for computations
@@ -352,8 +353,8 @@ def calculate_behavior_metrics(df, actual_frames_per_second, moving_threshold, t
                 
     if "activity" in setup.behavior_metrics:
         print("Trying activity")
-    df = compute_activity(df,actual_frames_per_second,4, moving_threshold, todays_folder_path, filename)
-    print("Just computed activity")
+        df = compute_activity(df,actual_frames_per_second,4, moving_threshold, todays_folder_path, filename)
+        print("Just computed activity")
         
     if "distance from center" in setup.behavior_metrics:
         print("Trying distance from center")

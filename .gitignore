@@ -1,1 +1,19 @@
-testing
+testing/
+
+# Python cache / virtual env
+.venv/
+__pycache__/
+*.py[cod]
+
+# macOS / editor artifacts
+.DS_Store
+*.swp
+
+# Runtime outputs
+output.txt
+logs/*.log
+
+# Newer repo layouts not tracked on legacy master
+bumblebox_v2/
+bumblebox_desktop/
+legacy/

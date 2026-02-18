@@ -289,27 +289,35 @@ def process_video_batch(video_batch):
         benchmark = None
         for video_path in video_batch:
             benchmark_list = process_video(video_path)
+            if benchmark_list in (None, 1):
+                continue
             count += 1
-            if benchmark == None:
-                benchmark = pd.Series([benchmark_list], columns=["videos analyzed", "cap_open_time", "frame_read_time_total", "gray_conversion_time_total", "detection_time_total", "csv_write_time_total", "total_video_time"])
-                benchmark['videos analyzed'] = count
+            if benchmark is None:
+                benchmark = {
+                    "videos analyzed": count,
+                    "cap_open_time": benchmark_list[1],
+                    "frame_read_time_total": benchmark_list[2],
+                    "gray_conversion_time_total": benchmark_list[3],
+                    "detection_time_total": benchmark_list[4],
+                    "csv_write_time_total": benchmark_list[5],
+                    "total_video_time": benchmark_list[6],
+                }
             else:
-                
                 benchmark["videos analyzed"] = count
-                benchmark['cap_open_time'] =  ((benchmark['cap_open_time'] * (count - 1)) + benchmark_list[1]) / count
-                benchmark['frame_read_time_total'] = ((benchmark['frame_read_time_total'] * (count - 1)) + benchmark_list[2]) / count
-                benchmark['gray_conversion_time_total'] = ((benchmark['gray_conversion_time_total'] * (count - 1)) + benchmark_list[3]) / count
-                benchmark['detection_time_total'] = ((benchmark['detection_time_total'] * (count - 1)) + benchmark_list[4]) / count
-                benchmark['csv_write_time_total'] = ((benchmark['csv_write_time_total'] * (count - 1)) + benchmark_list[5]) / count
-                benchmark['total_video_time'] = ((benchmark['total_video_time'] * (count - 1)) + benchmark_list[6]) / count
-                
+                benchmark["cap_open_time"] = ((benchmark["cap_open_time"] * (count - 1)) + benchmark_list[1]) / count
+                benchmark["frame_read_time_total"] = ((benchmark["frame_read_time_total"] * (count - 1)) + benchmark_list[2]) / count
+                benchmark["gray_conversion_time_total"] = ((benchmark["gray_conversion_time_total"] * (count - 1)) + benchmark_list[3]) / count
+                benchmark["detection_time_total"] = ((benchmark["detection_time_total"] * (count - 1)) + benchmark_list[4]) / count
+                benchmark["csv_write_time_total"] = ((benchmark["csv_write_time_total"] * (count - 1)) + benchmark_list[5]) / count
+                benchmark["total_video_time"] = ((benchmark["total_video_time"] * (count - 1)) + benchmark_list[6]) / count
+
                 print(f"\nCurrent average benchmark for {count} videos:")
-                print(f"  Video open time: {benchmark_list[1]:.3f} s")
-                print(f"  Total frame read time: {benchmark_list[2]:.3f} s")
-                print(f"  Total gray conversion time: {benchmark_list[3]:.3f} s")
-                print(f"  Total marker detection time: {benchmark_list[4]:.3f} s")
-                print(f"  Total CSV write time: {benchmark_list[5]:.3f} s")
-                print(f"  Overall processing time: {benchmark_list[6]:.3f} s")
+                print(f"  Video open time: {benchmark['cap_open_time']:.3f} s")
+                print(f"  Total frame read time: {benchmark['frame_read_time_total']:.3f} s")
+                print(f"  Total gray conversion time: {benchmark['gray_conversion_time_total']:.3f} s")
+                print(f"  Total marker detection time: {benchmark['detection_time_total']:.3f} s")
+                print(f"  Total CSV write time: {benchmark['csv_write_time_total']:.3f} s")
+                print(f"  Overall processing time: {benchmark['total_video_time']:.3f} s")
                 sys.stdout.flush()
 
         return count
@@ -365,7 +373,8 @@ def main():
         print("Error: Please provide only one of --start_date or --start_file.")
         exit(1)
     
-    #ENABLE_BENCHMARK = args.benchmark
+    global ENABLE_BENCHMARK
+    ENABLE_BENCHMARK = args.benchmark
 
     target_folder = os.path.join(args.volume, args.folder)
     if not os.path.isdir(target_folder):
@@ -494,7 +503,7 @@ def main():
             for video_file in video_files:
 
                 benchmark_list = process_video(video_file)
-                if benchmark_list == 1:
+                if benchmark_list in (None, 1):
                     print(f"Error processing {video_file}.")
                     continue
 

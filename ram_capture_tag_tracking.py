@@ -45,12 +45,13 @@ def array_capture(recording_time, fps, shutter_speed, width, height, tuning_file
     '''set noise reduction mode'''
     if noise_reduction_mode != "Auto":
         try:
+            noise_reduction_mode = getattr(controls.draft.NoiseReductionModeEnum, noise_reduction_mode)
             picam2.set_controls({"NoiseReductionMode": noise_reduction_mode})
-        except:
+        except Exception:
             print("The variable 'noise_reduction_mode' in the setup.py script is set incorrectly. Please change it and save that script. It should be 'Auto', 'Off', 'Fast', or 'HighQuality'")
     
     '''set digital zoom'''
-    if digital_zoom == type(tuple) and len(digital_zoom) == 4:
+    if isinstance(digital_zoom, tuple) and len(digital_zoom) == 4:
         picam2.set_controls({"ScalerCrop": digital_zoom})
     
     elif digital_zoom != None:
@@ -65,12 +66,15 @@ def array_capture(recording_time, fps, shutter_speed, width, height, tuning_file
     print(f"recording time: {recording_time}s")
     print(f"frames per second: {fps}")
     print(f"image width: {width} pixels")
-    print(f"image width: {height} pixels")
+    print(f"image height: {height} pixels")
     print(f"shutter speed: {shutter_speed} microseconds")
     
     start_time = time.time()
     
+    if fps <= 0:
+        raise ValueError("fps must be greater than zero")
     frames_list = []
+    capture_interval = 1 / float(fps)
     i = 0
     
     while ( (time.time() - start_time) < recording_time):
@@ -81,15 +85,16 @@ def array_capture(recording_time, fps, shutter_speed, width, height, tuning_file
         frames_list.append([yuv420])
         #yuv420 = yuv420[0:3040, :]
         #frames_dict[f"frame_{i:03d}"] = [yuv420, timestamp]
-        time.sleep(1/(fps+1))
+        time.sleep(capture_interval)
         i += 1
     
     finished = time.time()-start_time
     print(f'finished capturing frames to arrays, captured {i} frames in {round(finished,2)} seconds')
-    rate = i / finished
+    rate = i / finished if finished > 0 else 0
     print(f'\nthats {round(rate,2)} frames per second!\n\n\nMake sure this corresponds well to your desired framerate and write this number into the actual_frame_rate setting in settings.py. FPS is a bit experimental for tag tracking and mp4 recording at the moment... Thats the tradeoff for allowing a higher framerate.')
     sizeof = getsizeof(frames_list)
     
+    picam2.stop()
     return frames_list
         
         
@@ -140,6 +145,8 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
     noID = []
     raw = []
     augs_csv = []
+    df = pd.DataFrame(columns=['filename', 'colony number', 'datetime', 'frame', 'ID', 'centroidX', 'centroidY', 'frontX', 'frontY'])
+    df2 = pd.DataFrame(columns=['filename', 'colony number', 'datetime', 'frame', 'ID', 'centroidX', 'centroidY', 'frontX', 'frontY'])
     
     start = time.time()
 
@@ -215,9 +222,15 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
         
     
 
-    print("Average number of tags found: " + str(len(df.index)/frame_num))
+    if frame_num > 0:
+        print("Average number of tags found: " + str(len(df.index)/frame_num))
+    else:
+        print("No frames were processed for tag tracking.")
     tracking_time = time.time() - start
-    print(f"Tag tracking took {round(tracking_time,2)} seconds, an average of {round(tracking_time / frame_num,2)} seconds per frame") 
+    if frame_num > 0:
+        print(f"Tag tracking took {round(tracking_time,2)} seconds, an average of {round(tracking_time / frame_num,2)} seconds per frame")
+    else:
+        print(f"Tag tracking took {round(tracking_time,2)} seconds.")
     
     if df.empty == True:
         print("df is empty")
@@ -253,7 +266,7 @@ def main():
     parser = argparse.ArgumentParser(prog='Record a video, either an mp4 or mjpeg video! Program defaults to mp4 currently.')
     parser.add_argument('-p', '--data_folder_path', type=str, default=setup.data_folder_path, help='a path to the folder you want to collect data in. Default is /mnt/bumblebox/data')
     parser.add_argument('-t', '--recording_time', type=int, default=setup.recording_time, help='the video recording time in seconds')
-    parser.add_argument('-fps', '--frames_per_second', type=int, default=setup.frames_per_second, choices=range(0,11), help='the number of frames recorded per second of video capture. At the moment this is still a bit experimental, we have gotten up to 6fps to work for mjpeg, and up to 10fps for mp4 videos.')
+    parser.add_argument('-fps', '--frames_per_second', type=int, default=setup.frames_per_second, choices=range(1,11), help='the number of frames recorded per second of video capture. At the moment this is still a bit experimental, we have gotten up to 6fps to work for mjpeg, and up to 10fps for mp4 videos.')
     parser.add_argument('-afps', '--actual_frames_per_second', type=float, default=setup.actual_frames_per_second, help='the number of frames recorded per second of video capture. At the moment this is still a bit experimental, we have gotten up to 6fps to work for mjpeg, and up to 10fps for mp4 videos.')
     parser.add_argument('-sh', '--shutter', type=int, default=setup.shutter_speed, help='the exposure time, or shutter speed, of the camera in microseconds (1,000,000 microseconds in a second!!)')
     parser.add_argument('-w', '--width', type=int, default=setup.width, help='the width of the image in pixels')

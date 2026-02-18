@@ -15,6 +15,7 @@ import sys
 import logging
 import time
 import gc
+import subprocess
 
 logging.basicConfig(filename='/home/pi/Desktop/BumbleBox/logs/log.log',encoding='utf-8',format='%(filename)s %(asctime)s: %(message)s', filemode='a', level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -57,6 +58,10 @@ def generate_nest_image(todays_folder_path, today, number_of_images, hostname, s
         
     total_frames = len(files)
     print(total_frames)
+    if total_frames == 0:
+        print("No PNG images found for composite generation.")
+        logger.warning("No PNG images found in %s", todays_folder_path)
+        return 0
     
     if total_frames > number_of_images:
         total_frames = number_of_images
@@ -66,6 +71,10 @@ def generate_nest_image(todays_folder_path, today, number_of_images, hostname, s
     index = 0
     print("Trying to read image file!")
     imgdata = cv2.imread(files[0])
+    if imgdata is None:
+        print(f"Could not read first image: {files[0]}")
+        logger.warning("Could not read first image: %s", files[0])
+        return 0
     gray_img = cv2.cvtColor(imgdata, cv2.COLOR_RGB2GRAY)
     
     try:

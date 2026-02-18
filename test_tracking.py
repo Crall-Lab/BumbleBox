@@ -59,7 +59,7 @@ def test_tracking(preview_time, width, height, tag_dictionary, box_type, shutter
     picam2.set_controls({"ExposureTime": shutter_speed})
     
     '''set digital zoom'''
-    if digital_zoom == type(tuple) and len(digital_zoom) == 4:
+    if isinstance(digital_zoom, tuple) and len(digital_zoom) == 4:
         picam2.set_controls({"ScalerCrop": digital_zoom})
     
     elif digital_zoom != None:
@@ -85,15 +85,15 @@ def test_tracking(preview_time, width, height, tag_dictionary, box_type, shutter
             cl1 = clahe.apply(gray)
             gray = cv2.cvtColor(cl1,cv2.COLOR_GRAY2RGB)
             
-        except:
+        except Exception:
             print('converting to grayscale didnt work...')
-            pass
+            continue
             
         corners, ids, rejectedImgPoints = detector.detectMarkers(gray)
         frame_markers = aruco.drawDetectedMarkers(gray.copy(), corners, ids)
-        try:
+        if ids is not None:
             tag_avg_list.append(len(ids))
-        except:
+        else:
             print("no tags found in this frame")
         resized = cv2.resize(frame_markers, (1352,1013), interpolation = cv2.INTER_AREA)
         cv2.imshow("frame",resized)
@@ -107,6 +107,9 @@ def test_tracking(preview_time, width, height, tag_dictionary, box_type, shutter
         if k == 27:
             cv2.destroyAllWindows()
             break
+
+    picam2.stop()
+    cv2.destroyAllWindows()
         
     try:
         print(f"Average number of tags tracked: {round(mean(tag_avg_list),2)}")

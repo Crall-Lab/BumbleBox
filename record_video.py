@@ -49,7 +49,7 @@ def picam2_record_mp4(filename, outdir, recording_time, fps, shutter_speed, widt
             print("The variable 'noise_reduction_mode' in the setup.py script is set incorrectly. Please change it and save that script. It should be 'Auto', 'Off', 'Fast', or 'HighQuality'")
     
     '''set digital zoom'''
-    if digital_zoom == type(tuple) and len(digital_zoom) == 4:
+    if isinstance(digital_zoom, tuple) and len(digital_zoom) == 4:
         picam2.set_controls({"ScalerCrop": digital_zoom})
     
     elif digital_zoom != None:
@@ -65,38 +65,57 @@ def picam2_record_mp4(filename, outdir, recording_time, fps, shutter_speed, widt
     print(f"	recording time: {recording_time}s")
     print(f"	frames per second: {fps}")
     print(f"	image width: {width}")
-    print(f"	image width: {height}")
+    print(f"	image height: {height}")
     print(f"	output image format: RGB888")
     print(f"    output video format: mp4")
 
     time.sleep(2)
     start_time = time.time()
     
+    if fps <= 0:
+        raise ValueError("fps must be greater than zero")
+
     frames_list = []
+    capture_interval = 1 / float(fps)
     i = 0
     
     print("beginning video capture")
     while ( (time.time() - start_time) < recording_time):
-        timestamp = time.time() - start_time
-        
+        loop_start = time.time()
         yuv420 = picam2.capture_array()
         frames_list.append([yuv420])
         #yuv420 = yuv420[0:3040, :]
         #frames_dict[f"frame_{i:03d}"] = [yuv420, timestamp]
-        time.sleep(1/(fps+1))
+        elapsed = time.time() - loop_start
+        sleep_time = capture_interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
         i += 1
-        
+
+    picam2.stop()
+
     finished = time.time()-start_time
     print(f'finished capturing frames to arrays, captured {i} frames in {finished} seconds')
-    rate = i / finished
+    rate = i / finished if finished > 0 else 0
     print(f'thats {rate} frames per second!\nMake sure this corresponds well to your desired framerate. FPS is a bit experimental for tag tracking and mp4 recording at the moment... Thats the tradeoff for allowing a higher framerate.')
     
     output = outdir+'/'+filename+'.mp4'
+    if not frames_list:
+        print("No frames were captured. Skipping MP4 write.")
+        return output, frames_list
+
     print(output)
     vid_fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output,vid_fourcc,10,(4032,3040))
-    
-    for i, im_array in enumerate(frames_list):
+    first_rgb = cv2.cvtColor(frames_list[0][0], cv2.COLOR_YUV420p2RGB)
+    frame_height, frame_width = first_rgb.shape[:2]
+    writer_fps = rate if rate > 0 else float(fps)
+    out = cv2.VideoWriter(output, vid_fourcc, writer_fps, (frame_width, frame_height))
+    if not out.isOpened():
+        raise RuntimeError(f"Could not open output video for writing: {output}")
+
+    out.write(first_rgb)
+
+    for i, im_array in enumerate(frames_list[1:], start=1):
         frame = im_array[0]
         rgb_im = cv2.cvtColor(frame, cv2.COLOR_YUV420p2RGB)
         out.write(rgb_im)
@@ -122,18 +141,30 @@ def picam2_record_mjpeg(filename, outdir, recording_time, quality, fps, shutter_
     print(f"	quality (0-100): {quality}")
     print(f"	frames per second: {fps}")
     print(f"	image width: {width}")
-    print(f"	image width: {height}")
+    print(f"	image height: {height}")
     print(f"	image format: {imformat}")
     print(f"    output video format: mjpeg")
     print(f"	buffer count: {buffer_count}")
             
             
+    if fps <= 0:
+        raise ValueError("fps must be greater than zero")
     frame_duration_microseconds = int(1/fps * 10**6)
     
     tuning = Picamera2.load_tuning_file(tuning_file)
     picam2 = Picamera2(tuning=tuning)
     picam2.set_controls({"ExposureTime": shutter_speed})
-    video_config = picam2.create_video_configuration(main={"size": (width, height), "format": imformat}, controls={"FrameDurationLimits": (frame_duration_microseconds, frame_duration_microseconds)}, buffer_count=2)
+    if noise_reduction_mode != "Auto":
+        try:
+            noise_reduction_mode = getattr(controls.draft.NoiseReductionModeEnum, noise_reduction_mode)
+            picam2.set_controls({"NoiseReductionMode": noise_reduction_mode})
+        except Exception:
+            print("The variable 'noise_reduction_mode' in the setup.py script is set incorrectly. Please change it and save that script. It should be 'Auto', 'Off', 'Fast', or 'HighQuality'")
+    if isinstance(digital_zoom, tuple) and len(digital_zoom) == 4:
+        picam2.set_controls({"ScalerCrop": digital_zoom})
+    elif digital_zoom is not None:
+        print("The variable 'recording_digital_zoom' in the setup.py script is set incorrectly. It should be either 'None' or a tuple like (offset_x,offset_y,new_width,new_height)")
+    video_config = picam2.create_video_configuration(main={"size": (width, height), "format": imformat}, controls={"FrameDurationLimits": (frame_duration_microseconds, frame_duration_microseconds)}, buffer_count=buffer_count)
     picam2.align_configuration(video_config)
     picam2.configure(video_config)
 
@@ -143,7 +174,7 @@ def picam2_record_mjpeg(filename, outdir, recording_time, quality, fps, shutter_
 
     picam2.start()
     time.sleep(2)
-    picam2.start_encoder(encoder,output,pts=outdir+filename+"_pts.txt")
+    picam2.start_encoder(encoder,output,pts=outdir+"/"+filename+"_pts.txt")
 
     time.sleep(recording_time)
     
@@ -231,6 +262,8 @@ def trackTagsFromVid_MP4(frames_list, todays_folder_path, filename, tag_dictiona
     noID = []
     raw = []
     augs_csv = []
+    df = pd.DataFrame(columns=['filename', 'colony number', 'datetime', 'frame', 'ID', 'centroidX', 'centroidY', 'frontX', 'frontY'])
+    df2 = pd.DataFrame(columns=['filename', 'colony number', 'datetime', 'frame', 'ID', 'centroidX', 'centroidY', 'frontX', 'frontY'])
     
     start = time.time()
 
@@ -305,9 +338,15 @@ def trackTagsFromVid_MP4(frames_list, todays_folder_path, filename, tag_dictiona
         
     
 
-    print("Average number of tags found: " + str(len(df.index)/frame_num))
+    if frame_num > 0:
+        print("Average number of tags found: " + str(len(df.index)/frame_num))
+    else:
+        print("No frames were processed for tag tracking.")
     tracking_time = time.time() - start
-    print(f"Tag tracking took {round(tracking_time,2)} seconds, an average of {round(tracking_time / frame_num,2)} seconds per frame") 
+    if frame_num > 0:
+        print(f"Tag tracking took {round(tracking_time,2)} seconds, an average of {round(tracking_time / frame_num,2)} seconds per frame")
+    else:
+        print(f"Tag tracking took {round(tracking_time,2)} seconds.")
     
     if df.empty == True:
         logger.warning("df is empty")
@@ -380,7 +419,7 @@ def trackTagsFromVid_MJPEG(filepath, todays_folder_path, filename, tag_dictionar
         if ret == True:
             print(frame.shape)
             try:
-                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
                 cl1 = clahe.apply(gray)
                 gray = cv2.cvtColor(cl1,cv2.COLOR_GRAY2RGB)
@@ -410,20 +449,29 @@ def trackTagsFromVid_MJPEG(filepath, todays_folder_path, filename, tag_dictionar
 
             frame_num += 1
             print(f"processed frame {frame_num}")  
-        
+        else:
+            break
+    vid.release()
+
     df = pd.DataFrame(raw)
     df = df.rename(columns = {0:'filename', 1:'colony number', 2:'datetime', 3:'frame', 4:'ID', 5:'centroidX', 6:'centroidY', 7:'frontX', 8:'frontY'})
-    df.to_csv(todays_folder_path + "/" + filename + '_raw.csv')
+    df.to_csv(todays_folder_path + "/" + filename + '_raw.csv', index=False)
     print('saved raw csv')
     
     df2 = pd.DataFrame(noID)
     df2 = df2.rename(columns = {0:'filename', 1:'colony number', 2:'datetime', 3:'frame', 4:'ID', 5:'centroidX', 6:'centroidY', 7:'frontX', 8:'frontY'})
-    df2.to_csv(todays_folder_path + "/" + filename + '_noID.csv')
+    df2.to_csv(todays_folder_path + "/" + filename + '_noID.csv', index=False)
     print('saved noID csv')
 
-    print("Average number of tags found: " + str(len(df.index)/frame_num))
+    if frame_num > 0:
+        print("Average number of tags found: " + str(len(df.index)/frame_num))
+    else:
+        print("No frames were processed for tag tracking.")
     tracking_time = time.time() - start
-    print(f"Tag tracking took {tracking_time} seconds, an average of {tracking_time / frame_num} seconds per frame") 
+    if frame_num > 0:
+        print(f"Tag tracking took {tracking_time} seconds, an average of {tracking_time / frame_num} seconds per frame")
+    else:
+        print(f"Tag tracking took {tracking_time} seconds.")
     return df, df2, frame_num
 
 
@@ -450,7 +498,7 @@ def main():
     parser.add_argument('-p', '--data_folder_path', type=str, default=setup.data_folder_path, help='a path to the folder you want to collect data in. Default path is: /mnt/bumblebox/data/')
     parser.add_argument('-t', '--recording_time', type=int, default=setup.recording_time, help='the video recording time in seconds')
     parser.add_argument('-q', '--quality', type=int, default=setup.quality, choices=range(0,100), help='jpg image quality setting from 0-100. The higher the number, the better quality, and the bigger the file.')
-    parser.add_argument('-fps', '--frames_per_second', type=int, default=setup.frames_per_second, choices=range(0,10), help='the number of frames recorded per second of video capture. At the moment this is still a bit experimental, we have gotten up to 6fps to work for mjpeg, and up to 10fps for mp4 videos.')
+    parser.add_argument('-fps', '--frames_per_second', type=int, default=setup.frames_per_second, choices=range(1,11), help='the number of frames recorded per second of video capture. At the moment this is still a bit experimental, we have gotten up to 6fps to work for mjpeg, and up to 10fps for mp4 videos.')
     parser.add_argument('-sh', '--shutter', type=int, default=setup.shutter_speed, help='the exposure time, or shutter speed, of the camera in microseconds (1,000,000 microseconds in a second!!)')
     parser.add_argument('-w', '--width', type=int, default=setup.width, help='the width of the image in pixels')
     parser.add_argument('-ht', '--height', type=int, default=setup.height, help='the height of the image in pixels')
@@ -493,7 +541,7 @@ def main():
                 print("Calculating behavior metrics")
     
     if args.codec == 'mjpeg':
-        filepath = picam2_record_mjpeg(filename,todays_folder_path, args.recording_time, args.quality, args.frames_per_second, args.width, args.height, args.tuning_file, args.noise_reduction, args.digital_zoom)
+        filepath = picam2_record_mjpeg(filename,todays_folder_path, args.recording_time, args.quality, args.frames_per_second, args.shutter, args.width, args.height, args.tuning_file, args.noise_reduction, args.digital_zoom)
         if setup.track_recorded_videos == True:
             print('starting to track tags from the saved video!')
             df, df2, frame_num = trackTagsFromVid_MJPEG(filepath, todays_folder_path, filename, args.dictionary, args.box_type, now)
@@ -509,4 +557,3 @@ if __name__ == '__main__':
     
     main()
     logging.shutdown()
-
