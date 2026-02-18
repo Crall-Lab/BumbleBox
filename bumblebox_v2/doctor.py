@@ -1,0 +1,257 @@
+from __future__ import annotations
+
+import importlib
+import os
+import platform
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List
+
+
+@dataclass
+class CheckResult:
+    name: str
+    status: str
+    message: str
+
+
+def _read_pi_model() -> str | None:
+    model_paths = [
+        Path("/proc/device-tree/model"),
+        Path("/sys/firmware/devicetree/base/model"),
+    ]
+
+    for path in model_paths:
+        if path.exists():
+            raw = path.read_bytes().replace(b"\x00", b"").decode("utf-8", errors="ignore")
+            return raw.strip()
+    return None
+
+
+def _run_command(command: List[str]) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _status_for_pi(config_pi_model: str, detected_model: str | None) -> CheckResult:
+    if not detected_model:
+        return CheckResult(
+            name="Pi model",
+            status="WARN",
+            message="Could not detect Raspberry Pi model (expected on Pi hardware).",
+        )
+
+    lower = detected_model.lower()
+    if "raspberry pi 4" in lower:
+        detected = "pi4"
+    elif "raspberry pi 5" in lower:
+        detected = "pi5"
+    else:
+        detected = "other"
+
+    if config_pi_model == "auto":
+        if detected in {"pi4", "pi5"}:
+            return CheckResult("Pi model", "PASS", f"Detected {detected_model}")
+        return CheckResult(
+            "Pi model",
+            "WARN",
+            f"Detected {detected_model}. BumbleBox V2 is tuned for Raspberry Pi 4/5.",
+        )
+
+    if config_pi_model == detected:
+        return CheckResult("Pi model", "PASS", f"Config matches detected hardware: {detected_model}")
+
+    return CheckResult(
+        "Pi model",
+        "FAIL",
+        f"Config expects {config_pi_model}, but detected {detected_model}",
+    )
+
+
+def _dependency_check(module_name: str, install_hint: str) -> CheckResult:
+    try:
+        importlib.import_module(module_name)
+        return CheckResult(f"Dependency: {module_name}", "PASS", "Installed")
+    except ImportError:
+        return CheckResult(
+            f"Dependency: {module_name}",
+            "FAIL",
+            f"Missing (install with: {install_hint})",
+        )
+
+
+def _opencv_aruco_check() -> CheckResult:
+    try:
+        import cv2
+    except Exception:
+        return CheckResult(
+            "OpenCV ArUco",
+            "FAIL",
+            "cv2 import failed. Install opencv-contrib-python.",
+        )
+
+    if not hasattr(cv2, "aruco"):
+        return CheckResult(
+            "OpenCV ArUco",
+            "FAIL",
+            "cv2.aruco missing. Install opencv-contrib-python (not opencv-python).",
+        )
+    if not hasattr(cv2.aruco, "ArucoDetector"):
+        return CheckResult(
+            "OpenCV ArUco",
+            "WARN",
+            "cv2.aruco is present, but ArucoDetector API is missing (prefer OpenCV 4.7+).",
+        )
+    return CheckResult("OpenCV ArUco", "PASS", "cv2.aruco with ArucoDetector is available.")
+
+
+def _camera_stack_check() -> CheckResult:
+    result = _run_command(["libcamera-hello", "--list-cameras"])
+    if result is None:
+        return CheckResult(
+            "Camera stack",
+            "WARN",
+            "libcamera-hello not found. Install libcamera apps or run on Raspberry Pi OS.",
+        )
+
+    if result.returncode != 0:
+        return CheckResult(
+            "Camera stack",
+            "WARN",
+            f"libcamera returned non-zero exit code: {result.stderr.strip() or result.stdout.strip()}",
+        )
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    camera_lines = [line for line in lines if "camera" in line.lower() or "imx" in line.lower()]
+    if not camera_lines:
+        return CheckResult(
+            "Camera stack",
+            "WARN",
+            "libcamera is installed, but no cameras were listed.",
+        )
+
+    return CheckResult(
+        "Camera stack",
+        "PASS",
+        f"Detected camera stack and {len(camera_lines)} camera line(s).",
+    )
+
+
+def _data_root_check(data_root: str) -> CheckResult:
+    path = Path(data_root)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return CheckResult("Data root", "FAIL", f"Cannot create {path}: {exc}")
+
+    if not os.access(path, os.W_OK):
+        return CheckResult("Data root", "FAIL", f"Path is not writable: {path}")
+
+    return CheckResult("Data root", "PASS", f"Writable: {path}")
+
+
+def _findmnt_target(path: Path) -> tuple[str, str] | None:
+    result = _run_command(
+        ["findmnt", "--noheadings", "--output", "SOURCE,TARGET", "--target", str(path)]
+    )
+    if result is None or result.returncode != 0:
+        return None
+    text = (result.stdout or "").strip()
+    if not text:
+        return None
+    parts = text.split()
+    if len(parts) < 2:
+        return None
+    return parts[0], parts[1]
+
+
+def _data_root_mount_check(data_root: str) -> CheckResult:
+    path = Path(data_root)
+    if not path.exists():
+        return CheckResult("Data root mount", "WARN", f"Path does not exist yet: {path}")
+
+    mount = _findmnt_target(path)
+    if mount is None:
+        if str(path).startswith("/mnt/"):
+            return CheckResult(
+                "Data root mount",
+                "WARN",
+                (
+                    f"{path} is under /mnt but no active mount was detected. "
+                    "External storage may not be mounted."
+                ),
+            )
+        return CheckResult("Data root mount", "WARN", "Could not resolve mount source with findmnt.")
+
+    source, target = mount
+    if source.startswith("/dev/sd"):
+        return CheckResult(
+            "Data root mount",
+            "WARN",
+            (
+                f"Mounted at {target} from {source}. Device names like sda1/sdb1 can change; "
+                "prefer UUID entries in /etc/fstab."
+            ),
+        )
+    return CheckResult("Data root mount", "PASS", f"Resolved mount {target} from {source}.")
+
+
+def run_doctor(config: Dict[str, Any]) -> List[CheckResult]:
+    results: List[CheckResult] = []
+    py_version = tuple(int(part) for part in platform.python_version_tuple()[:3])
+
+    results.append(
+        CheckResult(
+            "Python",
+            "PASS" if py_version >= (3, 9, 0) else "FAIL",
+            f"Running Python {platform.python_version()}",
+        )
+    )
+
+    detected_model = _read_pi_model()
+    results.append(_status_for_pi(config["system"]["pi_model"], detected_model))
+
+    results.append(_dependency_check("cv2", "pip3 install opencv-contrib-python"))
+    results.append(_opencv_aruco_check())
+    results.append(_dependency_check("picamera2", "pip3 install picamera2"))
+    results.append(_dependency_check("yaml", "pip3 install pyyaml"))
+    results.append(_dependency_check("pandas", "pip3 install pandas"))
+    results.append(_camera_stack_check())
+    results.append(_data_root_check(config["system"]["data_root"]))
+    results.append(_data_root_mount_check(config["system"]["data_root"]))
+
+    mode = config["pipeline"]["mode"]
+    source = config["pipeline"]["tracking_source"]
+    results.append(
+        CheckResult(
+            "Pipeline mode",
+            "PASS",
+            f"Configured mode={mode}, tracking_source={source}",
+        )
+    )
+
+    return results
+
+
+def format_report(results: List[CheckResult]) -> str:
+    lines = []
+    for result in results:
+        lines.append(f"[{result.status}] {result.name}: {result.message}")
+
+    fail_count = sum(1 for result in results if result.status == "FAIL")
+    warn_count = sum(1 for result in results if result.status == "WARN")
+    lines.append("")
+    lines.append(f"Summary: {fail_count} fail, {warn_count} warn, {len(results) - fail_count - warn_count} pass")
+    return "\n".join(lines)
+
+
+def has_failures(results: List[CheckResult]) -> bool:
+    return any(result.status == "FAIL" for result in results)
