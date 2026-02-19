@@ -1038,6 +1038,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self.nest_folder_var = tk.StringVar()
         self.nest_script_var = tk.StringVar(value=str(default_script_path()))
         self.nest_labelmerc_var = tk.StringVar(value="")
+        self.nest_python_var = tk.StringVar(value="")
 
         ttk.Label(top, text="Image folder").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.nest_folder_var, width=90).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
@@ -1048,8 +1049,11 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Label(top, text="labelmerc (optional)").grid(row=2, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.nest_labelmerc_var, width=90).grid(row=2, column=1, sticky="ew", padx=8, pady=4)
 
+        ttk.Label(top, text="Label Python (optional)").grid(row=3, column=0, sticky="w")
+        ttk.Entry(top, textvariable=self.nest_python_var, width=90).grid(row=3, column=1, sticky="ew", padx=8, pady=4)
+
         buttons = ttk.Frame(top)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        buttons.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Button(buttons, text="Check Environment", command=self._run_nest_label_check).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Launch Nest Labeling", command=self._launch_nest_labeling).pack(side=tk.LEFT, padx=8)
 
@@ -1063,10 +1067,12 @@ class BumbleBoxV2GUI(tk.Tk):
             folder = self.nest_folder_var.get().strip() or None
             script = self.nest_script_var.get().strip() or None
             labelmerc = self.nest_labelmerc_var.get().strip() or None
+            python_exe = self.nest_python_var.get().strip() or None
             env = check_nest_labeling_environment(
                 image_folder=folder,
                 script_path=script,
                 labelmerc_override=labelmerc,
+                python_executable=python_exe,
             )
             self.nest_label_output.delete("1.0", tk.END)
             self.nest_label_output.insert(tk.END, format_nest_labeling_environment(env))
@@ -1082,16 +1088,19 @@ class BumbleBoxV2GUI(tk.Tk):
         try:
             script = self.nest_script_var.get().strip() or None
             labelmerc = self.nest_labelmerc_var.get().strip() or None
+            python_exe = self.nest_python_var.get().strip() or None
             process = launch_nest_labeling(
                 image_folder=folder,
                 script_path=script,
                 labelmerc_override=labelmerc,
+                python_executable=python_exe,
             )
             self._nest_label_pid = process.pid
             command = build_nest_labeling_command(
                 image_folder=folder,
                 script_path=script,
                 labelmerc_override=labelmerc,
+                python_executable=python_exe,
             )
             self.nest_label_output.delete("1.0", tk.END)
             self.nest_label_output.insert(

@@ -114,34 +114,47 @@ def _opencv_aruco_check() -> CheckResult:
 
 
 def _camera_stack_check() -> CheckResult:
-    result = _run_command(["libcamera-hello", "--list-cameras"])
-    if result is None:
+    command_names = ["rpicam-hello", "libcamera-hello"]
+    any_found = False
+    errors: List[str] = []
+
+    for command_name in command_names:
+        result = _run_command([command_name, "--list-cameras"])
+        if result is None:
+            continue
+
+        any_found = True
+        if result.returncode != 0:
+            details = result.stderr.strip() or result.stdout.strip() or "no output"
+            errors.append(f"{command_name}: {details}")
+            continue
+
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        camera_lines = [line for line in lines if "camera" in line.lower() or "imx" in line.lower()]
+        if not camera_lines:
+            errors.append(f"{command_name}: command worked but no cameras were listed")
+            continue
+
         return CheckResult(
             "Camera stack",
-            "WARN",
-            "libcamera-hello not found. Install libcamera apps or run on Raspberry Pi OS.",
+            "PASS",
+            f"Detected camera stack via {command_name} with {len(camera_lines)} camera line(s).",
         )
 
-    if result.returncode != 0:
+    if not any_found:
         return CheckResult(
             "Camera stack",
             "WARN",
-            f"libcamera returned non-zero exit code: {result.stderr.strip() or result.stdout.strip()}",
-        )
-
-    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    camera_lines = [line for line in lines if "camera" in line.lower() or "imx" in line.lower()]
-    if not camera_lines:
-        return CheckResult(
-            "Camera stack",
-            "WARN",
-            "libcamera is installed, but no cameras were listed.",
+            (
+                "Neither rpicam-hello nor libcamera-hello was found. "
+                "Install Raspberry Pi camera apps (libcamera/rpicam)."
+            ),
         )
 
     return CheckResult(
         "Camera stack",
-        "PASS",
-        f"Detected camera stack and {len(camera_lines)} camera line(s).",
+        "WARN",
+        "Camera command(s) found but camera listing failed: " + "; ".join(errors),
     )
 
 
@@ -149,6 +162,16 @@ def _data_root_check(data_root: str) -> CheckResult:
     path = Path(data_root)
     try:
         path.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        return CheckResult(
+            "Data root",
+            "FAIL",
+            (
+                f"Cannot create {path}: {exc}. "
+                "Run 'bbx storage setup --apply-config' for external storage, or set a writable path with "
+                "'bbx storage set-mount-point --mount-point /home/<user>/BumbleBoxData'."
+            ),
+        )
     except Exception as exc:
         return CheckResult("Data root", "FAIL", f"Cannot create {path}: {exc}")
 
@@ -221,7 +244,12 @@ def run_doctor(config: Dict[str, Any]) -> List[CheckResult]:
 
     results.append(_dependency_check("cv2", "pip3 install opencv-contrib-python"))
     results.append(_opencv_aruco_check())
-    results.append(_dependency_check("picamera2", "pip3 install picamera2"))
+    results.append(
+        _dependency_check(
+            "picamera2",
+            "sudo apt install python3-picamera2 (preferred on Pi) or pip3 install picamera2",
+        )
+    )
     results.append(_dependency_check("yaml", "pip3 install pyyaml"))
     results.append(_dependency_check("pandas", "pip3 install pandas"))
     results.append(_camera_stack_check())

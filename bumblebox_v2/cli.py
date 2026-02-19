@@ -468,6 +468,7 @@ def _cmd_nest_label_check(args: argparse.Namespace) -> int:
             image_folder=args.folder,
             script_path=args.script,
             labelmerc_override=args.labelmerc,
+            python_executable=args.python,
         )
     except Exception as exc:
         print(f"Nest labeling check failed: {exc}")
@@ -487,11 +488,13 @@ def _cmd_nest_label_launch(args: argparse.Namespace) -> int:
             image_folder=args.folder,
             script_path=args.script,
             labelmerc_override=args.labelmerc,
+            python_executable=args.python,
         )
         command = build_nest_labeling_command(
             image_folder=args.folder,
             script_path=args.script,
             labelmerc_override=args.labelmerc,
+            python_executable=args.python,
         )
     except Exception as exc:
         print(f"Nest labeling launch failed: {exc}")
@@ -1610,6 +1613,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to LabelNests GUI script.",
     )
     nest_check_parser.add_argument("--labelmerc", help="Optional path to labelmerc config.")
+    nest_check_parser.add_argument(
+        "--python",
+        help=(
+            "Optional Python executable for labeling environment. "
+            "If omitted, BumbleBox auto-selects a dedicated label env."
+        ),
+    )
     nest_check_parser.set_defaults(func=_cmd_nest_label_check)
 
     nest_launch_parser = nest_sub.add_parser(
@@ -1623,6 +1633,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to LabelNests GUI script.",
     )
     nest_launch_parser.add_argument("--labelmerc", help="Optional path to labelmerc config.")
+    nest_launch_parser.add_argument(
+        "--python",
+        help=(
+            "Optional Python executable for labeling environment. "
+            "If omitted, BumbleBox auto-selects a dedicated label env."
+        ),
+    )
     nest_launch_parser.add_argument("--wait", action="store_true", help="Wait for process exit.")
     nest_launch_parser.set_defaults(func=_cmd_nest_label_launch)
 

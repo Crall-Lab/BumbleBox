@@ -8,6 +8,7 @@ It is now integrated into BumbleBox V2:
 
 - CLI: `bbx nest-label check|launch`
 - GUI: `Nest Labeling` tab
+- Auto interpreter selection: BumbleBox first tries dedicated label env at `/Users/aec/Desktop/BumbleBox/.venvs/bbx-label`
 
 ## Recommended install path (Raspberry Pi OS / Debian)
 
@@ -17,6 +18,9 @@ For best Qt compatibility on Pi, use Debian packages first:
 sudo apt update
 sudo apt install python3-pyqt5 labelme
 ```
+
+If `labelme` is unavailable in your apt repositories, install `python3-pyqt5` only and run LabelMe on a desktop machine (recommended for stability/performance).
+Or keep labeling on Pi with the dedicated label env created by `scripts/setup_venv.sh`.
 
 Then check readiness:
 
@@ -42,6 +46,7 @@ python3 -m pip install pyqt5 labelme
 ```
 
 This path is less predictable on Debian than distro packages for Qt plugins, so prefer apt unless you need isolation.
+With Python 3.13 on Pi, pip installs for `pyqt5`/`labelme` may fail due to missing wheels and source-build tool requirements (`qmake`).
 
 ## LabelMe config file (`labelmerc`)
 
@@ -54,6 +59,16 @@ The nest-labeling launcher checks for LabelMe config in this order:
 5. `~/.labelmerc`
 
 If none exists, LabelMe still launches using defaults.
+
+## Interpreter selection
+
+By default, BumbleBox nest-label commands and GUI auto-select a labeling interpreter in this order:
+
+1. `BUMBLEBOX_NEST_PYTHON` (if set)
+2. `/Users/aec/Desktop/BumbleBox/.venvs/bbx-label/bin/python`
+3. `~/.venvs/bbx-label/bin/python`
+4. `/Users/aec/Desktop/BumbleBox/.venv/bin/python`
+5. current Python interpreter
 
 ## Common issues
 

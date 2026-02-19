@@ -52,14 +52,31 @@ Preferred one-command setup:
 bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh
 ```
 
-This installs core V2 packages plus `picamera2`, `PyQt5`, and `labelme` into `.venv`.
+This installs core V2 packages into `.venv`.
+It also creates a dedicated nest-label environment at `/Users/aec/Desktop/BumbleBox/.venvs/bbx-label` and configures BumbleBox to auto-use it for nest-label check/launch flows.
+On non-Pi hosts it also attempts optional `picamera2`, `PyQt5`, and `labelme` installs.
+On Raspberry Pi hosts, those optional pip installs are skipped by default (preferred path is apt packages).
 
 Skip flags (only if needed for debugging/non-Pi hosts):
 
 ```bash
 bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh --skip-nest-label
 bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh --skip-picamera2
+bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh --skip-label-env
 ```
+
+Recommended Raspberry Pi setup (more reliable than pip for camera/Qt stack):
+
+```bash
+sudo apt update
+sudo apt install python3-venv python3-picamera2 libcamera-apps python3-pyqt5
+python3 -m venv --copies --system-site-packages /Users/aec/Desktop/BumbleBox/.venv
+bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh --system-site-packages --skip-picamera2 --skip-nest-label
+```
+
+Note for Python 3.13 on Pi:
+- `pip install pyqt5 labelme` may fail because PyQt wheels/tooling are often unavailable for that combination and pip falls back to source builds (`qmake` errors).
+- Prefer apt for Qt-related dependencies on Pi (`python3-pyqt5`), and run nest-labeling on a desktop machine if `labelme` is not available in your apt repositories.
 
 Minimum Python packages:
 
@@ -67,7 +84,7 @@ Minimum Python packages:
 pip3 install pyyaml opencv-contrib-python pandas numpy
 ```
 
-On Raspberry Pi, install and enable the camera stack (`libcamera` + `picamera2`) using Raspberry Pi OS package sources.
+On Raspberry Pi, install and enable the camera stack (`rpicam`/`libcamera` + `picamera2`) using Raspberry Pi OS package sources.
 
 For nest labeling on Debian/Pi, prefer distro packages for Qt compatibility:
 
@@ -118,6 +135,7 @@ sudo apt install python3-pyqt5 labelme
 - `Schedule Check`: estimate if your recording/tracking cadence fits hardware limits.
 - `Optimize Tracking`: tune ArUco parameters and optionally apply best values to config.
 - `Nest Labeling`: check dependencies and launch the LabelNests GUI.
+  - auto-selects dedicated labeling interpreter (`.venvs/bbx-label`) when available; optional override field remains available.
 - `Fleet`: set up queen/worker mode, enroll workers, and run fleet status checks.
   - advanced options include separate `Pull Latest` and `Track Latest`, schedule fields (default hourly tracking), and a side-by-side latest media matrix.
 - `Run & Schedule`: run now, generate/install/status timers, inspect recent run summaries, and export run bundles.
