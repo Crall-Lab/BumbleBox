@@ -11,7 +11,7 @@ import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from .calibration import (
     apply_scale_to_config,
@@ -63,7 +63,7 @@ from .nest_labeling import (
     format_nest_labeling_environment,
     launch_nest_labeling,
 )
-from .roadmap import render_roadmap
+from .roadmap import build_roadmap
 from .runtime_alerts import build_runtime_alerts, format_runtime_alerts
 from .run_bundle import export_run_bundle, format_bundle_export_result
 from .run_engine import format_run_summary, run_once
@@ -133,6 +133,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._session_started_iso = datetime.now().isoformat(timespec="seconds")
 
         self._apply_ocean_slate_theme()
+        self._setup_responsive_typography()
         self._build_header()
         self.main_content = ttk.Frame(self)
         self.main_content.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -235,6 +236,51 @@ class BumbleBoxV2GUI(tk.Tk):
             background=colors["tab_btn_bg"],
             foreground=colors["text_light"],
         )
+
+    def _setup_responsive_typography(self) -> None:
+        self._base_window_width = 980
+        self._base_window_height = 680
+        self._font_base_sizes: dict[str, int] = {}
+
+        for name in ["TkDefaultFont", "TkTextFont", "TkHeadingFont", "TkMenuFont", "TkCaptionFont", "TkFixedFont"]:
+            try:
+                font_obj = tkfont.nametofont(name)
+                size = abs(int(font_obj.cget("size")))
+                if size > 0:
+                    self._font_base_sizes[name] = size
+            except Exception:
+                continue
+
+        default_font = tkfont.nametofont("TkDefaultFont")
+        family = str(default_font.cget("family"))
+        default_size = self._font_base_sizes.get("TkDefaultFont", 10)
+        self._hero_title_font = tkfont.Font(self, family=family, size=max(14, default_size + 4), weight="bold")
+        self._header_title_font = tkfont.Font(self, family=family, size=max(13, default_size + 3), weight="bold")
+        self._hero_title_base_size = abs(int(self._hero_title_font.cget("size")))
+        self._header_title_base_size = abs(int(self._header_title_font.cget("size")))
+        self._font_scale = 1.0
+        self.bind("<Configure>", self._on_root_resize, add="+")
+
+    def _on_root_resize(self, event) -> None:
+        if event.widget is not self:
+            return
+        width = max(1, int(self.winfo_width()))
+        height = max(1, int(self.winfo_height()))
+        scale = min(width / self._base_window_width, height / self._base_window_height)
+        scale = max(1.0, min(1.55, scale))
+
+        if abs(scale - self._font_scale) < 0.03:
+            return
+        self._font_scale = scale
+
+        for name, base_size in self._font_base_sizes.items():
+            try:
+                tkfont.nametofont(name).configure(size=max(8, int(round(base_size * scale))))
+            except Exception:
+                continue
+        self._hero_title_font.configure(size=max(13, int(round(self._hero_title_base_size * scale))))
+        self._header_title_font.configure(size=max(12, int(round(self._header_title_base_size * scale))))
+        self._refresh_roadmap_label_wraplength()
 
     def _style_output_text(self, widget: tk.Text) -> None:
         colors = self._palette
@@ -350,7 +396,7 @@ class BumbleBoxV2GUI(tk.Tk):
     def _build_intro_page(self) -> None:
         self.intro_frame = ttk.Frame(self.main_content, padding=12)
 
-        ttk.Label(self.intro_frame, text="Welcome to BumbleBox", font=("TkDefaultFont", 14, "bold")).pack(anchor=tk.W)
+        ttk.Label(self.intro_frame, text="Welcome to BumbleBox", font=self._hero_title_font).pack(anchor=tk.W)
         ttk.Label(
             self.intro_frame,
             text=(
@@ -453,7 +499,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
         title_row = ttk.Frame(frame)
         title_row.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ttk.Label(title_row, text="BumbleBox V2", font=("TkDefaultFont", 13, "bold")).pack(side=tk.LEFT)
+        ttk.Label(title_row, text="BumbleBox V2", font=self._header_title_font).pack(side=tk.LEFT)
         ttk.Label(title_row, text="Workflow:").pack(side=tk.LEFT, padx=(14, 4))
         ttk.Label(title_row, textvariable=self._workflow_label_var).pack(side=tk.LEFT)
         self.home_button = ttk.Button(title_row, text="Back to Home", command=self._show_intro)
@@ -758,13 +804,270 @@ class BumbleBoxV2GUI(tk.Tk):
         )
 
     def _build_roadmap_tab(self) -> None:
-        ttk.Button(self.roadmap_tab, text="Refresh Roadmap", command=self._refresh_roadmap).pack(anchor=tk.W)
-        self.roadmap_output = self._create_results_section(
+        controls = ttk.Frame(self.roadmap_tab)
+        controls.pack(fill=tk.X)
+        ttk.Button(controls, text="Refresh Roadmap", command=self._refresh_roadmap).pack(side=tk.LEFT)
+        self.roadmap_summary_var = tk.StringVar(value="No roadmap loaded yet.")
+        ttk.Label(controls, textvariable=self.roadmap_summary_var).pack(side=tk.LEFT, padx=(10, 0))
+
+        legend = ttk.Frame(self.roadmap_tab)
+        legend.pack(fill=tk.X, pady=(8, 4))
+        ttk.Label(legend, text="Legend:").pack(side=tk.LEFT)
+        ttk.Label(legend, text="☑ completed").pack(side=tk.LEFT, padx=(8, 10))
+        ttk.Label(legend, text="☐ not completed").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(legend, text="Click ? for details.").pack(side=tk.LEFT)
+
+        self.roadmap_canvas = tk.Canvas(
             self.roadmap_tab,
-            title="Roadmap Output",
-            text_height=11,
-            default_visible=False,
-            auto_hide_when_empty=True,
+            highlightthickness=0,
+            bg=self._palette["panel_bg"],
+            bd=0,
+        )
+        self.roadmap_scrollbar = ttk.Scrollbar(self.roadmap_tab, orient=tk.VERTICAL, command=self.roadmap_canvas.yview)
+        self.roadmap_steps_frame = ttk.Frame(self.roadmap_canvas)
+        self.roadmap_steps_frame.bind(
+            "<Configure>",
+            lambda _event: self.roadmap_canvas.configure(scrollregion=self.roadmap_canvas.bbox("all")),
+        )
+        self._roadmap_canvas_window = self.roadmap_canvas.create_window((0, 0), window=self.roadmap_steps_frame, anchor="nw")
+        self.roadmap_canvas.configure(yscrollcommand=self.roadmap_scrollbar.set)
+        self.roadmap_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(2, 0))
+        self.roadmap_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=(2, 0))
+        self.roadmap_canvas.bind("<Configure>", self._on_roadmap_canvas_resize)
+        self._roadmap_step_labels: list[ttk.Label] = []
+        self._refresh_roadmap(select_tab=False)
+
+    def _on_roadmap_canvas_resize(self, event) -> None:
+        if not hasattr(self, "roadmap_canvas"):
+            return
+        self.roadmap_canvas.itemconfigure(self._roadmap_canvas_window, width=max(1, int(event.width)))
+        self._refresh_roadmap_label_wraplength()
+
+    def _roadmap_wraplength(self) -> int:
+        canvas = getattr(self, "roadmap_canvas", None)
+        if canvas is None:
+            return 760
+        width = int(canvas.winfo_width()) if canvas.winfo_width() > 0 else 860
+        return max(380, width - 190)
+
+    def _refresh_roadmap_label_wraplength(self) -> None:
+        labels = getattr(self, "_roadmap_step_labels", [])
+        if not labels:
+            return
+        wrap = self._roadmap_wraplength()
+        for label in labels:
+            try:
+                label.configure(wraplength=wrap)
+            except Exception:
+                continue
+
+    def _roadmap_help_details(self, state: str, text: str) -> str:
+        lower = text.lower()
+        where = "The tab named in the step description."
+        steps = [
+            "Open the matching workflow from Home.",
+            "Open the tab named in this step.",
+            "Run the action in this step.",
+        ]
+        done_check = "You should see a success/result message in that tab."
+
+        if "config file" in lower:
+            where = "BumbleBox Setup -> Config Editor"
+            steps = [
+                "Open Config Editor.",
+                "If the button says 'Config Missing! Create Config', click it.",
+                "Click 'Load From File' then 'Validate'.",
+                "Click 'Save Config' if needed.",
+            ]
+            done_check = "Config is present and validation reports success."
+        elif "camera bring-up" in lower or "camera-preview" in lower:
+            where = "BumbleBox Setup -> Camera Setup"
+            steps = [
+                "Run 'Run Camera Preview'.",
+                "Check focus/framing in the preview window.",
+                "Run 'Run Live Tracking Test'.",
+            ]
+            done_check = "Both preview and tracking test complete without errors."
+        elif "calibration" in lower or "px/cm" in lower:
+            where = "BumbleBox Setup -> Calibration"
+            steps = [
+                "Use 'Manual Scale (Recommended)'.",
+                "Enter two points on the same plane and real distance in cm.",
+                "Use a larger baseline (about 5 to 15 cm) for stability.",
+                "Run calibration.",
+            ]
+            done_check = "Calibration results show updated px/cm and no error dialog."
+        elif "pipeline mode" in lower:
+            where = "BumbleBox Setup -> Config Editor"
+            steps = [
+                "Find 'Pipeline mode'.",
+                "Pick the mode that matches your experiment.",
+                "Save and validate config.",
+            ]
+            done_check = "Chosen mode is saved and config validates successfully."
+        elif "deferred tracking" in lower:
+            where = "BumbleBox Setup -> Config Editor"
+            steps = [
+                "Find 'Deferred tracking'.",
+                "Turn it ON if recording uptime is your priority.",
+                "Save and validate config.",
+            ]
+            done_check = "Deferred tracking setting is saved as intended."
+        elif "fps" in lower:
+            where = "BumbleBox Setup -> FPS Report"
+            steps = [
+                "Run a single FPS report on a recording.",
+                "Run FPS sweep to compare target vs real FPS.",
+                "Review drift and limits before long runs.",
+            ]
+            done_check = "FPS results are visible and acceptable for your plan."
+        elif "schedule-check" in lower or "timing margins" in lower:
+            where = "Schedule and Run -> Schedule Check"
+            steps = [
+                "Set benchmark input (optional but recommended).",
+                "Set sample frames and optional assumed RAM.",
+                "Click 'Run Schedule Check'.",
+            ]
+            done_check = "Report shows no critical failures for your schedule."
+        elif "nest label" in lower:
+            where = "Nest Labeling workflow"
+            steps = [
+                "Set image folder.",
+                "Click 'Check Environment'.",
+                "Fix any missing dependency warnings.",
+                "Click 'Launch Nest Labeling'.",
+            ]
+            done_check = "Labeling tool launches and can open your images."
+        elif "fleet" in lower or "queen" in lower or "worker" in lower:
+            where = "Fleet Setup workflow"
+            steps = [
+                "Set role and identity settings.",
+                "Enroll worker boxes.",
+                "Run fleet status and latest-status checks.",
+            ]
+            done_check = "Workers appear healthy/reachable in fleet status."
+        elif "systemd" in lower or "scheduled runs" in lower:
+            where = "Schedule and Run -> Schedule and Run"
+            steps = [
+                "Generate systemd units.",
+                "Run 'Systemd Install' and 'Systemd Enable'.",
+                "Run 'Systemd Status' to verify.",
+            ]
+            done_check = "Systemd status reports active/expected timers."
+        elif "export-bundle" in lower or "bundle" in lower:
+            where = "Schedule and Run -> Schedule and Run"
+            steps = [
+                "Refresh run history and select a run.",
+                "Set export options.",
+                "Click 'Export Selected Run Bundle'.",
+            ]
+            done_check = "Bundle export reports output path with no errors."
+
+        status_line = {
+            "DONE": "Status: completed based on current config/environment checks.",
+            "TODO": "Status: not completed yet.",
+            "INFO": "Status: informational recommendation.",
+        }.get(state.upper(), f"Status: {state}")
+
+        numbered_steps = "\n".join(f"{idx}. {item}" for idx, item in enumerate(steps, start=1))
+        return (
+            f"{status_line}\n\n"
+            f"Step detail:\n{text}\n\n"
+            f"Where to go:\n{where}\n\n"
+            f"What to do:\n{numbered_steps}\n\n"
+            f"How to tell it worked:\n{done_check}"
+        )
+
+    def _open_roadmap_help_dialog(self, title: str, details: str) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.transient(self)
+        dialog.configure(bg=self._palette["panel_bg"])
+        dialog.geometry("760x520")
+        dialog.minsize(560, 380)
+
+        container = ttk.Frame(dialog, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(container, text=title, font=self._header_title_font).pack(anchor=tk.W)
+        ttk.Label(
+            container,
+            text="Step guidance",
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(2, 8))
+
+        body = ttk.Frame(container)
+        body.pack(fill=tk.BOTH, expand=True)
+        help_text = tk.Text(body, wrap=tk.WORD)
+        self._style_output_text(help_text)
+        help_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        help_scroll = ttk.Scrollbar(body, orient=tk.VERTICAL, command=help_text.yview)
+        help_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        help_text.configure(yscrollcommand=help_scroll.set)
+        help_text.insert("1.0", details)
+        help_text.configure(state=tk.DISABLED)
+
+        footer = ttk.Frame(container)
+        footer.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(footer, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
+
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        try:
+            x = self.winfo_rootx() + max(0, (self.winfo_width() - dialog.winfo_width()) // 2)
+            y = self.winfo_rooty() + max(0, (self.winfo_height() - dialog.winfo_height()) // 2)
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+        dialog.grab_set()
+        dialog.focus_set()
+
+    def _show_roadmap_step_help(self, index: int, state: str, text: str) -> None:
+        details = self._roadmap_help_details(state, text)
+        self._open_roadmap_help_dialog(f"Roadmap Step {index}", details)
+
+    def _render_roadmap_steps(self, items: list[tuple[str, str]]) -> None:
+        for child in self.roadmap_steps_frame.winfo_children():
+            child.destroy()
+        self._roadmap_step_labels = []
+
+        done_count = 0
+        todo_like_count = 0
+        for idx, (state, text) in enumerate(items, start=1):
+            normalized_state = state.upper().strip()
+            is_done = normalized_state == "DONE"
+            if is_done:
+                done_count += 1
+            if normalized_state in {"TODO", "INFO"}:
+                todo_like_count += 1
+
+            row = ttk.Frame(self.roadmap_steps_frame, padding=(4, 5))
+            row.grid(row=idx - 1, column=0, sticky="ew")
+            row.columnconfigure(2, weight=1)
+
+            marker = "☑" if is_done else "☐"
+            ttk.Label(row, text=marker).grid(row=0, column=0, sticky="nw", padx=(0, 8))
+            ttk.Label(row, text=f"{normalized_state:>4}").grid(row=0, column=1, sticky="nw", padx=(0, 10))
+            text_label = ttk.Label(
+                row,
+                text=f"{idx}. {text}",
+                justify=tk.LEFT,
+                wraplength=self._roadmap_wraplength(),
+            )
+            text_label.grid(row=0, column=2, sticky="ew")
+            self._roadmap_step_labels.append(text_label)
+            ttk.Button(
+                row,
+                text="?",
+                width=2,
+                command=lambda i=idx, s=normalized_state, t=text: self._show_roadmap_step_help(i, s, t),
+            ).grid(row=0, column=3, sticky="ne", padx=(8, 0))
+
+        total = len(items)
+        self.roadmap_summary_var.set(
+            f"Completed: {done_count}/{total}   Remaining/Info: {todo_like_count}"
         )
 
     def _build_config_tab(self) -> None:
@@ -2661,12 +2964,13 @@ class BumbleBoxV2GUI(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Full camera setup check failed", str(exc))
 
-    def _refresh_roadmap(self) -> None:
+    def _refresh_roadmap(self, *, select_tab: bool = True) -> None:
         try:
             config, config_path = self._load_config_or_defaults()
-            self.roadmap_output.delete("1.0", tk.END)
-            self.roadmap_output.insert(tk.END, render_roadmap(config, config_path))
-            self.notebook.select(self.roadmap_tab)
+            items = build_roadmap(config, config_path)
+            self._render_roadmap_steps(items)
+            if select_tab and str(self.roadmap_tab) in self.notebook.tabs():
+                self.notebook.select(self.roadmap_tab)
         except Exception as exc:
             messagebox.showerror("Roadmap failed", str(exc))
 
