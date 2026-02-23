@@ -83,6 +83,20 @@ from .systemd_units import (
     write_systemd_units,
 )
 
+OCEAN_SLATE_PALETTE = {
+    "app_bg": "#2B3A42",
+    "panel_bg": "#334854",
+    "tab_btn_bg": "#1F2A33",
+    "tab_btn_active": "#2B3C49",
+    "tab_selected": "#3F5B6F",
+    "text_light": "#EAF2F7",
+    "text_muted": "#C0D3E0",
+    "entry_bg": "#22323D",
+    "entry_fg": "#EAF2F7",
+    "output_bg": "#111A22",
+    "output_text": "#DCE8F2",
+}
+
 
 class BumbleBoxV2GUI(tk.Tk):
     def __init__(self) -> None:
@@ -109,10 +123,217 @@ class BumbleBoxV2GUI(tk.Tk):
         self._fps_sweep_error: str | None = None
         self._fps_sweep_report = None
         self._fps_sweep_progress_q: queue.Queue[tuple[int, int, float]] = queue.Queue()
+        self._config_form_canvas: tk.Canvas | None = None
+        self._config_form_window: int | None = None
+        self._palette = dict(OCEAN_SLATE_PALETTE)
+        self._results_sections: dict[tk.Text, dict[str, object]] = {}
         self._session_started_iso = datetime.now().isoformat(timespec="seconds")
 
+        self._apply_ocean_slate_theme()
         self._build_header()
         self._build_notebook()
+
+    def _apply_ocean_slate_theme(self) -> None:
+        colors = self._palette
+        style = ttk.Style(self)
+        available = set(style.theme_names())
+        if "clam" in available:
+            style.theme_use("clam")
+
+        self.configure(bg=colors["app_bg"])
+
+        style.configure("TFrame", background=colors["panel_bg"])
+        style.configure("TLabelframe", background=colors["panel_bg"], borderwidth=1)
+        style.configure("TLabelframe.Label", background=colors["panel_bg"], foreground=colors["text_light"])
+        style.configure("TLabel", background=colors["panel_bg"], foreground=colors["text_light"])
+        style.configure(
+            "TButton",
+            background=colors["tab_btn_bg"],
+            foreground=colors["text_light"],
+            borderwidth=1,
+            padding=(8, 4),
+        )
+        style.map(
+            "TButton",
+            background=[
+                ("pressed", colors["tab_selected"]),
+                ("active", colors["tab_btn_active"]),
+            ],
+            foreground=[
+                ("disabled", colors["text_muted"]),
+                ("!disabled", colors["text_light"]),
+            ],
+        )
+        style.configure("TCheckbutton", background=colors["panel_bg"], foreground=colors["text_light"])
+        style.configure("TRadiobutton", background=colors["panel_bg"], foreground=colors["text_light"])
+        style.map(
+            "TCheckbutton",
+            background=[("active", colors["panel_bg"])],
+            foreground=[("disabled", colors["text_muted"]), ("!disabled", colors["text_light"])],
+        )
+        style.map(
+            "TRadiobutton",
+            background=[("active", colors["panel_bg"])],
+            foreground=[("disabled", colors["text_muted"]), ("!disabled", colors["text_light"])],
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground=colors["entry_bg"],
+            foreground=colors["entry_fg"],
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=colors["entry_bg"],
+            foreground=colors["entry_fg"],
+            background=colors["tab_btn_bg"],
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", colors["entry_bg"])],
+            foreground=[("readonly", colors["entry_fg"])],
+            selectbackground=[("readonly", colors["tab_selected"])],
+            selectforeground=[("readonly", colors["text_light"])],
+        )
+        style.configure("TNotebook", background=colors["app_bg"], borderwidth=0)
+        style.configure(
+            "TNotebook.Tab",
+            background=colors["tab_btn_bg"],
+            foreground=colors["text_light"],
+            padding=(10, 5),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", colors["tab_selected"]), ("active", colors["tab_btn_active"])],
+            foreground=[("selected", colors["text_light"]), ("!selected", colors["text_light"])],
+        )
+        style.configure(
+            "Treeview",
+            background=colors["output_bg"],
+            foreground=colors["output_text"],
+            fieldbackground=colors["output_bg"],
+            rowheight=24,
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", colors["tab_selected"])],
+            foreground=[("selected", colors["text_light"])],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=colors["tab_btn_bg"],
+            foreground=colors["text_light"],
+        )
+
+    def _style_output_text(self, widget: tk.Text) -> None:
+        colors = self._palette
+        widget.configure(
+            bg=colors["output_bg"],
+            fg=colors["output_text"],
+            insertbackground=colors["output_text"],
+            selectbackground=colors["tab_selected"],
+            selectforeground=colors["text_light"],
+            highlightthickness=1,
+            highlightbackground=colors["panel_bg"],
+            highlightcolor=colors["tab_selected"],
+            relief=tk.FLAT,
+            padx=8,
+            pady=6,
+        )
+
+    def _create_results_section(
+        self,
+        parent: tk.Widget,
+        *,
+        title: str = "Results",
+        text_height: int = 9,
+        default_visible: bool = False,
+        auto_hide_when_empty: bool = True,
+        fill: str = tk.BOTH,
+        expand: bool = True,
+        pady: tuple[int, int] = (10, 0),
+    ) -> tk.Text:
+        container = ttk.Frame(parent)
+        container.pack(fill=(tk.BOTH if expand else tk.X), expand=expand, pady=pady)
+
+        header = ttk.Frame(container)
+        header.pack(fill=tk.X)
+        status_var = tk.StringVar(value="No output")
+        ttk.Label(header, text=title).pack(side=tk.LEFT)
+        ttk.Label(header, textvariable=status_var).pack(side=tk.LEFT, padx=(8, 0))
+
+        body = ttk.Frame(container)
+        text_widget = tk.Text(body, wrap=tk.WORD, height=text_height)
+        text_widget.pack(fill=fill, expand=expand)
+        self._style_output_text(text_widget)
+
+        toggle_btn = ttk.Button(header, text="Show Results")
+        toggle_btn.pack(side=tk.RIGHT)
+
+        self._results_sections[text_widget] = {
+            "container": container,
+            "body": body,
+            "button": toggle_btn,
+            "status_var": status_var,
+            "fill": fill,
+            "expand": expand,
+            "auto_hide_when_empty": auto_hide_when_empty,
+        }
+        toggle_btn.configure(command=lambda widget=text_widget: self._toggle_results_section(widget))
+        text_widget.bind("<<Modified>>", self._on_results_text_modified, add="+")
+        text_widget.edit_modified(False)
+
+        self._set_results_section_visible(text_widget, default_visible)
+        return text_widget
+
+    def _set_results_section_visible(self, text_widget: tk.Text, visible: bool) -> None:
+        meta = self._results_sections.get(text_widget)
+        if not meta:
+            return
+
+        body = meta["body"]
+        button = meta["button"]
+        fill = meta["fill"]
+        expand = bool(meta["expand"])
+
+        if visible:
+            if body.winfo_manager() != "pack":
+                body.pack(fill=fill, expand=expand, pady=(6, 0))
+            button.configure(text="Hide Results")
+        else:
+            if body.winfo_manager() == "pack":
+                body.pack_forget()
+            button.configure(text="Show Results")
+
+    def _toggle_results_section(self, text_widget: tk.Text) -> None:
+        meta = self._results_sections.get(text_widget)
+        if not meta:
+            return
+        body = meta["body"]
+        currently_visible = body.winfo_manager() == "pack"
+        self._set_results_section_visible(text_widget, not currently_visible)
+
+    def _on_results_text_modified(self, event) -> None:
+        text_widget = event.widget
+        if not isinstance(text_widget, tk.Text):
+            return
+        if not text_widget.edit_modified():
+            return
+
+        meta = self._results_sections.get(text_widget)
+        if meta is None:
+            text_widget.edit_modified(False)
+            return
+
+        content = text_widget.get("1.0", tk.END).strip()
+        status_var = meta["status_var"]
+        status_var.set("Output available" if content else "No output")
+
+        if content:
+            self._set_results_section_visible(text_widget, True)
+        elif bool(meta.get("auto_hide_when_empty", True)):
+            self._set_results_section_visible(text_widget, False)
+
+        text_widget.edit_modified(False)
 
     def _build_header(self) -> None:
         frame = ttk.Frame(self, padding=10)
@@ -120,11 +341,18 @@ class BumbleBoxV2GUI(tk.Tk):
 
         ttk.Label(frame, text="Config path:").grid(row=0, column=0, sticky="w")
         ttk.Entry(frame, textvariable=self.config_path_var, width=62).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(frame, text="Create Default Config", command=self._create_config).grid(row=0, column=2, sticky="w", padx=4)
+        ttk.Button(frame, text="Create Config (If Missing)", command=self._create_config).grid(
+            row=0, column=2, sticky="w", padx=4
+        )
         ttk.Button(frame, text="Open Current Roadmap", command=self._refresh_roadmap).grid(row=0, column=3, sticky="w", padx=4)
+        ttk.Label(
+            frame,
+            text="Creates a default YAML config at the selected path and will not overwrite an existing file.",
+            justify=tk.LEFT,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         mode_row = ttk.Frame(frame)
-        mode_row.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        mode_row.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(mode_row, text="View mode:").pack(side=tk.LEFT)
         ttk.Radiobutton(
             mode_row,
@@ -146,7 +374,7 @@ class BumbleBoxV2GUI(tk.Tk):
         ).pack(side=tk.LEFT)
 
         setup_row = ttk.Frame(frame)
-        setup_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        setup_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         ttk.Label(setup_row, text="Setup order:").pack(side=tk.LEFT)
         setup_steps = [
             ("1. Doctor", "doctor"),
@@ -321,10 +549,16 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self.storage_output = tk.Text(storage_frame, wrap=tk.WORD, height=7)
         self.storage_output.grid(row=2, column=0, columnspan=3, sticky="nsew")
+        self._style_output_text(self.storage_output)
         storage_frame.rowconfigure(2, weight=1)
 
-        self.doctor_output = tk.Text(self.doctor_tab, wrap=tk.WORD)
-        self.doctor_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.doctor_output = self._create_results_section(
+            self.doctor_tab,
+            title="Doctor Results",
+            text_height=12,
+            default_visible=False,
+            auto_hide_when_empty=True,
+        )
         self._load_storage_mount_point_from_config()
         self._refresh_storage_status()
 
@@ -418,13 +652,23 @@ class BumbleBoxV2GUI(tk.Tk):
         top.columnconfigure(0, weight=1)
         top.columnconfigure(1, weight=1)
 
-        self.camera_setup_output = tk.Text(self.camera_setup_tab, wrap=tk.WORD)
-        self.camera_setup_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.camera_setup_output = self._create_results_section(
+            self.camera_setup_tab,
+            title="Camera Setup Results",
+            text_height=11,
+            default_visible=False,
+            auto_hide_when_empty=True,
+        )
 
     def _build_roadmap_tab(self) -> None:
         ttk.Button(self.roadmap_tab, text="Refresh Roadmap", command=self._refresh_roadmap).pack(anchor=tk.W)
-        self.roadmap_output = tk.Text(self.roadmap_tab, wrap=tk.WORD)
-        self.roadmap_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.roadmap_output = self._create_results_section(
+            self.roadmap_tab,
+            title="Roadmap Output",
+            text_height=11,
+            default_visible=False,
+            auto_hide_when_empty=True,
+        )
 
     def _build_config_tab(self) -> None:
         container = ttk.Frame(self.config_tab)
@@ -436,23 +680,44 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Button(top_buttons, text="Validate", command=self._validate_editor_config).pack(side=tk.LEFT, padx=6)
         ttk.Button(top_buttons, text="Save Config", command=self._save_editor_config).pack(side=tk.LEFT, padx=6)
 
-        form_canvas = tk.Canvas(container, highlightthickness=0)
+        form_canvas = tk.Canvas(
+            container,
+            highlightthickness=0,
+            bg=self._palette["panel_bg"],
+            bd=0,
+        )
         scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=form_canvas.yview)
         self.config_form_frame = ttk.Frame(form_canvas)
         self.config_form_frame.bind(
             "<Configure>",
             lambda _event: form_canvas.configure(scrollregion=form_canvas.bbox("all")),
         )
-        form_canvas.create_window((0, 0), window=self.config_form_frame, anchor="nw")
+        self._config_form_canvas = form_canvas
+        self._config_form_window = form_canvas.create_window((0, 0), window=self.config_form_frame, anchor="nw")
+        form_canvas.bind("<Configure>", self._on_config_canvas_resize)
         form_canvas.configure(yscrollcommand=scrollbar.set)
         form_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         self._render_config_fields()
 
-        self.config_output = tk.Text(self.config_tab, wrap=tk.WORD, height=10)
-        self.config_output.pack(fill=tk.BOTH, expand=False, pady=(10, 0))
+        self.config_output = self._create_results_section(
+            self.config_tab,
+            title="Config Messages",
+            text_height=7,
+            default_visible=False,
+            auto_hide_when_empty=True,
+            fill=tk.X,
+            expand=False,
+        )
         self._load_config_into_editor()
+
+    def _on_config_canvas_resize(self, event) -> None:
+        canvas = getattr(self, "_config_form_canvas", None)
+        window_id = getattr(self, "_config_form_window", None)
+        if canvas is None or window_id is None:
+            return
+        canvas.itemconfigure(window_id, width=max(1, int(event.width)))
 
     def _render_config_fields(self) -> None:
         specs = [
@@ -617,8 +882,13 @@ class BumbleBoxV2GUI(tk.Tk):
         top.columnconfigure(0, weight=1)
         top.columnconfigure(1, weight=1)
 
-        self.fps_output = tk.Text(self.fps_tab, wrap=tk.WORD)
-        self.fps_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.fps_output = self._create_results_section(
+            self.fps_tab,
+            title="FPS Results",
+            text_height=11,
+            default_visible=False,
+            auto_hide_when_empty=True,
+        )
 
     def _build_calibration_tab(self) -> None:
         top = ttk.Frame(self.calibration_tab)
@@ -683,8 +953,13 @@ class BumbleBoxV2GUI(tk.Tk):
         top.columnconfigure(0, weight=1)
         top.columnconfigure(1, weight=1)
 
-        self.calibration_output = tk.Text(self.calibration_tab, wrap=tk.WORD)
-        self.calibration_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.calibration_output = self._create_results_section(
+            self.calibration_tab,
+            title="Calibration Results",
+            text_height=11,
+            default_visible=False,
+            auto_hide_when_empty=True,
+        )
 
     def _build_schedule_check_tab(self) -> None:
         top = ttk.Frame(self.schedule_check_tab)
@@ -724,8 +999,13 @@ class BumbleBoxV2GUI(tk.Tk):
 
         top.columnconfigure(1, weight=1)
 
-        self.schedule_check_output = tk.Text(self.schedule_check_tab, wrap=tk.WORD)
-        self.schedule_check_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.schedule_check_output = self._create_results_section(
+            self.schedule_check_tab,
+            title="Schedule Check Results",
+            text_height=11,
+            default_visible=False,
+            auto_hide_when_empty=True,
+        )
 
     def _run_schedule_check(self) -> None:
         try:
@@ -860,8 +1140,13 @@ class BumbleBoxV2GUI(tk.Tk):
 
         top.columnconfigure(1, weight=1)
 
-        self.optimize_output = tk.Text(self.optimize_tracking_tab, wrap=tk.WORD)
-        self.optimize_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.optimize_output = self._create_results_section(
+            self.optimize_tracking_tab,
+            title="Optimization Results",
+            text_height=11,
+            default_visible=False,
+            auto_hide_when_empty=True,
+        )
 
     def _start_optimize_tracking(self) -> None:
         if self._optimize_thread and self._optimize_thread.is_alive():
@@ -1059,8 +1344,13 @@ class BumbleBoxV2GUI(tk.Tk):
 
         top.columnconfigure(1, weight=1)
 
-        self.nest_label_output = tk.Text(self.nest_label_tab, wrap=tk.WORD)
-        self.nest_label_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.nest_label_output = self._create_results_section(
+            self.nest_label_tab,
+            title="Nest Labeling Results",
+            text_height=11,
+            default_visible=False,
+            auto_hide_when_empty=True,
+        )
 
     def _run_nest_label_check(self) -> None:
         try:
@@ -1342,16 +1632,29 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fleet_latest_tree.column(col, width=width, stretch=(col in {"host", "state"}))
         self.fleet_latest_tree.pack(fill=tk.X, expand=False)
 
-        self.fleet_latest_detail = tk.Text(latest_frame, wrap=tk.WORD, height=7)
-        self.fleet_latest_detail.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        self.fleet_latest_detail = self._create_results_section(
+            latest_frame,
+            title="Latest Matrix Details",
+            text_height=7,
+            default_visible=False,
+            auto_hide_when_empty=True,
+            fill=tk.BOTH,
+            expand=False,
+            pady=(6, 0),
+        )
         status_frame.columnconfigure(1, weight=1)
         status_frame.rowconfigure(3, weight=1)
 
         top.columnconfigure(0, weight=1)
         top.columnconfigure(1, weight=1)
 
-        self.fleet_output = tk.Text(self.fleet_tab, wrap=tk.WORD)
-        self.fleet_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.fleet_output = self._create_results_section(
+            self.fleet_tab,
+            title="Fleet Results",
+            text_height=11,
+            default_visible=False,
+            auto_hide_when_empty=True,
+        )
 
     def _fleet_init_queen(self) -> None:
         try:
@@ -1755,14 +2058,29 @@ class BumbleBoxV2GUI(tk.Tk):
         top.columnconfigure(1, weight=1)
         top.columnconfigure(2, weight=1)
 
-        self.run_output = tk.Text(self.run_tab, wrap=tk.WORD)
-        self.run_output.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.run_output = self._create_results_section(
+            self.run_tab,
+            title="Run & Schedule Results",
+            text_height=9,
+            default_visible=False,
+            auto_hide_when_empty=True,
+            fill=tk.X,
+            expand=False,
+        )
 
         alerts_frame = ttk.LabelFrame(self.run_tab, text="Runtime Alerts", padding=8)
         alerts_frame.pack(fill=tk.X, expand=False, pady=(10, 0))
         ttk.Button(alerts_frame, text="Refresh Runtime Alerts", command=self._refresh_runtime_alerts).pack(anchor=tk.W)
-        self.runtime_alert_output = tk.Text(alerts_frame, wrap=tk.WORD, height=5)
-        self.runtime_alert_output.pack(fill=tk.X, expand=False, pady=(6, 0))
+        self.runtime_alert_output = self._create_results_section(
+            alerts_frame,
+            title="Runtime Alerts Output",
+            text_height=5,
+            default_visible=True,
+            auto_hide_when_empty=False,
+            fill=tk.X,
+            expand=False,
+            pady=(6, 0),
+        )
 
         history_frame = ttk.LabelFrame(self.run_tab, text="Recent Runs", padding=8)
         history_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -1799,11 +2117,14 @@ class BumbleBoxV2GUI(tk.Tk):
         ]:
             self.run_history_tree.heading(col, text=label)
             self.run_history_tree.column(col, width=width, stretch=(col == "session"))
-        self.run_history_tree.pack(fill=tk.X, pady=(8, 8))
+        self.run_history_tree.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
         self.run_history_tree.bind("<<TreeviewSelect>>", self._on_run_history_select)
 
-        self.run_history_detail = tk.Text(history_frame, wrap=tk.WORD, height=8)
-        self.run_history_detail.pack(fill=tk.BOTH, expand=True)
+        self.run_history_detail_frame = ttk.LabelFrame(history_frame, text="Selected Run Details", padding=6)
+        self.run_history_detail = tk.Text(self.run_history_detail_frame, wrap=tk.WORD, height=6)
+        self.run_history_detail.pack(fill=tk.BOTH, expand=False)
+        self._style_output_text(self.run_history_detail)
+        self._set_run_history_detail_text("")
         self._register_advanced_widget(export_controls)
         self._refresh_runtime_alerts()
         self._refresh_run_history()
@@ -1886,8 +2207,23 @@ class BumbleBoxV2GUI(tk.Tk):
     def _create_config(self) -> None:
         try:
             path = write_default_config(self.config_path_var.get(), force=False)
+            self._load_config_into_editor()
+            self.config_output.delete("1.0", tk.END)
+            self.config_output.insert(
+                tk.END,
+                (
+                    "Created a new default config file.\n"
+                    f"Path: {path}\n"
+                    "The file has been loaded into the editor."
+                ),
+            )
             messagebox.showinfo("Config created", f"Created default config at:\n{path}")
         except FileExistsError:
+            self.config_output.delete("1.0", tk.END)
+            self.config_output.insert(
+                tk.END,
+                "Config file already exists at the selected path; no overwrite was performed.",
+            )
             messagebox.showinfo("Config exists", "Config already exists. Keeping current file.")
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
@@ -2449,22 +2785,34 @@ class BumbleBoxV2GUI(tk.Tk):
                         record.session_name,
                     ),
                 )
+            self._set_run_history_detail_text("")
             self._refresh_runtime_alerts()
         except Exception as exc:
             messagebox.showerror("Run history failed", str(exc))
 
+    def _set_run_history_detail_text(self, text: str) -> None:
+        self.run_history_detail.delete("1.0", tk.END)
+        if text.strip():
+            self.run_history_detail.insert(tk.END, text)
+            if self.run_history_detail_frame.winfo_manager() != "pack":
+                self.run_history_detail_frame.pack(fill=tk.X, expand=False)
+        else:
+            if self.run_history_detail_frame.winfo_manager() == "pack":
+                self.run_history_detail_frame.pack_forget()
+
     def _on_run_history_select(self, _event=None) -> None:
         selected = self.run_history_tree.selection()
         if not selected:
+            self._set_run_history_detail_text("")
             return
         iid = selected[0]
         path = self._run_history_paths.get(iid)
         if not path:
+            self._set_run_history_detail_text("")
             return
         try:
             payload = load_run_summary(path)
-            self.run_history_detail.delete("1.0", tk.END)
-            self.run_history_detail.insert(tk.END, json.dumps(payload, indent=2))
+            self._set_run_history_detail_text(json.dumps(payload, indent=2))
         except Exception as exc:
             messagebox.showerror("Load summary failed", str(exc))
 
@@ -2492,8 +2840,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 zip_bundle=bool(self.bundle_zip_var.get()),
             )
             text = format_bundle_export_result(result)
-            self.run_history_detail.delete("1.0", tk.END)
-            self.run_history_detail.insert(tk.END, text)
+            self._set_run_history_detail_text(text)
             messagebox.showinfo("Export complete", text)
         except Exception as exc:
             messagebox.showerror("Bundle export failed", str(exc))
