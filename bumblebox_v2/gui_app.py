@@ -11,7 +11,7 @@ import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from .calibration import (
     apply_scale_to_config,
@@ -127,11 +127,18 @@ class BumbleBoxV2GUI(tk.Tk):
         self._config_form_window: int | None = None
         self._palette = dict(OCEAN_SLATE_PALETTE)
         self._results_sections: dict[tk.Text, dict[str, object]] = {}
+        self._tab_titles: dict[str, str] = {}
+        self._workflow_tabs: dict[str, list[str]] = {}
+        self._workflow_label_var = tk.StringVar(value="Home")
         self._session_started_iso = datetime.now().isoformat(timespec="seconds")
 
         self._apply_ocean_slate_theme()
         self._build_header()
+        self.main_content = ttk.Frame(self)
+        self.main_content.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self._build_intro_page()
         self._build_notebook()
+        self._show_intro()
 
     def _apply_ocean_slate_theme(self) -> None:
         colors = self._palette
@@ -180,6 +187,11 @@ class BumbleBoxV2GUI(tk.Tk):
             "TEntry",
             fieldbackground=colors["entry_bg"],
             foreground=colors["entry_fg"],
+        )
+        style.map(
+            "TEntry",
+            fieldbackground=[("readonly", colors["entry_bg"])],
+            foreground=[("readonly", colors["entry_fg"])],
         )
         style.configure(
             "TCombobox",
@@ -335,25 +347,121 @@ class BumbleBoxV2GUI(tk.Tk):
 
         text_widget.edit_modified(False)
 
+    def _build_intro_page(self) -> None:
+        self.intro_frame = ttk.Frame(self.main_content, padding=12)
+
+        ttk.Label(self.intro_frame, text="Welcome to BumbleBox", font=("TkDefaultFont", 14, "bold")).pack(anchor=tk.W)
+        ttk.Label(
+            self.intro_frame,
+            text=(
+                "Start by choosing a workspace. Each workspace shows only the tabs needed for that workflow."
+            ),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(4, 14))
+
+        cards = ttk.Frame(self.intro_frame)
+        cards.pack(fill=tk.BOTH, expand=True)
+
+        workflows = [
+            (
+                "setup",
+                "BumbleBox Setup",
+                "Bring up hardware and configuration: roadmap, diagnostics, camera setup, tracking test, FPS checks, and calibration.",
+            ),
+            (
+                "schedule_run",
+                "Schedule and Run",
+                "Validate timing/memory assumptions and manage scheduled execution and immediate runs.",
+            ),
+            (
+                "nest_labeling",
+                "Nest Labeling",
+                "Check labeling environment readiness and launch the nest-labeling workflow.",
+            ),
+            (
+                "fleet",
+                "Fleet Setup",
+                "Configure and monitor queen/worker BumbleBoxes, worker discovery, and media synchronization.",
+            ),
+        ]
+
+        for idx, (key, label, desc) in enumerate(workflows):
+            row = idx // 2
+            col = idx % 2
+            card = ttk.LabelFrame(cards, text=label, padding=10)
+            card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
+            ttk.Button(card, text=f"Open {label}", command=lambda workflow_key=key: self._open_workflow(workflow_key)).pack(
+                anchor=tk.W
+            )
+            ttk.Label(card, text=desc, wraplength=380, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
+
+        cards.columnconfigure(0, weight=1)
+        cards.columnconfigure(1, weight=1)
+        cards.rowconfigure(0, weight=1)
+        cards.rowconfigure(1, weight=1)
+
+    def _show_intro(self) -> None:
+        self._workflow_label_var.set("Home")
+        if hasattr(self, "home_button"):
+            self.home_button.config(state=tk.DISABLED)
+        if hasattr(self, "notebook") and self.notebook.winfo_manager() == "pack":
+            self.notebook.pack_forget()
+        if self.intro_frame.winfo_manager() != "pack":
+            self.intro_frame.pack(fill=tk.BOTH, expand=True)
+
+    def _open_workflow(self, workflow_key: str) -> None:
+        tab_keys = self._workflow_tabs.get(workflow_key, [])
+        if not tab_keys:
+            return
+
+        if self.intro_frame.winfo_manager() == "pack":
+            self.intro_frame.pack_forget()
+        if self.notebook.winfo_manager() != "pack":
+            self.notebook.pack(fill=tk.BOTH, expand=True)
+        if hasattr(self, "home_button"):
+            self.home_button.config(state=tk.NORMAL)
+
+        self._workflow_label_var.set(
+            {
+                "setup": "BumbleBox Setup",
+                "schedule_run": "Schedule and Run",
+                "nest_labeling": "Nest Labeling",
+                "fleet": "Fleet Setup",
+            }.get(workflow_key, workflow_key.title())
+        )
+
+        self._set_visible_tabs(tab_keys, select_key=tab_keys[0] if tab_keys else None)
+
+    def _set_visible_tabs(self, tab_keys: list[str], select_key: str | None = None) -> None:
+        for tab_id in self.notebook.tabs():
+            self.notebook.forget(tab_id)
+
+        for key in tab_keys:
+            tab = self._tab_lookup.get(key)
+            if tab is None:
+                continue
+            self.notebook.add(tab, text=self._tab_titles.get(key, key))
+
+        if select_key is not None:
+            tab = self._tab_lookup.get(select_key)
+            if tab is not None:
+                self.notebook.select(tab)
+
     def _build_header(self) -> None:
         frame = ttk.Frame(self, padding=10)
         frame.pack(fill=tk.X)
 
-        ttk.Label(frame, text="Config path:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.config_path_var, width=62).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(frame, text="Create Config (If Missing)", command=self._create_config).grid(
-            row=0, column=2, sticky="w", padx=4
-        )
-        ttk.Button(frame, text="Open Current Roadmap", command=self._refresh_roadmap).grid(row=0, column=3, sticky="w", padx=4)
-        ttk.Label(
-            frame,
-            text="Creates a default YAML config at the selected path and will not overwrite an existing file.",
-            justify=tk.LEFT,
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        title_row = ttk.Frame(frame)
+        title_row.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(title_row, text="BumbleBox V2", font=("TkDefaultFont", 13, "bold")).pack(side=tk.LEFT)
+        ttk.Label(title_row, text="Workflow:").pack(side=tk.LEFT, padx=(14, 4))
+        ttk.Label(title_row, textvariable=self._workflow_label_var).pack(side=tk.LEFT)
+        self.home_button = ttk.Button(title_row, text="Back to Home", command=self._show_intro)
+        self.home_button.pack(side=tk.RIGHT)
 
         mode_row = ttk.Frame(frame)
-        mode_row.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        ttk.Label(mode_row, text="View mode:").pack(side=tk.LEFT)
+        mode_row.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(mode_row, text="View mode:").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Radiobutton(
             mode_row,
             text="Basic",
@@ -372,30 +480,10 @@ class BumbleBoxV2GUI(tk.Tk):
             mode_row,
             text="Basic hides rarely used tuning controls.",
         ).pack(side=tk.LEFT)
-
-        setup_row = ttk.Frame(frame)
-        setup_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        ttk.Label(setup_row, text="Setup order:").pack(side=tk.LEFT)
-        setup_steps = [
-            ("1. Doctor", "doctor"),
-            ("2. Camera Setup", "camera_setup"),
-            ("3. Calibration", "calibration"),
-            ("4. FPS Report", "fps"),
-            ("5. Schedule Check", "schedule_check"),
-            ("6. Run & Schedule", "run"),
-        ]
-        for label, key in setup_steps:
-            ttk.Button(
-                setup_row,
-                text=label,
-                command=lambda tab_key=key: self._go_to_tab(tab_key),
-            ).pack(side=tk.LEFT, padx=3)
-
-        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(0, weight=1)
 
     def _build_notebook(self) -> None:
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.notebook = ttk.Notebook(self.main_content)
 
         self.doctor_tab = ttk.Frame(self.notebook, padding=12)
         self.camera_setup_tab = ttk.Frame(self.notebook, padding=12)
@@ -404,22 +492,11 @@ class BumbleBoxV2GUI(tk.Tk):
         self.calibration_tab = ttk.Frame(self.notebook, padding=12)
         self.schedule_check_tab = ttk.Frame(self.notebook, padding=12)
         self.optimize_tracking_tab = ttk.Frame(self.notebook, padding=12)
+        self.test_tracking_tab = ttk.Frame(self.notebook, padding=12)
         self.config_tab = ttk.Frame(self.notebook, padding=12)
         self.nest_label_tab = ttk.Frame(self.notebook, padding=12)
         self.fleet_tab = ttk.Frame(self.notebook, padding=12)
         self.run_tab = ttk.Frame(self.notebook, padding=12)
-
-        self.notebook.add(self.doctor_tab, text="Doctor")
-        self.notebook.add(self.camera_setup_tab, text="Camera Setup")
-        self.notebook.add(self.roadmap_tab, text="Roadmap")
-        self.notebook.add(self.config_tab, text="Config Editor")
-        self.notebook.add(self.fps_tab, text="FPS Report")
-        self.notebook.add(self.calibration_tab, text="Calibration")
-        self.notebook.add(self.schedule_check_tab, text="Schedule Check")
-        self.notebook.add(self.optimize_tracking_tab, text="Optimize Tracking")
-        self.notebook.add(self.nest_label_tab, text="Nest Labeling")
-        self.notebook.add(self.fleet_tab, text="Fleet")
-        self.notebook.add(self.run_tab, text="Run & Schedule")
 
         self._build_doctor_tab()
         self._build_camera_setup_tab()
@@ -429,6 +506,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._build_calibration_tab()
         self._build_schedule_check_tab()
         self._build_optimize_tracking_tab()
+        self._build_test_tracking_tab()
         self._build_nest_label_tab()
         self._build_fleet_tab()
         self._build_run_tab()
@@ -441,10 +519,29 @@ class BumbleBoxV2GUI(tk.Tk):
             "fps": self.fps_tab,
             "calibration": self.calibration_tab,
             "schedule_check": self.schedule_check_tab,
-            "optimize_tracking": self.optimize_tracking_tab,
+            "test_tracking": self.test_tracking_tab,
             "nest_labeling": self.nest_label_tab,
             "fleet": self.fleet_tab,
             "run": self.run_tab,
+        }
+        self._tab_titles = {
+            "roadmap": "Setup Roadmap",
+            "doctor": "Doctor",
+            "config": "Config Editor",
+            "camera_setup": "Camera Setup",
+            "test_tracking": "Test Tracking",
+            "fps": "FPS Report",
+            "calibration": "Calibration",
+            "schedule_check": "Schedule Check",
+            "run": "Schedule and Run",
+            "nest_labeling": "Nest Labeling",
+            "fleet": "Fleet Setup",
+        }
+        self._workflow_tabs = {
+            "setup": ["roadmap", "doctor", "config", "camera_setup", "test_tracking", "fps", "calibration"],
+            "schedule_run": ["schedule_check", "run"],
+            "nest_labeling": ["nest_labeling"],
+            "fleet": ["fleet"],
         }
         self._set_ui_mode()
 
@@ -504,7 +601,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
     def _go_to_tab(self, tab_key: str) -> None:
         tab = self._tab_lookup.get(tab_key)
-        if tab is not None:
+        if tab is not None and str(tab) in self.notebook.tabs():
             self.notebook.select(tab)
 
     def _build_doctor_tab(self) -> None:
@@ -674,6 +771,22 @@ class BumbleBoxV2GUI(tk.Tk):
         container = ttk.Frame(self.config_tab)
         container.pack(fill=tk.BOTH, expand=True)
 
+        source_frame = ttk.LabelFrame(container, text="Config File", padding=8)
+        source_frame.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(source_frame, text="Current config path").grid(row=0, column=0, sticky="w")
+        self.config_path_display = ttk.Entry(source_frame, textvariable=self.config_path_var, width=82, state="readonly")
+        self.config_path_display.grid(row=0, column=1, sticky="ew", padx=8, pady=3)
+        self.config_action_button = ttk.Button(source_frame, text="", command=self._handle_config_path_action)
+        self.config_action_button.grid(row=0, column=2, sticky="w")
+        ttk.Label(
+            source_frame,
+            text=(
+                "Path is read-only here. Use the button to switch config files or create a missing default file."
+            ),
+            justify=tk.LEFT,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        source_frame.columnconfigure(1, weight=1)
+
         top_buttons = ttk.Frame(container)
         top_buttons.pack(fill=tk.X, pady=(0, 8))
         ttk.Button(top_buttons, text="Load From File", command=self._load_config_into_editor).pack(side=tk.LEFT)
@@ -711,6 +824,7 @@ class BumbleBoxV2GUI(tk.Tk):
             expand=False,
         )
         self._load_config_into_editor()
+        self._refresh_config_path_controls()
 
     def _on_config_canvas_resize(self, event) -> None:
         canvas = getattr(self, "_config_form_canvas", None)
@@ -1035,6 +1149,20 @@ class BumbleBoxV2GUI(tk.Tk):
                 )
         except Exception as exc:
             messagebox.showerror("Schedule check failed", str(exc))
+
+    def _build_test_tracking_tab(self) -> None:
+        intro = ttk.LabelFrame(self.test_tracking_tab, text="Test Tracking", padding=10)
+        intro.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            intro,
+            text=(
+                "This tab is reserved for the next test-tracking workflow revision.\n\n"
+                "Current status: placeholder only.\n"
+                "In the meantime, use Camera Setup -> Run Live Tracking Test for quick validation."
+            ),
+            wraplength=860,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
 
     def _build_optimize_tracking_tab(self) -> None:
         top = ttk.Frame(self.optimize_tracking_tab)
@@ -2130,7 +2258,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._refresh_run_history()
 
     def _load_config_or_defaults(self):
-        config_path = Path(self.config_path_var.get())
+        config_path = Path(self.config_path_var.get()).expanduser()
         if config_path.exists():
             return load_config(config_path), config_path
         return load_defaults(), config_path
@@ -2152,6 +2280,37 @@ class BumbleBoxV2GUI(tk.Tk):
             current = current[part]
         current[parts[-1]] = value
 
+    def _refresh_config_path_controls(self) -> None:
+        button = getattr(self, "config_action_button", None)
+        if button is None:
+            return
+        path = Path(self.config_path_var.get()).expanduser()
+        if path.exists():
+            button.configure(text="Change Config")
+        else:
+            button.configure(text="Config Missing! Create Config")
+
+    def _handle_config_path_action(self) -> None:
+        current_path = Path(self.config_path_var.get()).expanduser()
+        if not current_path.exists():
+            self._create_config()
+            return
+
+        selected = filedialog.askopenfilename(
+            title="Select BumbleBox Config",
+            initialdir=str(current_path.parent),
+            filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+
+        selected_path = Path(selected).expanduser()
+        self.config_path_var.set(str(selected_path))
+        self._refresh_config_path_controls()
+        self._load_config_into_editor()
+        self.config_output.delete("1.0", tk.END)
+        self.config_output.insert(tk.END, f"Switched to config:\n{selected_path}")
+
     def _load_config_into_editor(self) -> None:
         try:
             config, _ = self._load_config_or_defaults()
@@ -2161,6 +2320,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     variable.set(bool(raw))
                 else:
                     variable.set("" if raw is None else str(raw))
+            self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(tk.END, "Loaded configuration into editor.")
         except Exception as exc:
@@ -2199,6 +2359,7 @@ class BumbleBoxV2GUI(tk.Tk):
             validate_config(config)
             _, config_path = self._load_config_or_defaults()
             save_config(config_path, config)
+            self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(tk.END, f"Saved config to {config_path}")
         except Exception as exc:
@@ -2208,6 +2369,7 @@ class BumbleBoxV2GUI(tk.Tk):
         try:
             path = write_default_config(self.config_path_var.get(), force=False)
             self._load_config_into_editor()
+            self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(
                 tk.END,
@@ -2219,6 +2381,7 @@ class BumbleBoxV2GUI(tk.Tk):
             )
             messagebox.showinfo("Config created", f"Created default config at:\n{path}")
         except FileExistsError:
+            self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(
                 tk.END,
