@@ -4,44 +4,24 @@ This repository now includes a V2 foundation that keeps BumbleBox flexibility wh
 
 ## Entry Points
 
-- CLI: `/Users/aec/Desktop/BumbleBox/bbx.py`
-- GUI: `/Users/aec/Desktop/BumbleBox/bbx_gui.py`
+- Start-here setup: `/Users/aec/Desktop/BumbleBox/start_bumblebox.sh`
+- CLI launcher (no manual activation): `/Users/aec/Desktop/BumbleBox/bbx`
+- GUI launcher (no manual activation): `/Users/aec/Desktop/BumbleBox/bbx-gui`
+- Python CLI entry point: `/Users/aec/Desktop/BumbleBox/bbx.py`
+- Python GUI entry point: `/Users/aec/Desktop/BumbleBox/bbx_gui.py`
 - V2 package: `/Users/aec/Desktop/BumbleBox/bumblebox_v2`
 - Desktop scaffold CLI: `/Users/aec/Desktop/BumbleBox/bbx_desktop.py`
 
 ## Quick Start
 
 ```bash
-bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py init
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py doctor
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py storage status
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py storage setup --apply-config
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py camera-preview --seconds 20
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py camera-test-tracking --seconds 20
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py roadmap
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py fps-sweep --fps-start 2 --fps-stop 20 --fps-step 2 --probe-seconds 20 --assume-ram-gb 2
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py run-once --mock-camera
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py systemd-write
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py systemd-install
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py systemd-status
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py optimize-tracking --input /path/to/video_or_images --execution-target pi_safe --tag-size-mm 2.5 --early-stop-patience 40
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py schedule-check --benchmark-input /path/to/video_or_images --assume-ram-gb 2
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py fleet init-queen --queen-interface-only
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py fleet enroll-worker --host 192.168.1.21 --name worker-1
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py fleet status
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py fleet latest-status
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py fleet discover
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py fleet queen-pull-latest
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py fleet queen-track-latest --cooldown-minutes 60
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py gui-install-shortcut
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py export-bundle --latest
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx_desktop.py validate-bundle --bundle /path/to/bundle_or_zip
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx_desktop.py analyze --bundle /path/to/bundle_or_zip --output-dir /path/to/desktop_output --with-tracked-video
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx_desktop.py visualize --bundle /path/to/bundle_or_zip --output /path/to/tracking_overlay.mp4
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py nest-label check --folder /path/to/composite_images
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx.py nest-label launch --folder /path/to/composite_images
-/Users/aec/Desktop/BumbleBox/.venv/bin/python /Users/aec/Desktop/BumbleBox/bbx_gui.py
+bash /Users/aec/Desktop/BumbleBox/start_bumblebox.sh
+/Users/aec/Desktop/BumbleBox/bbx init
+/Users/aec/Desktop/BumbleBox/bbx doctor
+/Users/aec/Desktop/BumbleBox/bbx camera-preview --seconds 20
+/Users/aec/Desktop/BumbleBox/bbx camera-test-tracking --seconds 20
+/Users/aec/Desktop/BumbleBox/bbx roadmap
+/Users/aec/Desktop/BumbleBox/bbx gui
 ```
 
 ## V2 Dependencies
@@ -49,13 +29,14 @@ bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh
 Preferred one-command setup:
 
 ```bash
-bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh
+bash /Users/aec/Desktop/BumbleBox/start_bumblebox.sh
 ```
 
-This installs core V2 packages into `.venv`.
+This installs core V2 packages into `.venvs/bbx-runtime`.
 It also creates a dedicated nest-label environment at `/Users/aec/Desktop/BumbleBox/.venvs/bbx-label` and configures BumbleBox to auto-use it for nest-label check/launch flows.
 On non-Pi hosts it also attempts optional `picamera2`, `PyQt5`, and `labelme` installs.
 On Raspberry Pi hosts, those optional pip installs are skipped by default (preferred path is apt packages).
+It installs the Desktop GUI icon and prints launch instructions.
 
 Skip flags (only if needed for debugging/non-Pi hosts):
 

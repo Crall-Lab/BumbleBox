@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME_PY="${REPO_ROOT}/.venvs/bbx-runtime/bin/python"
+LEGACY_PY="${REPO_ROOT}/.venv/bin/python"
+
+if [[ -x "$RUNTIME_PY" ]]; then
+  exec "$RUNTIME_PY" "${REPO_ROOT}/bbx.py" "$@"
+fi
+
+if [[ -x "$LEGACY_PY" ]]; then
+  exec "$LEGACY_PY" "${REPO_ROOT}/bbx.py" "$@"
+fi
+
+echo "[BumbleBox] Runtime environment not found." >&2
+echo "Run first-time setup:" >&2
+echo "  ${REPO_ROOT}/start_bumblebox.sh" >&2
+exit 1

@@ -1580,7 +1580,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create a desktop icon/launcher for BumbleBox GUI.",
         description=(
             "Create a Desktop launcher (.desktop), app-menu entry, launcher script, and icon for BumbleBox GUI. "
-            "The launcher script prefers repo .venv Python when available, then falls back to system python3."
+            "The launcher script prefers repo .venvs/bbx-runtime Python, then repo .venv, then system python3."
         ),
     )
     gui_shortcut_parser.add_argument("--name", default="BumbleBox GUI", help="Launcher display name.")
