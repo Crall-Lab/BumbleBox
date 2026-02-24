@@ -236,6 +236,32 @@ class BumbleBoxV2GUI(tk.Tk):
             background=colors["tab_btn_bg"],
             foreground=colors["text_light"],
         )
+        style.configure(
+            "RoadmapCard.TFrame",
+            background=colors["entry_bg"],
+            borderwidth=1,
+            relief="solid",
+        )
+        style.configure(
+            "RoadmapCardText.TLabel",
+            background=colors["entry_bg"],
+            foreground=colors["text_light"],
+        )
+        style.configure(
+            "RoadmapStateDone.TLabel",
+            background=colors["entry_bg"],
+            foreground=colors["text_light"],
+        )
+        style.configure(
+            "RoadmapStateTodo.TLabel",
+            background=colors["entry_bg"],
+            foreground=colors["text_light"],
+        )
+        style.configure(
+            "RoadmapStateOptional.TLabel",
+            background=colors["entry_bg"],
+            foreground=colors["text_muted"],
+        )
 
     def _setup_responsive_typography(self) -> None:
         self._base_window_width = 980
@@ -812,43 +838,53 @@ class BumbleBoxV2GUI(tk.Tk):
 
         legend = ttk.Frame(self.roadmap_tab)
         legend.pack(fill=tk.X, pady=(8, 4))
-        ttk.Label(legend, text="Legend:").pack(side=tk.LEFT)
-        ttk.Label(legend, text="☑ completed").pack(side=tk.LEFT, padx=(8, 10))
-        ttk.Label(legend, text="☐ not completed").pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(legend, text="Click ? for details.").pack(side=tk.LEFT)
 
-        self.roadmap_canvas = tk.Canvas(
-            self.roadmap_tab,
-            highlightthickness=0,
-            bg=self._palette["panel_bg"],
-            bd=0,
+        paging = ttk.Frame(self.roadmap_tab)
+        paging.pack(fill=tk.X, pady=(0, 6))
+        self.roadmap_prev_btn = ttk.Button(
+            paging,
+            text="Previous Remaining Set",
+            command=lambda: self._change_roadmap_remaining_page(-1),
         )
-        self.roadmap_scrollbar = ttk.Scrollbar(self.roadmap_tab, orient=tk.VERTICAL, command=self.roadmap_canvas.yview)
-        self.roadmap_steps_frame = ttk.Frame(self.roadmap_canvas)
-        self.roadmap_steps_frame.bind(
-            "<Configure>",
-            lambda _event: self.roadmap_canvas.configure(scrollregion=self.roadmap_canvas.bbox("all")),
+        self.roadmap_prev_btn.pack(side=tk.LEFT)
+        self.roadmap_next_btn = ttk.Button(
+            paging,
+            text="Next Remaining Set",
+            command=lambda: self._change_roadmap_remaining_page(1),
         )
-        self._roadmap_canvas_window = self.roadmap_canvas.create_window((0, 0), window=self.roadmap_steps_frame, anchor="nw")
-        self.roadmap_canvas.configure(yscrollcommand=self.roadmap_scrollbar.set)
-        self.roadmap_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(2, 0))
-        self.roadmap_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=(2, 0))
-        self.roadmap_canvas.bind("<Configure>", self._on_roadmap_canvas_resize)
+        self.roadmap_next_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.roadmap_page_var = tk.StringVar(value="Remaining set 1/1")
+        ttk.Label(paging, textvariable=self.roadmap_page_var).pack(side=tk.LEFT, padx=(10, 0))
+
+        self.roadmap_steps_frame = ttk.Frame(self.roadmap_tab)
+        self.roadmap_steps_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
+        self._roadmap_items: list[tuple[str, str]] = []
+        self._roadmap_remaining_page = 0
+        self._roadmap_remaining_page_count = 1
+        self._roadmap_remaining_total = 0
         self._roadmap_step_labels: list[ttk.Label] = []
         self._refresh_roadmap(select_tab=False)
 
-    def _on_roadmap_canvas_resize(self, event) -> None:
-        if not hasattr(self, "roadmap_canvas"):
+    def _change_roadmap_remaining_page(self, delta: int) -> None:
+        if not getattr(self, "_roadmap_items", None):
             return
-        self.roadmap_canvas.itemconfigure(self._roadmap_canvas_window, width=max(1, int(event.width)))
-        self._refresh_roadmap_label_wraplength()
+        page_count = max(1, int(getattr(self, "_roadmap_remaining_page_count", 1)))
+        if page_count <= 1:
+            return
+        current = int(getattr(self, "_roadmap_remaining_page", 0))
+        new_page = min(page_count - 1, max(0, current + delta))
+        if new_page == current:
+            return
+        self._roadmap_remaining_page = new_page
+        self._render_roadmap_steps(self._roadmap_items)
 
     def _roadmap_wraplength(self) -> int:
-        canvas = getattr(self, "roadmap_canvas", None)
-        if canvas is None:
+        panel = getattr(self, "roadmap_steps_frame", None)
+        if panel is None:
             return 760
-        width = int(canvas.winfo_width()) if canvas.winfo_width() > 0 else 860
-        return max(380, width - 190)
+        width = int(panel.winfo_width()) if panel.winfo_width() > 0 else 860
+        return max(380, width - 220)
 
     def _refresh_roadmap_label_wraplength(self) -> None:
         labels = getattr(self, "_roadmap_step_labels", [])
@@ -966,7 +1002,8 @@ class BumbleBoxV2GUI(tk.Tk):
         status_line = {
             "DONE": "Status: completed based on current config/environment checks.",
             "TODO": "Status: not completed yet.",
-            "INFO": "Status: informational recommendation.",
+            "OPTIONAL": "Status: optional step.",
+            "INFO": "Status: optional informational step.",
         }.get(state.upper(), f"Status: {state}")
 
         numbered_steps = "\n".join(f"{idx}. {item}" for idx, item in enumerate(steps, start=1))
@@ -1029,45 +1066,95 @@ class BumbleBoxV2GUI(tk.Tk):
         self._open_roadmap_help_dialog(f"Roadmap Step {index}", details)
 
     def _render_roadmap_steps(self, items: list[tuple[str, str]]) -> None:
+        self._roadmap_items = list(items)
         for child in self.roadmap_steps_frame.winfo_children():
             child.destroy()
         self._roadmap_step_labels = []
 
-        done_count = 0
-        todo_like_count = 0
+        indexed_items: list[tuple[int, str, str]] = []
         for idx, (state, text) in enumerate(items, start=1):
             normalized_state = state.upper().strip()
-            is_done = normalized_state == "DONE"
-            if is_done:
-                done_count += 1
-            if normalized_state in {"TODO", "INFO"}:
-                todo_like_count += 1
+            indexed_items.append((idx, normalized_state, text))
 
-            row = ttk.Frame(self.roadmap_steps_frame, padding=(4, 5))
-            row.grid(row=idx - 1, column=0, sticky="ew")
-            row.columnconfigure(2, weight=1)
+        done_items = [item for item in indexed_items if item[1] == "DONE"]
+        remaining_items = [item for item in indexed_items if item[1] != "DONE"]
 
-            marker = "☑" if is_done else "☐"
-            ttk.Label(row, text=marker).grid(row=0, column=0, sticky="nw", padx=(0, 8))
-            ttk.Label(row, text=f"{normalized_state:>4}").grid(row=0, column=1, sticky="nw", padx=(0, 10))
+        if len(remaining_items) > 1:
+            page_count = 2
+        else:
+            page_count = 1
+        self._roadmap_remaining_page_count = page_count
+        self._roadmap_remaining_total = len(remaining_items)
+        self._roadmap_remaining_page = min(
+            page_count - 1,
+            max(0, int(getattr(self, "_roadmap_remaining_page", 0))),
+        )
+
+        remaining_subset: list[tuple[int, str, str]] = remaining_items
+        if page_count > 1:
+            split = (len(remaining_items) + 1) // 2
+            start = self._roadmap_remaining_page * split
+            end = start + split
+            remaining_subset = remaining_items[start:end]
+
+        display_items = done_items + remaining_subset
+
+        for idx, normalized_state, text in display_items:
+            row = ttk.Frame(self.roadmap_steps_frame, style="RoadmapCard.TFrame", padding=(8, 8))
+            row.pack(fill=tk.X, pady=(0, 7))
+            row.columnconfigure(1, weight=1)
+
+            if normalized_state == "DONE":
+                state_label = "☑ DONE"
+                state_style = "RoadmapStateDone.TLabel"
+            elif normalized_state in {"OPTIONAL", "INFO"}:
+                state_label = f"[{normalized_state}]"
+                state_style = "RoadmapStateOptional.TLabel"
+            else:
+                state_label = "☐ TODO"
+                state_style = "RoadmapStateTodo.TLabel"
+
+            ttk.Label(row, text=state_label, style=state_style).grid(row=0, column=0, sticky="nw", padx=(0, 10))
+
             text_label = ttk.Label(
                 row,
                 text=f"{idx}. {text}",
+                style="RoadmapCardText.TLabel",
                 justify=tk.LEFT,
                 wraplength=self._roadmap_wraplength(),
             )
-            text_label.grid(row=0, column=2, sticky="ew")
+            text_label.grid(row=0, column=1, sticky="ew")
             self._roadmap_step_labels.append(text_label)
             ttk.Button(
                 row,
                 text="?",
                 width=2,
                 command=lambda i=idx, s=normalized_state, t=text: self._show_roadmap_step_help(i, s, t),
-            ).grid(row=0, column=3, sticky="ne", padx=(8, 0))
+            ).grid(row=0, column=2, sticky="ne", padx=(8, 0))
 
         total = len(items)
+        done_count = len(done_items)
+        optional_count = sum(1 for _idx, state, _text in indexed_items if state in {"OPTIONAL", "INFO"})
+        actionable_remaining = sum(1 for _idx, state, _text in indexed_items if state == "TODO")
         self.roadmap_summary_var.set(
-            f"Completed: {done_count}/{total}   Remaining/Info: {todo_like_count}"
+            f"Completed: {done_count}/{total}   Remaining actionable: {actionable_remaining}   Optional: {optional_count}"
+        )
+        if self._roadmap_remaining_total == 0:
+            self.roadmap_page_var.set("No remaining tasks.")
+        elif self._roadmap_remaining_page_count == 1:
+            self.roadmap_page_var.set("Remaining set 1/1")
+        else:
+            current_page = self._roadmap_remaining_page + 1
+            self.roadmap_page_var.set(f"Remaining set {current_page}/{self._roadmap_remaining_page_count}")
+        self.roadmap_prev_btn.configure(
+            state=(tk.NORMAL if self._roadmap_remaining_page_count > 1 and self._roadmap_remaining_page > 0 else tk.DISABLED)
+        )
+        self.roadmap_next_btn.configure(
+            state=(
+                tk.NORMAL
+                if self._roadmap_remaining_page_count > 1 and self._roadmap_remaining_page < self._roadmap_remaining_page_count - 1
+                else tk.DISABLED
+            )
         )
 
     def _build_config_tab(self) -> None:
