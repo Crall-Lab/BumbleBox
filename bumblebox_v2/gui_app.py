@@ -1182,7 +1182,9 @@ class BumbleBoxV2GUI(tk.Tk):
             help_details=(
                 "Basic mode hides less-common tuning controls so setup is simpler for first-time use.\n\n"
                 "Advanced mode shows all controls, including deeper optimization/sweep options. "
-                "Use Advanced when you need manual tuning."
+                "Use Advanced when you need manual tuning.\n\n"
+                "Basic hides rarely used tuning controls; core setup, scheduling, recording, and tracking "
+                "workflows remain available."
             ),
             padx=(0, 4),
         )
@@ -1200,17 +1202,7 @@ class BumbleBoxV2GUI(tk.Tk):
             variable=self.ui_mode_var,
             command=self._set_ui_mode,
         ).pack(side=tk.LEFT, padx=(2, 8))
-        hint_row = ttk.Frame(frame)
-        hint_row.grid(row=2, column=0, sticky="w", pady=(2, 0))
-        self._pack_help_label(
-            hint_row,
-            text="Basic hides rarely used tuning controls.",
-            help_title="What Basic Hides",
-            help_details=(
-                "Basic mode hides advanced controls such as detailed sweep overrides and certain optional "
-                "parameters. Core setup, scheduling, recording, and tracking workflows remain available."
-            ),
-        )
+        ttk.Label(frame, text="Basic hides rarely used controls.").grid(row=2, column=0, sticky="w", pady=(2, 0))
         frame.columnconfigure(0, weight=1)
 
     def _build_notebook(self) -> None:
@@ -2387,11 +2379,12 @@ class BumbleBoxV2GUI(tk.Tk):
 
         for group_id, group_title, _specs in group_defs:
             group_frame = ttk.LabelFrame(self.config_form_frame, text=group_title, padding=8)
-            group_frame.grid(row=0, column=0, sticky="n")
+            group_frame.grid(row=0, column=0, sticky="nw")
             group_frame.columnconfigure(0, weight=1)
-            group_frame.grid_anchor("n")
+            group_frame.grid_anchor("nw")
             group_body = ttk.Frame(group_frame)
-            group_body.grid(row=0, column=0, sticky="")
+            group_body.grid(row=0, column=0, sticky="ew")
+            group_body.columnconfigure(0, weight=1)
             self._config_group_frames[group_id] = group_frame
             self._config_group_bodies[group_id] = group_body
             self._config_group_order.append(group_id)
@@ -2403,18 +2396,9 @@ class BumbleBoxV2GUI(tk.Tk):
             row_index = 0
             for label, key, value_type, choices, roles in specs:
                 row_frame = ttk.Frame(group_body)
-                row_frame.grid(row=row_index, column=0, sticky="", pady=2)
-                self._grid_help_label(
-                    row_frame,
-                    row=0,
-                    column=0,
-                    text=label,
-                    help_title=label,
-                    help_details=self._config_field_help_details(key),
-                    sticky="e",
-                    padx=(0, 8),
-                    pady=1,
-                )
+                row_frame.grid(row=row_index, column=0, sticky="ew", pady=2)
+                row_frame.columnconfigure(3, weight=1)
+                ttk.Label(row_frame, text=label).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=1)
                 widget_width = self._config_widget_width(key, value_type, choices)
 
                 if value_type is bool:
@@ -2446,6 +2430,12 @@ class BumbleBoxV2GUI(tk.Tk):
                     ttk.Button(row_frame, text="Browse", command=self._browse_tuning_file).grid(
                         row=0, column=2, sticky="w", padx=(6, 0)
                     )
+
+                self._make_help_button(
+                    row_frame,
+                    title=label,
+                    details=self._config_field_help_details(key),
+                ).grid(row=0, column=4, sticky="e", padx=(8, 0), pady=1)
 
                 self.config_fields[key] = (variable, value_type)
                 self._config_field_widgets[key] = widget
@@ -2487,7 +2477,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 row_index += 1
 
         self.config_form_frame.columnconfigure(0, weight=1)
-        self.config_form_frame.grid_anchor("n")
+        self.config_form_frame.grid_anchor("nw")
 
         role_binding = getattr(self, "_config_role_trace_bound", False)
         role_field = self.config_fields.get("fleet.role")
