@@ -202,7 +202,7 @@ def run_camera_preview(
     camera_cfg = config.get("camera", {})
     width = int(width if width is not None else camera_cfg.get("width", 4056))
     height = int(height if height is not None else camera_cfg.get("height", 3040))
-    window_name = str(window or camera_cfg.get("preview_window", "QTGL")).strip().upper()
+    window_name = str(window or camera_cfg.get("preview_window", "QT")).strip().upper()
     if window_name not in PREVIEW_WINDOWS:
         raise ValueError(f"window must be one of {sorted(PREVIEW_WINDOWS)}")
 

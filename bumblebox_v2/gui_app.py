@@ -1478,7 +1478,6 @@ class BumbleBoxV2GUI(tk.Tk):
         top.pack(fill=tk.X)
 
         self.camera_preview_seconds_var = tk.StringVar(value="20")
-        self.camera_preview_window_var = tk.StringVar(value="QTGL")
         self.camera_preview_width_var = tk.StringVar(value="")
         self.camera_preview_height_var = tk.StringVar(value="")
 
@@ -1513,20 +1512,11 @@ class BumbleBoxV2GUI(tk.Tk):
             preview,
             row=2,
             column=0,
-            text="Preview window",
-            help_title="Preview Window Backend",
-            help_details=(
-                "Select preview backend. QTGL is usually best on desktop sessions. "
-                "DRM can be useful on direct-display/headless-style Pi setups."
-            ),
+            text="Preview backend",
+            help_title="Preview Backend",
+            help_details="Preview is fixed to QT for stability in the GUI workflow.",
         )
-        ttk.Combobox(
-            preview,
-            textvariable=self.camera_preview_window_var,
-            values=["QTGL", "QT", "DRM"],
-            state="readonly",
-            width=10,
-        ).grid(row=2, column=1, sticky="w", padx=8, pady=3)
+        ttk.Label(preview, text="QT (fixed)").grid(row=2, column=1, sticky="w", padx=8, pady=3)
         self._grid_help_label(
             preview,
             row=3,
@@ -2264,7 +2254,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     ("Height (px)", "camera.height", int, None, None),
                     ("FPS target", "camera.fps_target", float, None, None),
                     ("Shutter (us)", "camera.shutter_us", int, None, None),
-                    ("Preview window", "camera.preview_window", str, ["QTGL", "QT", "DRM"], None),
+                    ("Preview window", "camera.preview_window", str, ["QT"], None),
                     ("Tuning file", "camera.tuning_file", str, None, None),
                 ],
             ),
@@ -2325,7 +2315,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "camera.height": "Capture height in pixels. Higher values increase detail and resource usage.",
             "camera.fps_target": "Requested capture framerate. Real framerate can differ; verify with FPS Report.",
             "camera.shutter_us": "Exposure time in microseconds. Longer exposure can brighten image but increase motion blur.",
-            "camera.preview_window": "Preview backend type used by camera preview tools.",
+            "camera.preview_window": "Preview backend used by camera preview (fixed to QT for stable GUI behavior).",
             "camera.tuning_file": "Optional libcamera tuning JSON file for sensor-specific imaging tuning.",
             "pipeline.mode": "Main run mode: record only, track only, record+track, or mixed schedule lanes.",
             "pipeline.tracking_source": "Track from in-memory frames (ram) or saved video files (video).",
@@ -4571,6 +4561,8 @@ class BumbleBoxV2GUI(tk.Tk):
             )
             for key, (variable, value_type) in self.config_fields.items():
                 raw = self._get_nested(config, key)
+                if key == "camera.preview_window":
+                    raw = "QT"
                 if value_type is bool:
                     variable.set(bool(raw))
                 else:
@@ -4597,6 +4589,8 @@ class BumbleBoxV2GUI(tk.Tk):
                     parsed = None
                 elif key == "camera.codec":
                     parsed = text.lower() or "mp4"
+                elif key == "camera.preview_window":
+                    parsed = "QT"
                 else:
                     parsed = text
             self._set_nested(config, key, parsed)
@@ -4975,7 +4969,7 @@ class BumbleBoxV2GUI(tk.Tk):
             preview_text = self._run_camera_preview_subprocess(
                 config_path=config_path,
                 preview_seconds=seconds,
-                window=self.camera_preview_window_var.get().strip(),
+                window="QT",
                 width=width,
                 height=height,
             )
@@ -5058,7 +5052,7 @@ class BumbleBoxV2GUI(tk.Tk):
             preview_text = self._run_camera_preview_subprocess(
                 config_path=config_path,
                 preview_seconds=preview_seconds,
-                window=self.camera_preview_window_var.get().strip(),
+                window="QT",
                 width=width,
                 height=height,
             )
@@ -5097,59 +5091,55 @@ class BumbleBoxV2GUI(tk.Tk):
     ) -> str:
         repo_root = Path(__file__).resolve().parents[1]
         bbx_path = repo_root / "bbx.py"
-        requested_window = str(window or "QTGL").strip().upper()
-        if requested_window not in {"QTGL", "QT", "DRM"}:
-            requested_window = "QTGL"
+        requested_window = "QT"
 
-        attempt_windows = [requested_window]
-        for candidate in ("QT", "DRM"):
-            if candidate not in attempt_windows:
-                attempt_windows.append(candidate)
-
-        attempt_details: list[str] = []
-        for attempt_window in attempt_windows:
-            command = [
-                sys.executable,
-                str(bbx_path),
-                "camera-preview",
-                "--config",
-                str(config_path),
-                "--seconds",
-                f"{float(preview_seconds):.3f}",
-                "--window",
-                attempt_window,
+        def looks_like_backend_failure(stdout_text: str, stderr_text: str) -> bool:
+            combined = f"{stdout_text}\n{stderr_text}".lower()
+            failure_markers = [
+                "commit failed",
+                "could not connect to display",
+                "no qt platform plugin could be initialized",
+                "failed to initialize egl",
+                "qt.qpa.xcb",
+                "qxcbconnection",
+                "could not load the qt platform plugin",
             ]
-            if width is not None:
-                command.extend(["--width", str(int(width))])
-            if height is not None:
-                command.extend(["--height", str(int(height))])
+            return any(marker in combined for marker in failure_markers)
 
-            proc = subprocess.run(command, capture_output=True, text=True, check=False)
-            stdout = (proc.stdout or "").strip()
-            stderr = (proc.stderr or "").strip()
-            if proc.returncode == 0:
-                if attempt_window != requested_window:
-                    prefix = (
-                        f"Requested preview window '{requested_window}' failed; "
-                        f"used fallback '{attempt_window}'.\n\n"
-                    )
-                    return prefix + (stdout or f"Camera preview completed with fallback window '{attempt_window}'.")
-                return stdout or "Camera preview completed."
+        command = [
+            sys.executable,
+            str(bbx_path),
+            "camera-preview",
+            "--config",
+            str(config_path),
+            "--seconds",
+            f"{float(preview_seconds):.3f}",
+            "--window",
+            requested_window,
+        ]
+        if width is not None:
+            command.extend(["--width", str(int(width))])
+        if height is not None:
+            command.extend(["--height", str(int(height))])
 
-            detail = [
-                f"Window={attempt_window}, exit={proc.returncode}",
-                f"Command: {' '.join(shlex.quote(part) for part in command)}",
-            ]
-            if stdout:
-                detail.append(f"stdout:\n{stdout}")
-            if stderr:
-                detail.append(f"stderr:\n{stderr}")
-            attempt_details.append("\n\n".join(detail))
+        proc = subprocess.run(command, capture_output=True, text=True, check=False)
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        backend_failed = looks_like_backend_failure(stdout, stderr)
+        if proc.returncode == 0 and not backend_failed:
+            return stdout or "Camera preview completed."
 
-        raise RuntimeError(
-            "Camera preview failed for all window backends (QTGL/QT/DRM).\n\n"
-            + "\n\n---\n\n".join(attempt_details)
-        )
+        details = [
+            f"Camera preview failed with backend {requested_window}.",
+            f"Exit code: {proc.returncode}",
+            f"Detected backend failure markers: {'yes' if backend_failed else 'no'}",
+            f"Command: {' '.join(shlex.quote(part) for part in command)}",
+        ]
+        if stdout:
+            details.append(f"stdout:\n{stdout}")
+        if stderr:
+            details.append(f"stderr:\n{stderr}")
+        raise RuntimeError("\n\n".join(details))
 
     def _refresh_roadmap(self, *, select_tab: bool = True) -> None:
         try:

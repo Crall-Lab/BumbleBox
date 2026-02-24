@@ -14,7 +14,7 @@ camera:
   codec: "mp4"
   infrared: true
   noise_reduction: "Auto"
-  preview_window: "QTGL"
+  preview_window: "QT"
   tuning_file: null
   digital_zoom: null
   mp4_codec: "mp4v"

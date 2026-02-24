@@ -1205,7 +1205,7 @@ def build_parser() -> argparse.ArgumentParser:
     camera_preview_parser.add_argument(
         "--window",
         choices=["QTGL", "QT", "DRM"],
-        default="QTGL",
+        default="QT",
         help="Picamera2 preview backend window type.",
     )
     camera_preview_parser.add_argument("--width", type=int, help="Optional preview width override in pixels.")
