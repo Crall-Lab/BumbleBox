@@ -141,7 +141,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._fps_sweep_progress_q: queue.Queue[tuple[int, int, float]] = queue.Queue()
         self._config_form_canvas: tk.Canvas | None = None
         self._config_form_window: int | None = None
-        self._theme_knob: ttk.Scale | None = None
+        self._theme_knob: tk.Scale | None = None
         self._suppress_theme_knob_callback = False
         self._palette = self._palette_for_theme_mode(self.theme_mode_var.get())
         self._results_sections: dict[tk.Text, dict[str, object]] = {}
@@ -190,18 +190,20 @@ class BumbleBoxV2GUI(tk.Tk):
                 ("!disabled", colors["text_light"]),
             ],
         )
-        style.configure(
-            "IntroPrimary.TButton",
-            background=colors["tab_selected"],
-            foreground="#FFFFFF",
-            borderwidth=1,
-            padding=(12, 7),
-        )
+        intro_primary_kwargs = {
+            "background": colors["tab_btn_active"],
+            "foreground": "#FFFFFF",
+            "borderwidth": 1,
+            "padding": (12, 7),
+        }
+        if hasattr(self, "_intro_button_font"):
+            intro_primary_kwargs["font"] = self._intro_button_font
+        style.configure("IntroPrimary.TButton", **intro_primary_kwargs)
         style.map(
             "IntroPrimary.TButton",
             background=[
                 ("pressed", colors["tab_btn_bg"]),
-                ("active", colors["tab_btn_active"]),
+                ("active", colors["tab_selected"]),
             ],
             foreground=[("disabled", "#E6E6E6"), ("!disabled", "#FFFFFF")],
         )
@@ -442,13 +444,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
         for label in getattr(self, "_intro_card_title_labels", []):
             try:
-                label.configure(bg=colors["entry_bg"], fg=colors["text_light"])
-            except Exception:
-                continue
-
-        for label in getattr(self, "_intro_badge_labels", []):
-            try:
-                label.configure(bg=colors["tab_selected"], fg=colors["text_light"])
+                label.configure(bg=colors["tab_selected"], fg="#FFFFFF")
             except Exception:
                 continue
 
@@ -520,6 +516,20 @@ class BumbleBoxV2GUI(tk.Tk):
             except Exception:
                 pass
 
+        knob = getattr(self, "_theme_knob", None)
+        if knob is not None:
+            try:
+                knob.configure(
+                    bg=colors["entry_bg"],
+                    fg=colors["text_light"],
+                    activebackground=colors["tab_selected"],
+                    troughcolor=colors["tab_btn_bg"],
+                    highlightbackground=colors["entry_bg"],
+                    highlightcolor=colors["entry_bg"],
+                )
+            except Exception:
+                pass
+
     def _setup_responsive_typography(self) -> None:
         self._base_window_width = 980
         self._base_window_height = 680
@@ -539,14 +549,18 @@ class BumbleBoxV2GUI(tk.Tk):
         default_size = self._font_base_sizes.get("TkDefaultFont", 10)
         self._hero_title_font = tkfont.Font(self, family=family, size=max(14, default_size + 4), weight="bold")
         self._header_title_font = tkfont.Font(self, family=family, size=max(13, default_size + 3), weight="bold")
-        self._intro_subtitle_font = tkfont.Font(self, family=family, size=max(10, default_size + 1))
-        self._intro_card_title_font = tkfont.Font(self, family=family, size=max(11, default_size + 1), weight="bold")
-        self._intro_badge_font = tkfont.Font(self, family=family, size=max(9, default_size - 1), weight="bold")
+        self._intro_card_title_font = tkfont.Font(
+            self,
+            family=family,
+            size=max(22, max(11, default_size + 1) * 2),
+            weight="bold",
+        )
+        self._intro_button_font = tkfont.Font(self, family=family, size=max(10, default_size), weight="bold")
         self._hero_title_base_size = abs(int(self._hero_title_font.cget("size")))
         self._header_title_base_size = abs(int(self._header_title_font.cget("size")))
-        self._intro_subtitle_base_size = abs(int(self._intro_subtitle_font.cget("size")))
         self._intro_card_title_base_size = abs(int(self._intro_card_title_font.cget("size")))
-        self._intro_badge_base_size = abs(int(self._intro_badge_font.cget("size")))
+        self._intro_button_base_size = abs(int(self._intro_button_font.cget("size")))
+        ttk.Style(self).configure("IntroPrimary.TButton", font=self._intro_button_font)
         self._font_scale = 1.0
         self.bind("<Configure>", self._on_root_resize, add="+")
 
@@ -569,9 +583,8 @@ class BumbleBoxV2GUI(tk.Tk):
                 continue
         self._hero_title_font.configure(size=max(13, int(round(self._hero_title_base_size * scale))))
         self._header_title_font.configure(size=max(12, int(round(self._header_title_base_size * scale))))
-        self._intro_subtitle_font.configure(size=max(10, int(round(self._intro_subtitle_base_size * scale))))
         self._intro_card_title_font.configure(size=max(10, int(round(self._intro_card_title_base_size * scale))))
-        self._intro_badge_font.configure(size=max(8, int(round(self._intro_badge_base_size * scale))))
+        self._intro_button_font.configure(size=max(9, int(round(self._intro_button_base_size * scale))))
         self._refresh_intro_wraplength()
         self._refresh_roadmap_label_wraplength()
 
@@ -718,7 +731,6 @@ class BumbleBoxV2GUI(tk.Tk):
         self._intro_card_frames: list[tk.Frame] = []
         self._intro_card_header_frames: list[tk.Frame] = []
         self._intro_card_title_labels: list[tk.Label] = []
-        self._intro_badge_labels: list[tk.Label] = []
         self._intro_desc_labels: list[tk.Label] = []
 
         hero = tk.Frame(
@@ -737,23 +749,10 @@ class BumbleBoxV2GUI(tk.Tk):
             bg=colors["entry_bg"],
             fg=colors["text_light"],
             font=self._hero_title_font,
-            anchor="w",
-            justify=tk.LEFT,
+            anchor="center",
+            justify=tk.CENTER,
         )
-        self._intro_hero_title.pack(fill=tk.X, anchor="w")
-        self._intro_hero_subtitle = tk.Label(
-            hero,
-            text=(
-                "Choose a workspace to focus on one phase at a time. "
-                "Each workspace shows only the tabs needed for that task."
-            ),
-            bg=colors["entry_bg"],
-            fg=colors["text_muted"],
-            font=self._intro_subtitle_font,
-            anchor="w",
-            justify=tk.LEFT,
-        )
-        self._intro_hero_subtitle.pack(fill=tk.X, anchor="w", pady=(8, 0))
+        self._intro_hero_title.pack(fill=tk.X, anchor="center")
 
         self._intro_cards_frame = ttk.Frame(self.intro_frame)
         self._intro_cards_frame.pack(fill=tk.BOTH, expand=True)
@@ -762,30 +761,26 @@ class BumbleBoxV2GUI(tk.Tk):
             (
                 "setup",
                 "BumbleBox Setup",
-                "SETUP",
                 "Bring up hardware and configuration: roadmap, diagnostics, storage setup, camera setup, tracking optimization, FPS checks, and calibration.",
             ),
             (
                 "schedule_run",
                 "Schedule and Run",
-                "RUN",
                 "Validate timing and memory assumptions, then manage scheduled execution and immediate runs.",
             ),
             (
                 "nest_labeling",
                 "Nest Labeling",
-                "LABEL",
                 "Check labeling environment readiness and launch the nest-labeling workflow.",
             ),
             (
                 "fleet",
                 "Fleet Setup",
-                "FLEET",
                 "Configure and monitor queen/worker BumbleBoxes, worker discovery, and media synchronization.",
             ),
         ]
 
-        for idx, (key, label, badge, desc) in enumerate(workflows):
+        for idx, (key, label, desc) in enumerate(workflows):
             row = idx // 2
             col = idx % 2
             card = tk.Frame(
@@ -805,25 +800,16 @@ class BumbleBoxV2GUI(tk.Tk):
             title_label = tk.Label(
                 header,
                 text=label,
-                bg=colors["entry_bg"],
-                fg=colors["text_light"],
+                bg=colors["tab_selected"],
+                fg="#FFFFFF",
                 font=self._intro_card_title_font,
                 anchor="center",
                 justify=tk.CENTER,
+                padx=14,
+                pady=7,
             )
             self._intro_card_title_labels.append(title_label)
             title_label.pack(fill=tk.X, anchor="center", pady=(6, 0))
-            badge_label = tk.Label(
-                header,
-                text=badge,
-                bg=colors["tab_selected"],
-                fg=colors["text_light"],
-                font=self._intro_badge_font,
-                padx=8,
-                pady=2,
-            )
-            self._intro_badge_labels.append(badge_label)
-            badge_label.pack(anchor="center")
 
             desc_label = tk.Label(
                 card,
@@ -866,7 +852,7 @@ class BumbleBoxV2GUI(tk.Tk):
             text="Appearance",
             bg=colors["entry_bg"],
             fg=colors["text_light"],
-            font=self._intro_card_title_font,
+            font=self._header_title_font,
         )
         self._intro_theme_title_label.pack(side=tk.LEFT, padx=(0, 8))
         self._intro_theme_dark_label = tk.Label(
@@ -876,12 +862,23 @@ class BumbleBoxV2GUI(tk.Tk):
             fg=colors["text_light"],
         )
         self._intro_theme_dark_label.pack(side=tk.LEFT, padx=(0, 6))
-        self._theme_knob = ttk.Scale(
+        self._theme_knob = tk.Scale(
             self._intro_theme_panel,
             from_=0.0,
             to=1.0,
+            resolution=1.0,
             orient=tk.HORIZONTAL,
-            length=72,
+            length=40,
+            showvalue=False,
+            sliderlength=14,
+            width=8,
+            bd=0,
+            highlightthickness=0,
+            relief=tk.FLAT,
+            bg=colors["entry_bg"],
+            fg=colors["text_light"],
+            activebackground=colors["tab_selected"],
+            troughcolor=colors["tab_btn_bg"],
             command=self._on_theme_knob_changed,
         )
         self._theme_knob.pack(side=tk.LEFT)
