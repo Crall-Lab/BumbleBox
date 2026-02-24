@@ -70,6 +70,7 @@ from .run_engine import format_run_summary, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
 from .storage_manager import (
     build_storage_setup_sudo_command,
+    discover_storage_devices,
     format_storage_setup_result,
     format_storage_status_report,
     get_storage_status,
@@ -171,6 +172,21 @@ class BumbleBoxV2GUI(tk.Tk):
                 ("disabled", colors["text_muted"]),
                 ("!disabled", colors["text_light"]),
             ],
+        )
+        style.configure(
+            "IntroPrimary.TButton",
+            background=colors["tab_selected"],
+            foreground=colors["text_light"],
+            borderwidth=1,
+            padding=(12, 7),
+        )
+        style.map(
+            "IntroPrimary.TButton",
+            background=[
+                ("pressed", colors["tab_btn_bg"]),
+                ("active", colors["tab_btn_active"]),
+            ],
+            foreground=[("disabled", colors["text_muted"]), ("!disabled", colors["text_light"])],
         )
         style.configure("TCheckbutton", background=colors["panel_bg"], foreground=colors["text_light"])
         style.configure("TRadiobutton", background=colors["panel_bg"], foreground=colors["text_light"])
@@ -302,8 +318,14 @@ class BumbleBoxV2GUI(tk.Tk):
         default_size = self._font_base_sizes.get("TkDefaultFont", 10)
         self._hero_title_font = tkfont.Font(self, family=family, size=max(14, default_size + 4), weight="bold")
         self._header_title_font = tkfont.Font(self, family=family, size=max(13, default_size + 3), weight="bold")
+        self._intro_subtitle_font = tkfont.Font(self, family=family, size=max(10, default_size + 1))
+        self._intro_card_title_font = tkfont.Font(self, family=family, size=max(11, default_size + 1), weight="bold")
+        self._intro_badge_font = tkfont.Font(self, family=family, size=max(9, default_size - 1), weight="bold")
         self._hero_title_base_size = abs(int(self._hero_title_font.cget("size")))
         self._header_title_base_size = abs(int(self._header_title_font.cget("size")))
+        self._intro_subtitle_base_size = abs(int(self._intro_subtitle_font.cget("size")))
+        self._intro_card_title_base_size = abs(int(self._intro_card_title_font.cget("size")))
+        self._intro_badge_base_size = abs(int(self._intro_badge_font.cget("size")))
         self._font_scale = 1.0
         self.bind("<Configure>", self._on_root_resize, add="+")
 
@@ -326,6 +348,10 @@ class BumbleBoxV2GUI(tk.Tk):
                 continue
         self._hero_title_font.configure(size=max(13, int(round(self._hero_title_base_size * scale))))
         self._header_title_font.configure(size=max(12, int(round(self._header_title_base_size * scale))))
+        self._intro_subtitle_font.configure(size=max(10, int(round(self._intro_subtitle_base_size * scale))))
+        self._intro_card_title_font.configure(size=max(10, int(round(self._intro_card_title_base_size * scale))))
+        self._intro_badge_font.configure(size=max(8, int(round(self._intro_badge_base_size * scale))))
+        self._refresh_intro_wraplength()
         self._refresh_roadmap_label_wraplength()
 
     def _style_output_text(self, widget: tk.Text) -> None:
@@ -440,57 +466,153 @@ class BumbleBoxV2GUI(tk.Tk):
         text_widget.edit_modified(False)
 
     def _build_intro_page(self) -> None:
+        colors = self._palette
         self.intro_frame = ttk.Frame(self.main_content, padding=12)
 
-        ttk.Label(self.intro_frame, text="Welcome to BumbleBox", font=self._hero_title_font).pack(anchor=tk.W)
-        ttk.Label(
+        hero = tk.Frame(
             self.intro_frame,
-            text=(
-                "Start by choosing a workspace. Each workspace shows only the tabs needed for that workflow."
-            ),
+            bg=colors["entry_bg"],
+            highlightthickness=1,
+            highlightbackground=colors["tab_selected"],
+            padx=18,
+            pady=14,
+        )
+        hero.pack(fill=tk.X, pady=(0, 14))
+        tk.Label(
+            hero,
+            text="BumbleBox Control Center",
+            bg=colors["entry_bg"],
+            fg=colors["text_light"],
+            font=self._hero_title_font,
+            anchor="w",
             justify=tk.LEFT,
-        ).pack(anchor=tk.W, pady=(4, 14))
+        ).pack(fill=tk.X, anchor="w")
+        self._intro_hero_subtitle = tk.Label(
+            hero,
+            text=(
+                "Choose a workspace to focus on one phase at a time. "
+                "Each workspace shows only the tabs needed for that task."
+            ),
+            bg=colors["entry_bg"],
+            fg=colors["text_muted"],
+            font=self._intro_subtitle_font,
+            anchor="w",
+            justify=tk.LEFT,
+        )
+        self._intro_hero_subtitle.pack(fill=tk.X, anchor="w", pady=(8, 0))
 
-        cards = ttk.Frame(self.intro_frame)
-        cards.pack(fill=tk.BOTH, expand=True)
+        self._intro_cards_frame = ttk.Frame(self.intro_frame)
+        self._intro_cards_frame.pack(fill=tk.BOTH, expand=True)
+        self._intro_desc_labels: list[tk.Label] = []
 
         workflows = [
             (
                 "setup",
                 "BumbleBox Setup",
-                "Bring up hardware and configuration: roadmap, diagnostics, camera setup, tracking optimization, FPS checks, and calibration.",
+                "SETUP",
+                "Bring up hardware and configuration: roadmap, diagnostics, storage setup, camera setup, tracking optimization, FPS checks, and calibration.",
             ),
             (
                 "schedule_run",
                 "Schedule and Run",
-                "Validate timing/memory assumptions and manage scheduled execution and immediate runs.",
+                "RUN",
+                "Validate timing and memory assumptions, then manage scheduled execution and immediate runs.",
             ),
             (
                 "nest_labeling",
                 "Nest Labeling",
+                "LABEL",
                 "Check labeling environment readiness and launch the nest-labeling workflow.",
             ),
             (
                 "fleet",
                 "Fleet Setup",
+                "FLEET",
                 "Configure and monitor queen/worker BumbleBoxes, worker discovery, and media synchronization.",
             ),
         ]
 
-        for idx, (key, label, desc) in enumerate(workflows):
+        for idx, (key, label, badge, desc) in enumerate(workflows):
             row = idx // 2
             col = idx % 2
-            card = ttk.LabelFrame(cards, text=label, padding=10)
-            card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
-            ttk.Button(card, text=f"Open {label}", command=lambda workflow_key=key: self._open_workflow(workflow_key)).pack(
-                anchor=tk.W
+            card = tk.Frame(
+                self._intro_cards_frame,
+                bg=colors["entry_bg"],
+                highlightthickness=1,
+                highlightbackground=colors["tab_btn_active"],
+                padx=14,
+                pady=12,
             )
-            ttk.Label(card, text=desc, wraplength=380, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
+            card.grid(row=row, column=col, sticky="nsew", padx=7, pady=7)
 
-        cards.columnconfigure(0, weight=1)
-        cards.columnconfigure(1, weight=1)
-        cards.rowconfigure(0, weight=1)
-        cards.rowconfigure(1, weight=1)
+            header = tk.Frame(card, bg=colors["entry_bg"])
+            header.pack(fill=tk.X)
+            tk.Label(
+                header,
+                text=label,
+                bg=colors["entry_bg"],
+                fg=colors["text_light"],
+                font=self._intro_card_title_font,
+                anchor="w",
+            ).pack(side=tk.LEFT, anchor="w")
+            tk.Label(
+                header,
+                text=badge,
+                bg=colors["tab_selected"],
+                fg=colors["text_light"],
+                font=self._intro_badge_font,
+                padx=8,
+                pady=2,
+            ).pack(side=tk.RIGHT, anchor="e")
+
+            desc_label = tk.Label(
+                card,
+                text=desc,
+                bg=colors["entry_bg"],
+                fg=colors["text_muted"],
+                justify=tk.LEFT,
+                anchor="w",
+            )
+            desc_label.pack(fill=tk.X, anchor="w", pady=(10, 12))
+            self._intro_desc_labels.append(desc_label)
+
+            ttk.Button(
+                card,
+                text=f"Open {label}",
+                style="IntroPrimary.TButton",
+                command=lambda workflow_key=key: self._open_workflow(workflow_key),
+            ).pack(anchor="w")
+
+        self._intro_cards_frame.columnconfigure(0, weight=1)
+        self._intro_cards_frame.columnconfigure(1, weight=1)
+        self._intro_cards_frame.rowconfigure(0, weight=1)
+        self._intro_cards_frame.rowconfigure(1, weight=1)
+        self._refresh_intro_wraplength()
+
+    def _refresh_intro_wraplength(self) -> None:
+        cards_frame = getattr(self, "_intro_cards_frame", None)
+        if cards_frame is None:
+            return
+
+        frame_width = cards_frame.winfo_width()
+        if frame_width <= 0:
+            frame_width = 900
+        card_width = max(320, int((frame_width - 28) / 2))
+        text_wrap = max(240, card_width - 44)
+
+        labels = getattr(self, "_intro_desc_labels", [])
+        for label in labels:
+            try:
+                label.configure(wraplength=text_wrap)
+            except Exception:
+                continue
+
+        subtitle = getattr(self, "_intro_hero_subtitle", None)
+        if subtitle is not None:
+            try:
+                subtitle.configure(wraplength=max(540, frame_width - 24))
+            except Exception:
+                pass
 
     def _show_intro(self) -> None:
         self._workflow_label_var.set("Home")
@@ -500,6 +622,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.notebook.pack_forget()
         if self.intro_frame.winfo_manager() != "pack":
             self.intro_frame.pack(fill=tk.BOTH, expand=True)
+        self._refresh_intro_wraplength()
 
     def _open_workflow(self, workflow_key: str) -> None:
         tab_keys = self._workflow_tabs.get(workflow_key, [])
@@ -577,6 +700,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self.notebook = ttk.Notebook(self.main_content)
 
         self.doctor_tab = ttk.Frame(self.notebook, padding=12)
+        self.storage_tab = ttk.Frame(self.notebook, padding=12)
         self.camera_setup_tab = ttk.Frame(self.notebook, padding=12)
         self.roadmap_tab = ttk.Frame(self.notebook, padding=12)
         self.fps_tab = ttk.Frame(self.notebook, padding=12)
@@ -589,6 +713,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self.run_tab = ttk.Frame(self.notebook, padding=12)
 
         self._build_doctor_tab()
+        self._build_storage_tab()
         self._build_camera_setup_tab()
         self._build_roadmap_tab()
         self._build_config_tab()
@@ -602,6 +727,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._tab_lookup = {
             "doctor": self.doctor_tab,
+            "storage": self.storage_tab,
             "camera_setup": self.camera_setup_tab,
             "roadmap": self.roadmap_tab,
             "config": self.config_tab,
@@ -616,6 +742,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._tab_titles = {
             "roadmap": "Setup Roadmap",
             "doctor": "Doctor",
+            "storage": "Storage",
             "config": "Config Editor",
             "camera_setup": "Camera Setup",
             "tracking_optimization": "Tracking Optimization",
@@ -627,7 +754,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "fleet": "Fleet Setup",
         }
         self._workflow_tabs = {
-            "setup": ["roadmap", "doctor", "config", "camera_setup", "tracking_optimization", "fps", "calibration"],
+            "setup": ["roadmap", "doctor", "storage", "config", "camera_setup", "tracking_optimization", "fps", "calibration"],
             "schedule_run": ["schedule_check", "run"],
             "nest_labeling": ["nest_labeling"],
             "fleet": ["fleet"],
@@ -698,15 +825,27 @@ class BumbleBoxV2GUI(tk.Tk):
         controls.pack(fill=tk.X)
         ttk.Button(controls, text="Run Doctor", command=self._run_doctor).pack(side=tk.LEFT)
 
-        storage_frame = ttk.LabelFrame(self.doctor_tab, text="Storage Setup", padding=8)
-        storage_frame.pack(fill=tk.X, pady=(10, 0))
+        self.doctor_output = self._create_results_section(
+            self.doctor_tab,
+            title="Doctor Results",
+            text_height=12,
+            default_visible=False,
+            auto_hide_when_empty=True,
+        )
+
+    def _build_storage_tab(self) -> None:
+        top = ttk.Frame(self.storage_tab)
+        top.pack(fill=tk.X)
 
         self.storage_mount_point_var = tk.StringVar(value="/mnt/bumblebox/data")
-        ttk.Label(storage_frame, text="Mount point").grid(row=0, column=0, sticky="w")
-        ttk.Entry(storage_frame, textvariable=self.storage_mount_point_var, width=42).grid(
+        self.storage_device_var = tk.StringVar(value="Auto (recommended)")
+        self._storage_device_display_to_path: dict[str, str] = {}
+
+        ttk.Label(top, text="Mount point").grid(row=0, column=0, sticky="w")
+        ttk.Entry(top, textvariable=self.storage_mount_point_var, width=42).grid(
             row=0, column=1, sticky="ew", padx=8, pady=3
         )
-        row_buttons = ttk.Frame(storage_frame)
+        row_buttons = ttk.Frame(top)
         row_buttons.grid(row=0, column=2, sticky="w")
         ttk.Button(
             row_buttons,
@@ -724,28 +863,40 @@ class BumbleBoxV2GUI(tk.Tk):
             command=self._setup_storage_auto_mount,
         ).pack(side=tk.LEFT)
 
+        ttk.Label(top, text="Storage device").grid(row=1, column=0, sticky="w")
+        self.storage_device_combo = ttk.Combobox(
+            top,
+            textvariable=self.storage_device_var,
+            state="readonly",
+            width=55,
+        )
+        self.storage_device_combo.grid(row=1, column=1, sticky="ew", padx=8, pady=3)
+        device_buttons = ttk.Frame(top)
+        device_buttons.grid(row=1, column=2, sticky="w")
+        ttk.Button(
+            device_buttons,
+            text="Refresh Devices",
+            command=self._refresh_storage_device_choices,
+        ).pack(side=tk.LEFT)
+
         info = (
-            "If storage is already mounted at this path, BumbleBox shows where data is being written. "
-            "If not mounted, Setup Storage Auto-Mount configures UUID-based /etc/fstab boot mounting."
+            "Select Auto to let BumbleBox choose the best detected partition, or select a specific /dev/... device "
+            "to force setup on that partition."
         )
-        ttk.Label(storage_frame, text=info, wraplength=860, justify=tk.LEFT).grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(6, 4)
+        ttk.Label(top, text=info, wraplength=860, justify=tk.LEFT).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(6, 4)
         )
-        storage_frame.columnconfigure(1, weight=1)
+        top.columnconfigure(1, weight=1)
 
-        self.storage_output = tk.Text(storage_frame, wrap=tk.WORD, height=7)
-        self.storage_output.grid(row=2, column=0, columnspan=3, sticky="nsew")
-        self._style_output_text(self.storage_output)
-        storage_frame.rowconfigure(2, weight=1)
-
-        self.doctor_output = self._create_results_section(
-            self.doctor_tab,
-            title="Doctor Results",
-            text_height=12,
+        self.storage_output = self._create_results_section(
+            self.storage_tab,
+            title="Storage Results",
+            text_height=11,
             default_visible=False,
             auto_hide_when_empty=True,
         )
         self._load_storage_mount_point_from_config()
+        self._refresh_storage_device_choices()
         self._refresh_storage_status()
 
     def _build_camera_setup_tab(self) -> None:
@@ -2964,6 +3115,47 @@ class BumbleBoxV2GUI(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
 
+    def _selected_storage_device_path(self) -> str | None:
+        selected = self.storage_device_var.get().strip()
+        return self._storage_device_display_to_path.get(selected)
+
+    def _refresh_storage_device_choices(self, preferred_path: str | None = None) -> None:
+        auto_label = "Auto (recommended)"
+        choices = [auto_label]
+        mapping: dict[str, str] = {}
+        devices = discover_storage_devices()
+
+        for device in devices:
+            if device.dev_type != "part":
+                continue
+            if not device.path.startswith("/dev/"):
+                continue
+            if not device.has_filesystem:
+                continue
+            if device.mountpoint in {"/", "/boot", "/boot/firmware"}:
+                continue
+            descriptor = (
+                f"{device.path} ({device.size or '?'} {device.fstype or 'unknown fs'}"
+                f", {device.display_name})"
+            )
+            if device.mountpoint:
+                descriptor += f" mounted:{device.mountpoint}"
+            choices.append(descriptor)
+            mapping[descriptor] = device.path
+
+        self._storage_device_display_to_path = mapping
+        self.storage_device_combo.configure(values=choices)
+
+        current = self.storage_device_var.get().strip()
+        if preferred_path:
+            for label, path in mapping.items():
+                if path == preferred_path:
+                    self.storage_device_var.set(label)
+                    return
+        if current in choices:
+            return
+        self.storage_device_var.set(auto_label)
+
     def _load_storage_mount_point_from_config(self) -> None:
         try:
             config, _ = self._load_config_or_defaults()
@@ -2988,6 +3180,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 tk.END,
                 f"Saved mount point to config:\n- system.data_root: {mount_point}\n- config: {config_path}",
             )
+            self._refresh_storage_device_choices()
             self._refresh_storage_status()
         except Exception as exc:
             messagebox.showerror("Save mount point failed", str(exc))
@@ -2997,8 +3190,14 @@ class BumbleBoxV2GUI(tk.Tk):
             config, _ = self._load_config_or_defaults()
             mount_point = self.storage_mount_point_var.get().strip() or None
             report = get_storage_status(config=config, mount_point=mount_point)
+            self._refresh_storage_device_choices(preferred_path=report.recommended_device_path)
             self.storage_output.delete("1.0", tk.END)
             self.storage_output.insert(tk.END, format_storage_status_report(report))
+            selected_device = self._selected_storage_device_path()
+            if selected_device:
+                self.storage_output.insert(tk.END, f"\nSelected setup device: {selected_device}")
+            else:
+                self.storage_output.insert(tk.END, "\nSelected setup device: Auto (recommended)")
         except Exception as exc:
             self.storage_output.delete("1.0", tk.END)
             self.storage_output.insert(tk.END, f"[FAIL] Storage status failed: {exc}")
@@ -3053,14 +3252,17 @@ class BumbleBoxV2GUI(tk.Tk):
 
         try:
             config, config_path = self._load_config_or_defaults()
+            device_path = self._selected_storage_device_path()
             status = get_storage_status(config=config, mount_point=mount_point)
-            if status.mounted and status.writable:
+            if status.mounted and status.writable and (
+                device_path is None or status.device_path == device_path
+            ):
                 self.storage_output.delete("1.0", tk.END)
                 self.storage_output.insert(tk.END, format_storage_status_report(status))
                 return
 
             try:
-                result = setup_storage_auto_mount(mount_point=mount_point)
+                result = setup_storage_auto_mount(mount_point=mount_point, device_path=device_path)
                 self.storage_output.delete("1.0", tk.END)
                 self.storage_output.insert(tk.END, format_storage_setup_result(result))
                 config.setdefault("system", {})
@@ -3068,13 +3270,18 @@ class BumbleBoxV2GUI(tk.Tk):
                 save_config(config_path, config)
                 self.storage_output.insert(tk.END, f"\n\nUpdated config: {config_path}")
             except PermissionError:
-                if self._run_pkexec_storage_setup(config_path=config_path, mount_point=mount_point, device_path=None):
+                if self._run_pkexec_storage_setup(
+                    config_path=config_path,
+                    mount_point=mount_point,
+                    device_path=device_path,
+                ):
                     self._refresh_storage_status()
                     return
 
                 sudo_cmd = build_storage_setup_sudo_command(
                     config_path=str(config_path),
                     mount_point=mount_point,
+                    device_path=device_path,
                     apply_config=True,
                 )
                 self.storage_output.insert(
