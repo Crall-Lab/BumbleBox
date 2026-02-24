@@ -22,6 +22,7 @@ Options:
   --label-python <bin>      Python interpreter for dedicated labeling env (default: --python value)
   --skip-system-deps        Do not auto-install apt dependencies (Pi)
   --skip-pip-upgrade        Skip pip/setuptools/wheel upgrade
+  --skip-gui-shortcut       Do not auto-install Desktop GUI launcher/icon at end of setup
   --no-smoke-check          Skip import smoke checks
   -h, --help                Show this help text
 EOF
@@ -43,6 +44,7 @@ LABEL_VENV_DIR="${REPO_ROOT}/.venvs/bbx-label"
 LABEL_PYTHON_BIN=""
 AUTO_SYSTEM_DEPS=1
 SKIP_PIP_UPGRADE=0
+INSTALL_GUI_SHORTCUT=1
 RUN_SMOKE_CHECK=1
 PI_MODEL=""
 SKIPPED_PIP_NEST_LABEL_ON_PI=0
@@ -295,6 +297,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_PIP_UPGRADE=1
       shift
       ;;
+    --skip-gui-shortcut)
+      INSTALL_GUI_SHORTCUT=0
+      shift
+      ;;
     --no-smoke-check)
       RUN_SMOKE_CHECK=0
       shift
@@ -430,6 +436,15 @@ have_labelme = importlib.util.find_spec("labelme") is not None
 print(f"Label env PyQt5 available: {have_pyqt}")
 print(f"Label env labelme available: {have_labelme}")
 PY
+  fi
+fi
+
+if [[ "$INSTALL_GUI_SHORTCUT" -eq 1 ]]; then
+  echo "[BumbleBox] Installing GUI desktop icon/launcher"
+  if "$VENV_PY" "${REPO_ROOT}/bbx.py" gui-install-shortcut >/dev/null 2>&1; then
+    echo "[BumbleBox] Desktop GUI launcher/icon installed."
+  else
+    echo "[BumbleBox] Note: Desktop GUI launcher/icon could not be installed (headless session or desktop path unavailable)."
   fi
 fi
 

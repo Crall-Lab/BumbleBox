@@ -1670,7 +1670,10 @@ def build_parser() -> argparse.ArgumentParser:
     gui_shortcut_parser.add_argument("--bin-dir", help="Override directory for launcher script.")
     gui_shortcut_parser.add_argument(
         "--icon-path",
-        help="Use an existing icon file path. If omitted, a default BumbleBox SVG icon is created if missing.",
+        help=(
+            "Use an existing icon file path. If omitted, BumbleBox first checks repo assets "
+            "(for example assets/bumblebox.png) then falls back to a generated default SVG icon."
+        ),
     )
     gui_shortcut_parser.add_argument("--dry-run", action="store_true", help="Show target paths without writing files.")
     gui_shortcut_parser.set_defaults(func=_cmd_gui_install_shortcut)

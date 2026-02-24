@@ -117,6 +117,29 @@ def _default_icon_svg() -> str:
 """
 
 
+def _choose_default_icon_path(repo_root: Path, home: Path) -> Path:
+    generated_fallback = home / ".local" / "share" / "icons" / "bumblebox-gui.svg"
+    assets_dir = repo_root / "assets"
+    candidates = [
+        assets_dir / "bumblebox.png",
+        assets_dir / "bumblebox.svg",
+        assets_dir / "icon.png",
+        assets_dir / "icon.svg",
+        assets_dir / "logo.png",
+        assets_dir / "logo.svg",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+
+    if assets_dir.exists() and assets_dir.is_dir():
+        for ext in ("png", "svg", "jpg", "jpeg", "webp", "ico"):
+            for path in sorted(assets_dir.glob(f"*.{ext}")):
+                if path.is_file():
+                    return path.resolve()
+    return generated_fallback
+
+
 def _mark_trusted(path: Path) -> bool:
     try:
         proc = subprocess.run(
@@ -146,7 +169,9 @@ def install_gui_shortcut(
     desktop = _expand(desktop_dir, _resolve_desktop_dir(home)).resolve()
     apps = _expand(applications_dir, home / ".local" / "share" / "applications").resolve()
     local_bin = _expand(bin_dir, home / ".local" / "bin").resolve()
-    icon = _expand(icon_path, home / ".local" / "share" / "icons" / "bumblebox-gui.svg").resolve()
+    generated_icon_path = (home / ".local" / "share" / "icons" / "bumblebox-gui.svg").resolve()
+    default_icon_path = _choose_default_icon_path(repo, home)
+    icon = _expand(icon_path, default_icon_path).resolve()
 
     filename = _sanitize_desktop_filename(name)
     desktop_entry = desktop / filename
@@ -165,7 +190,7 @@ def install_gui_shortcut(
         icon.parent.mkdir(parents=True, exist_ok=True)
 
         if icon_path is None:
-            if not icon.exists():
+            if icon == generated_icon_path and not icon.exists():
                 icon.write_text(_default_icon_svg())
         elif not icon.exists():
             raise FileNotFoundError(
