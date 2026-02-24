@@ -105,25 +105,57 @@ def _open_picamera2(
             "picamera2 is not available. Install Raspberry Pi camera stack and retry."
         ) from exc
 
-    resolved_tuning_file = resolve_camera_tuning_file(config)
-    if resolved_tuning_file:
+    def _construct_picamera2(resolved_tuning_file: Optional[str]) -> Any:
         try:
-            tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
-            picam2 = Picamera2(tuning=tuning)
-        except Exception as exc:
+            camera_info = Picamera2.global_camera_info()
+            if isinstance(camera_info, list) and len(camera_info) == 0:
+                raise RuntimeError(
+                    "No camera detected by picamera2/libcamera. "
+                    "Check ribbon cable orientation/seating and enable camera stack."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            # Continue; some environments may not support this probe cleanly.
+            pass
+
+        try:
+            if resolved_tuning_file:
+                tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
+                return Picamera2(tuning=tuning)
+            return Picamera2()
+        except IndexError as exc:
             raise RuntimeError(
-                f"Failed to load tuning file '{resolved_tuning_file}': {exc}"
+                "No camera detected by picamera2/libcamera (IndexError during camera open). "
+                "Check ribbon cable orientation/seating, camera power, and that no other process owns the camera."
             ) from exc
-    else:
-        picam2 = Picamera2()
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if resolved_tuning_file:
+                raise RuntimeError(
+                    f"Failed to open camera with tuning file '{resolved_tuning_file}': {exc}"
+                ) from exc
+            raise RuntimeError(f"Failed to open camera: {exc}") from exc
+
+    resolved_tuning_file = resolve_camera_tuning_file(config)
+    picam2 = _construct_picamera2(resolved_tuning_file)
 
     main_stream = {"size": (int(width), int(height))}
     if frame_format:
         main_stream["format"] = frame_format
 
-    camera_config = picam2.create_preview_configuration(main_stream)
-    picam2.align_configuration(camera_config)
-    picam2.configure(camera_config)
+    try:
+        camera_config = picam2.create_preview_configuration(main_stream)
+        picam2.align_configuration(camera_config)
+        picam2.configure(camera_config)
+    except IndexError as exc:
+        raise RuntimeError(
+            "Camera opened but failed to configure stream (IndexError). "
+            "This usually means libcamera could not enumerate valid sensor modes."
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(f"Failed to configure camera preview stream: {exc}") from exc
     return picam2, resolved_tuning_file
 
 

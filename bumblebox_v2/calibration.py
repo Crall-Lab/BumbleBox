@@ -198,20 +198,56 @@ def capture_calibration_image(
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = out_dir / f"{filename_prefix}_{stamp}.png"
 
+    def _construct_picamera2(tuning_file: Optional[str]) -> Any:
+        try:
+            camera_info = Picamera2.global_camera_info()
+            if isinstance(camera_info, list) and len(camera_info) == 0:
+                raise RuntimeError(
+                    "No camera detected by picamera2/libcamera. "
+                    "Check ribbon cable orientation/seating and enable camera stack."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        try:
+            if tuning_file:
+                tuning = Picamera2.load_tuning_file(str(tuning_file))
+                return Picamera2(tuning=tuning)
+            return Picamera2()
+        except IndexError as exc:
+            raise RuntimeError(
+                "No camera detected by picamera2/libcamera (IndexError during camera open). "
+                "Check ribbon cable orientation/seating, camera power, and that no other process owns the camera."
+            ) from exc
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if tuning_file:
+                raise RuntimeError(
+                    f"Failed to open camera with tuning file '{tuning_file}': {exc}"
+                ) from exc
+            raise RuntimeError(f"Failed to open camera: {exc}") from exc
+
     tuning_file = resolve_camera_tuning_file(config)
-    if tuning_file:
-        tuning = Picamera2.load_tuning_file(str(tuning_file))
-        picam2 = Picamera2(tuning=tuning)
-    else:
-        picam2 = Picamera2()
+    picam2 = _construct_picamera2(tuning_file)
 
     started = False
     try:
-        still = picam2.create_still_configuration(
-            main={"size": (width, height), "format": "RGB888"}
-        )
-        picam2.align_configuration(still)
-        picam2.configure(still)
+        try:
+            still = picam2.create_still_configuration(
+                main={"size": (width, height), "format": "RGB888"}
+            )
+            picam2.align_configuration(still)
+            picam2.configure(still)
+        except IndexError as exc:
+            raise RuntimeError(
+                "Camera opened but failed to configure still stream (IndexError). "
+                "This usually means libcamera could not enumerate valid sensor modes."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"Failed to configure still capture: {exc}") from exc
         picam2.set_controls({"ExposureTime": shutter_us})
 
         if noise_reduction != "Auto":

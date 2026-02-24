@@ -137,20 +137,51 @@ def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[fl
     digital_zoom = config["camera"].get("digital_zoom")
     noise_reduction = config["camera"].get("noise_reduction", "Auto")
 
-    resolved_tuning_file = resolve_camera_tuning_file(config)
-    if resolved_tuning_file:
+    def _construct_picamera2(resolved_tuning_file: str | None):
         try:
-            tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
-            picam2 = Picamera2(tuning=tuning)
-        except Exception as exc:
+            camera_info = Picamera2.global_camera_info()
+            if isinstance(camera_info, list) and len(camera_info) == 0:
+                raise RuntimeError(
+                    "No camera detected by picamera2/libcamera. "
+                    "Check ribbon cable orientation/seating and enable camera stack."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        try:
+            if resolved_tuning_file:
+                tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
+                return Picamera2(tuning=tuning)
+            return Picamera2()
+        except IndexError as exc:
             raise RuntimeError(
-                f"Failed to load tuning file '{resolved_tuning_file}': {exc}"
+                "No camera detected by picamera2/libcamera (IndexError during camera open). "
+                "Check ribbon cable orientation/seating, camera power, and that no other process owns the camera."
             ) from exc
-    else:
-        picam2 = Picamera2()
-    preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
-    picam2.align_configuration(preview)
-    picam2.configure(preview)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if resolved_tuning_file:
+                raise RuntimeError(
+                    f"Failed to open camera with tuning file '{resolved_tuning_file}': {exc}"
+                ) from exc
+            raise RuntimeError(f"Failed to open camera: {exc}") from exc
+
+    resolved_tuning_file = resolve_camera_tuning_file(config)
+    picam2 = _construct_picamera2(resolved_tuning_file)
+    try:
+        preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
+        picam2.align_configuration(preview)
+        picam2.configure(preview)
+    except IndexError as exc:
+        raise RuntimeError(
+            "Camera opened but failed to configure capture stream (IndexError). "
+            "This usually means libcamera could not enumerate valid sensor modes."
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(f"Failed to configure capture stream: {exc}") from exc
     picam2.set_controls({"ExposureTime": shutter_us})
 
     if noise_reduction != "Auto":
