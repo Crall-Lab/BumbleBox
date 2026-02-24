@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import getpass
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable
 
@@ -37,6 +39,7 @@ VALID_CAMERA_MODELS = {
 VALID_PREVIEW_WINDOWS = {"QTGL", "QT", "DRM"}
 VALID_CAMERA_CODECS = {"mp4", "mjpeg"}
 VALID_UI_THEME_MODES = {"dark", "light"}
+SERVICE_USER_AUTO_SENTINELS = {"", "auto", "current", "default", "pi", "root"}
 
 
 class ConfigError(ValueError):
@@ -49,6 +52,33 @@ def _require_yaml() -> None:
             "PyYAML is required for BumbleBox V2 config support. "
             "Install with: pip3 install pyyaml"
         )
+
+
+def detect_current_user() -> str:
+    for key in ("SUDO_USER", "USER", "LOGNAME"):
+        value = str(os.environ.get(key, "")).strip()
+        if value and value != "root":
+            return value
+    try:
+        value = str(getpass.getuser()).strip()
+        if value and value != "root":
+            return value
+    except Exception:
+        pass
+    return "pi"
+
+
+def normalize_service_user_value(raw: Any) -> str:
+    value = str(raw if raw is not None else "").strip()
+    if value.lower() in SERVICE_USER_AUTO_SENTINELS:
+        return detect_current_user()
+    return value
+
+
+def _normalize_service_user_in_config(config: Dict[str, Any]) -> None:
+    scheduling = config.setdefault("scheduling", {})
+    if isinstance(scheduling, dict):
+        scheduling["service_user"] = normalize_service_user_value(scheduling.get("service_user"))
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
@@ -298,7 +328,14 @@ def validate_config(config: Dict[str, Any]) -> None:
 
 
 def load_defaults() -> Dict[str, Any]:
-    return _read_yaml(DEFAULT_CONFIG_PATH)
+    defaults = _read_yaml(DEFAULT_CONFIG_PATH)
+    try:
+        # Keep default service user aligned with the account running setup on this machine.
+        _normalize_service_user_in_config(defaults)
+    except Exception:
+        # Defaults should still load even if user detection fails.
+        pass
+    return defaults
 
 
 def load_config(config_path: str | Path) -> Dict[str, Any]:
@@ -311,12 +348,14 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
     else:
         merged = defaults
 
+    _normalize_service_user_in_config(merged)
     validate_config(merged)
     return merged
 
 
 def save_config(config_path: str | Path, config: Dict[str, Any]) -> None:
     _require_yaml()
+    _normalize_service_user_in_config(config)
     validate_config(config)
 
     config_path = Path(config_path)

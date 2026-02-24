@@ -81,7 +81,7 @@ scheduling:
   backend: "systemd"
   scope: "system"
   unit_prefix: "bumblebox-v2"
-  service_user: "pi"
+  service_user: "auto"
   enabled: false
   active_hours: "00:00-23:59"
 

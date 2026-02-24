@@ -1903,6 +1903,15 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Button(top_buttons, text="Validate", command=self._validate_editor_config).pack(side=tk.LEFT, padx=6)
         ttk.Button(top_buttons, text="Save Config", command=self._save_editor_config).pack(side=tk.LEFT, padx=6)
 
+        self.config_page_var = tk.StringVar(value="")
+        config_page_nav = ttk.Frame(container)
+        config_page_nav.pack(fill=tk.X, pady=(0, 6))
+        self.config_prev_btn = ttk.Button(config_page_nav, text="Previous", command=self._config_prev_page)
+        self.config_prev_btn.pack(side=tk.LEFT)
+        ttk.Label(config_page_nav, textvariable=self.config_page_var).pack(side=tk.LEFT, padx=10)
+        self.config_next_btn = ttk.Button(config_page_nav, text="Next", command=self._config_next_page)
+        self.config_next_btn.pack(side=tk.LEFT)
+
         form_canvas = tk.Canvas(
             container,
             highlightthickness=0,
@@ -1946,82 +1955,150 @@ class BumbleBoxV2GUI(tk.Tk):
             return
         canvas.itemconfigure(window_id, width=max(1, int(event.width)))
 
-    def _render_config_fields(self) -> None:
-        specs = [
-            ("Colony ID", "system.colony_id", str, None, None),
-            ("Data root", "system.data_root", str, None, None),
-            ("Pi model", "system.pi_model", str, ["auto", "pi4", "pi5"], None),
+    def _config_group_specs(self):
+        camera_models = ["auto", "hq", "hq_noir", "module3", "module3_wide", "module3_standard", "module3_noir"]
+        return [
             (
-                "Camera model",
-                "camera.model",
-                str,
-                ["auto", "hq", "hq_noir", "module3", "module3_wide", "module3_standard", "module3_noir"],
-                None,
+                "basic",
+                "System Basics",
+                [
+                    ("Colony ID", "system.colony_id", str, None, None),
+                    ("Data root", "system.data_root", str, None, None),
+                    ("Pi model", "system.pi_model", str, ["auto", "pi4", "pi5"], None),
+                    ("Camera model", "camera.model", str, camera_models, None),
+                    ("Fleet role", "fleet.role", str, ["standalone", "queen", "worker"], None),
+                    ("Unit prefix", "scheduling.unit_prefix", str, None, None),
+                    ("Service user", "scheduling.service_user", str, None, None),
+                    ("UI theme mode", "runtime.ui_theme_mode", str, ["dark", "light"], None),
+                    ("Use mock camera", "runtime.use_mock_camera", bool, None, None),
+                ],
             ),
-            ("Codec", "camera.codec", str, ["mp4", "mjpeg"], None),
-            ("Width (px)", "camera.width", int, None, None),
-            ("Height (px)", "camera.height", int, None, None),
-            ("FPS target", "camera.fps_target", float, None, None),
-            ("Shutter (us)", "camera.shutter_us", int, None, None),
-            ("Preview window", "camera.preview_window", str, ["QTGL", "QT", "DRM"], None),
-            ("Tuning file", "camera.tuning_file", str, None, None),
-            ("Pipeline mode", "pipeline.mode", str, ["record_only", "track_only", "record_and_track", "mixed_schedule"], None),
-            ("Tracking source", "pipeline.tracking_source", str, ["ram", "video"], None),
-            ("Deferred tracking", "pipeline.defer_tracking_until_after_recording", bool, None, None),
-            ("Parallel tracking", "pipeline.parallel_tracking", bool, None, None),
-            ("Behavior metrics", "pipeline.calculate_behavior_metrics", bool, None, None),
-            ("Recording seconds", "capture.recording_seconds", int, None, None),
-            ("Record interval (min)", "capture.record_interval_minutes", int, None, None),
-            ("Track interval (min)", "capture.track_interval_minutes", int, None, None),
-            ("Scheduler backend", "scheduling.backend", str, ["systemd", "cron"], None),
-            ("Scheduler scope", "scheduling.scope", str, ["system", "user"], None),
-            ("Scheduling enabled", "scheduling.enabled", bool, None, None),
-            ("Unit prefix", "scheduling.unit_prefix", str, None, None),
-            ("Service user", "scheduling.service_user", str, None, None),
-            ("Fleet role", "fleet.role", str, ["standalone", "queen", "worker"], None),
-            ("Queen local pipeline", "fleet.queen_local_pipeline_enabled", bool, None, {"queen"}),
-            ("Queen media enabled", "fleet.queen_media_schedule.enabled", bool, None, {"queen"}),
-            ("Queen pull interval (min)", "fleet.queen_media_schedule.pull_interval_minutes", int, None, {"queen"}),
-            ("Queen track interval (min)", "fleet.queen_media_schedule.track_interval_minutes", int, None, {"queen"}),
-            ("Queen media max videos", "fleet.queen_media_schedule.max_videos_total", int, None, {"queen"}),
-            ("Queen media cooldown (min)", "fleet.queen_media_schedule.cooldown_minutes", int, None, {"queen"}),
-            ("Use mock camera", "runtime.use_mock_camera", bool, None, None),
-            ("UI theme mode", "runtime.ui_theme_mode", str, ["dark", "light"], None),
-            ("Save frame timestamps", "runtime.save_frame_timestamps", bool, None, None),
-            ("FPS report each recording", "runtime.fps_report_on_each_recording", bool, None, None),
+            (
+                "camera",
+                "Camera Configuration",
+                [
+                    ("Codec", "camera.codec", str, ["mp4", "mjpeg"], None),
+                    ("Width (px)", "camera.width", int, None, None),
+                    ("Height (px)", "camera.height", int, None, None),
+                    ("FPS target", "camera.fps_target", float, None, None),
+                    ("Shutter (us)", "camera.shutter_us", int, None, None),
+                    ("Preview window", "camera.preview_window", str, ["QTGL", "QT", "DRM"], None),
+                    ("Tuning file", "camera.tuning_file", str, None, None),
+                ],
+            ),
+            (
+                "pipeline",
+                "Recording, Tracking, and Scheduling",
+                [
+                    ("Pipeline mode", "pipeline.mode", str, ["record_only", "track_only", "record_and_track", "mixed_schedule"], None),
+                    ("Tracking source", "pipeline.tracking_source", str, ["ram", "video"], None),
+                    ("Deferred tracking", "pipeline.defer_tracking_until_after_recording", bool, None, None),
+                    ("Parallel tracking", "pipeline.parallel_tracking", bool, None, None),
+                    ("Behavior metrics", "pipeline.calculate_behavior_metrics", bool, None, None),
+                    ("Recording seconds", "capture.recording_seconds", int, None, None),
+                    ("Record interval (min)", "capture.record_interval_minutes", int, None, None),
+                    ("Track interval (min)", "capture.track_interval_minutes", int, None, None),
+                    ("Scheduler backend", "scheduling.backend", str, ["systemd", "cron"], None),
+                    ("Scheduler scope", "scheduling.scope", str, ["system", "user"], None),
+                    ("Save frame timestamps", "runtime.save_frame_timestamps", bool, None, None),
+                    ("FPS report each recording", "runtime.fps_report_on_each_recording", bool, None, None),
+                    ("Queen local pipeline", "fleet.queen_local_pipeline_enabled", bool, None, {"queen"}),
+                    ("Queen media enabled", "fleet.queen_media_schedule.enabled", bool, None, {"queen"}),
+                    ("Queen pull interval (min)", "fleet.queen_media_schedule.pull_interval_minutes", int, None, {"queen"}),
+                    ("Queen track interval (min)", "fleet.queen_media_schedule.track_interval_minutes", int, None, {"queen"}),
+                    ("Queen media max videos", "fleet.queen_media_schedule.max_videos_total", int, None, {"queen"}),
+                    ("Queen media cooldown (min)", "fleet.queen_media_schedule.cooldown_minutes", int, None, {"queen"}),
+                ],
+            ),
         ]
 
+    def _render_config_fields(self) -> None:
+        group_defs = self._config_group_specs()
         self._config_field_rows: dict[str, ttk.Frame] = {}
         self._config_field_roles: dict[str, set[str] | None] = {}
+        self._config_group_frames: dict[str, ttk.LabelFrame] = {}
+        self._config_group_order: list[str] = []
+        self._config_group_titles: dict[str, str] = {}
+        self._config_page_index = 0
 
-        for row, (label, key, value_type, choices, roles) in enumerate(specs):
-            row_frame = ttk.Frame(self.config_form_frame)
-            row_frame.grid(row=row, column=0, sticky="ew", pady=2)
-            row_frame.columnconfigure(1, weight=1)
-            ttk.Label(row_frame, text=label).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=1)
+        for group_id, group_title, _specs in group_defs:
+            group_frame = ttk.LabelFrame(self.config_form_frame, text=group_title, padding=8)
+            group_frame.grid(row=0, column=0, sticky="ew")
+            group_frame.columnconfigure(0, weight=1)
+            self._config_group_frames[group_id] = group_frame
+            self._config_group_order.append(group_id)
+            self._config_group_titles[group_id] = group_title
 
-            if value_type is bool:
-                variable = tk.BooleanVar(value=False)
-                widget = ttk.Checkbutton(row_frame, variable=variable)
-                widget.grid(row=0, column=1, sticky="w", pady=1)
-            elif choices:
-                variable = tk.StringVar(value=str(choices[0]))
-                widget = ttk.Combobox(
-                    row_frame,
-                    textvariable=variable,
-                    values=choices,
-                    state="readonly",
-                    width=28,
+        for group_id, _group_title, specs in group_defs:
+            group_frame = self._config_group_frames[group_id]
+            row_index = 0
+            for label, key, value_type, choices, roles in specs:
+                row_frame = ttk.Frame(group_frame)
+                row_frame.grid(row=row_index, column=0, sticky="ew", pady=2)
+                row_frame.columnconfigure(1, weight=1)
+                ttk.Label(row_frame, text=label).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=1)
+
+                if value_type is bool:
+                    variable = tk.BooleanVar(value=False)
+                    widget = ttk.Checkbutton(row_frame, variable=variable)
+                    widget.grid(row=0, column=1, sticky="w", pady=1)
+                elif choices:
+                    variable = tk.StringVar(value=str(choices[0]))
+                    widget = ttk.Combobox(
+                        row_frame,
+                        textvariable=variable,
+                        values=choices,
+                        state="readonly",
+                        width=28,
+                    )
+                    widget.grid(row=0, column=1, sticky="ew", pady=1)
+                else:
+                    variable = tk.StringVar(value="")
+                    widget = ttk.Entry(row_frame, textvariable=variable, width=34)
+                    widget.grid(row=0, column=1, sticky="ew", pady=1)
+
+                if key == "camera.tuning_file":
+                    ttk.Button(row_frame, text="Browse", command=self._browse_tuning_file).grid(
+                        row=0, column=2, sticky="w", padx=(6, 0)
+                    )
+
+                self.config_fields[key] = (variable, value_type)
+                self._config_field_rows[key] = row_frame
+                self._config_field_roles[key] = set(roles) if roles else None
+                row_index += 1
+
+            if group_id == "basic":
+                ttk.Label(
+                    group_frame,
+                    text="Unit prefix controls generated timer/service names (for example: bumblebox-v2-record.timer).",
+                    justify=tk.LEFT,
+                    wraplength=760,
+                ).grid(row=row_index, column=0, sticky="w", pady=(8, 0))
+                row_index += 1
+
+            if group_id == "camera":
+                self._camera_max_status_var = tk.StringVar(
+                    value="Tip: reads connected camera modes first, then falls back to camera model defaults."
                 )
-                widget.grid(row=0, column=1, sticky="ew", pady=1)
-            else:
-                variable = tk.StringVar(value="")
-                widget = ttk.Entry(row_frame, textvariable=variable, width=34)
-                widget.grid(row=0, column=1, sticky="ew", pady=1)
+                actions = ttk.Frame(group_frame)
+                actions.grid(row=row_index, column=0, sticky="w", pady=(8, 0))
+                ttk.Button(
+                    actions,
+                    text="Use Max Resolution",
+                    command=self._apply_camera_max_resolution,
+                ).pack(side=tk.LEFT)
+                ttk.Label(actions, textvariable=self._camera_max_status_var).pack(side=tk.LEFT, padx=(8, 0))
+                row_index += 1
 
-            self.config_fields[key] = (variable, value_type)
-            self._config_field_rows[key] = row_frame
-            self._config_field_roles[key] = set(roles) if roles else None
+            if group_id == "pipeline":
+                self._pipeline_tracking_hint_var = tk.StringVar(value="")
+                ttk.Label(
+                    group_frame,
+                    textvariable=self._pipeline_tracking_hint_var,
+                    justify=tk.LEFT,
+                    wraplength=760,
+                ).grid(row=row_index, column=0, sticky="w", pady=(8, 0))
+                row_index += 1
 
         self.config_form_frame.columnconfigure(0, weight=1)
 
@@ -2034,7 +2111,195 @@ class BumbleBoxV2GUI(tk.Tk):
                 self._config_role_trace_bound = True
             except Exception:
                 self._config_role_trace_bound = False
+
+        pipeline_binding = getattr(self, "_pipeline_trace_bound", False)
+        mode_field = self.config_fields.get("pipeline.mode")
+        source_field = self.config_fields.get("pipeline.tracking_source")
+        if (not pipeline_binding) and mode_field is not None and source_field is not None:
+            try:
+                mode_field[0].trace_add("write", lambda *_args: self._update_pipeline_tracking_hint())
+                source_field[0].trace_add("write", lambda *_args: self._update_pipeline_tracking_hint())
+                self._pipeline_trace_bound = True
+            except Exception:
+                self._pipeline_trace_bound = False
+
+        self._set_config_page(0)
+        self._update_pipeline_tracking_hint()
         self._refresh_config_field_visibility()
+
+    def _set_config_page(self, page_index: int) -> None:
+        order = getattr(self, "_config_group_order", [])
+        if not order:
+            return
+        bounded = max(0, min(len(order) - 1, int(page_index)))
+        self._config_page_index = bounded
+        frames = getattr(self, "_config_group_frames", {})
+        for idx, group_id in enumerate(order):
+            frame = frames.get(group_id)
+            if frame is None:
+                continue
+            if idx == bounded:
+                frame.grid()
+            else:
+                frame.grid_remove()
+        self._update_config_page_controls()
+
+    def _config_prev_page(self) -> None:
+        self._set_config_page(getattr(self, "_config_page_index", 0) - 1)
+
+    def _config_next_page(self) -> None:
+        self._set_config_page(getattr(self, "_config_page_index", 0) + 1)
+
+    def _update_config_page_controls(self) -> None:
+        order = getattr(self, "_config_group_order", [])
+        if not order:
+            return
+        idx = max(0, min(len(order) - 1, int(getattr(self, "_config_page_index", 0))))
+        group_id = order[idx]
+        title = getattr(self, "_config_group_titles", {}).get(group_id, group_id)
+        if hasattr(self, "config_page_var"):
+            self.config_page_var.set(f"Group {idx + 1}/{len(order)}: {title}")
+        if hasattr(self, "config_prev_btn"):
+            self.config_prev_btn.configure(state=(tk.NORMAL if idx > 0 else tk.DISABLED))
+        if hasattr(self, "config_next_btn"):
+            self.config_next_btn.configure(state=(tk.NORMAL if idx < len(order) - 1 else tk.DISABLED))
+
+    def _browse_tuning_file(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select camera tuning file",
+            initialdir=str(Path(self.config_path_var.get()).expanduser().parent),
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        field = self.config_fields.get("camera.tuning_file")
+        if field is None:
+            return
+        field[0].set(selected)
+
+    def _infer_camera_model_max_resolution(self, model: str) -> tuple[int, int] | None:
+        normalized = str(model or "").strip().lower()
+        mapping = {
+            "hq": (4056, 3040),
+            "hq_noir": (4056, 3040),
+            "module3": (4608, 2592),
+            "module3_wide": (4608, 2592),
+            "module3_standard": (4608, 2592),
+            "module3_noir": (4608, 2592),
+        }
+        return mapping.get(normalized)
+
+    def _coerce_size_tuple(self, value) -> tuple[int, int] | None:
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                width = int(value[0])
+                height = int(value[1])
+                if width > 0 and height > 0:
+                    return width, height
+            except Exception:
+                return None
+        return None
+
+    def _probe_connected_camera_max_resolution(self) -> tuple[int, int] | None:
+        try:
+            from picamera2 import Picamera2
+        except Exception:
+            return None
+
+        picam2 = None
+        sizes: list[tuple[int, int]] = []
+        try:
+            picam2 = Picamera2()
+            sensor_modes = getattr(picam2, "sensor_modes", None)
+            if isinstance(sensor_modes, (list, tuple)):
+                for mode in sensor_modes:
+                    size = None
+                    if isinstance(mode, dict):
+                        size = mode.get("size") or mode.get("resolution") or mode.get("output_size")
+                    else:
+                        size = mode
+                    maybe_size = self._coerce_size_tuple(size)
+                    if maybe_size is not None:
+                        sizes.append(maybe_size)
+
+            properties = getattr(picam2, "camera_properties", None)
+            if isinstance(properties, dict):
+                for key in ("PixelArraySize", "PixelArray", "SensorResolution"):
+                    maybe_size = self._coerce_size_tuple(properties.get(key))
+                    if maybe_size is not None:
+                        sizes.append(maybe_size)
+        except Exception:
+            return None
+        finally:
+            if picam2 is not None:
+                try:
+                    picam2.close()
+                except Exception:
+                    pass
+
+        if not sizes:
+            return None
+        return max(sizes, key=lambda item: item[0] * item[1])
+
+    def _apply_camera_max_resolution(self) -> None:
+        width_field = self.config_fields.get("camera.width")
+        height_field = self.config_fields.get("camera.height")
+        model_field = self.config_fields.get("camera.model")
+        if width_field is None or height_field is None:
+            return
+
+        detected = self._probe_connected_camera_max_resolution()
+        source = "connected camera"
+        if detected is None:
+            model_name = str(model_field[0].get()).strip().lower() if model_field else "auto"
+            detected = self._infer_camera_model_max_resolution(model_name)
+            source = f"camera model preset ({model_name})"
+
+        if detected is None:
+            message = "Could not detect max resolution. Connect a camera or select a specific camera model."
+            if hasattr(self, "_camera_max_status_var"):
+                self._camera_max_status_var.set(message)
+            messagebox.showerror("Camera resolution detection failed", message)
+            return
+
+        width, height = detected
+        width_field[0].set(str(width))
+        height_field[0].set(str(height))
+        if hasattr(self, "_camera_max_status_var"):
+            self._camera_max_status_var.set(f"Set width/height to {width}x{height} from {source}.")
+        self.config_output.delete("1.0", tk.END)
+        self.config_output.insert(tk.END, f"Applied max resolution: {width}x{height}\nSource: {source}")
+
+    def _update_pipeline_tracking_hint(self) -> None:
+        hint_var = getattr(self, "_pipeline_tracking_hint_var", None)
+        if hint_var is None:
+            return
+        mode_field = self.config_fields.get("pipeline.mode")
+        source_field = self.config_fields.get("pipeline.tracking_source")
+        mode = str(mode_field[0].get()).strip().lower() if mode_field else ""
+        source = str(source_field[0].get()).strip().lower() if source_field else ""
+
+        if mode == "record_and_track" and source == "ram":
+            hint = (
+                "record_and_track + tracking_source=ram keeps frame data in memory during recording. "
+                "This is fast for short runs, but RAM-heavy for long recordings or high FPS. "
+                "Choose tracking_source=video for lower RAM pressure and longer reliable recording windows."
+            )
+        elif mode == "record_and_track" and source == "video":
+            hint = (
+                "record_and_track + tracking_source=video tracks from saved video. "
+                "This is usually safer for long-duration recording because RAM pressure is lower."
+            )
+        elif mode == "track_only":
+            hint = "track_only ignores recording cadence and focuses on scheduled tracking jobs."
+        elif mode == "record_only":
+            hint = "record_only captures video without tag-tracking jobs."
+        else:
+            hint = (
+                "mixed_schedule can run separate record and track lanes. "
+                "Use Schedule Check and Schedule and Run tabs to validate timing."
+            )
+        hint_var.set(hint)
 
     def _refresh_config_field_visibility(self) -> None:
         rows = getattr(self, "_config_field_rows", {})
@@ -2056,6 +2321,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 row.grid()
             else:
                 row.grid_remove()
+        self._update_pipeline_tracking_hint()
 
     def _build_fps_tab(self) -> None:
         top = ttk.Frame(self.fps_tab)

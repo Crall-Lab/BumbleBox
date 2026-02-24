@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from .config import normalize_service_user_value
+
 
 @dataclass
 class SystemdWriteResult:
@@ -371,7 +373,7 @@ def write_systemd_units(config: Dict[str, Any], config_path: str | Path, output_
 
     unit_prefix = str(scheduling.get("unit_prefix", "bumblebox-v2")).strip() or "bumblebox-v2"
     scope = str(scheduling.get("scope", "system")).lower()
-    service_user = str(scheduling.get("service_user", "pi")).strip() if scope == "system" else None
+    service_user = normalize_service_user_value(scheduling.get("service_user")) if scope == "system" else None
 
     written: List[Path] = []
     timers_to_enable: List[str] = []

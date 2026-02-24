@@ -1330,7 +1330,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_config_arg(fleet_init)
     fleet_init.add_argument("--queen-host", help="Host/IP workers should use for queen time sync.")
-    fleet_init.add_argument("--ssh-user", help="Default SSH user for workers (default from config or 'pi').")
+    fleet_init.add_argument("--ssh-user", help="Default SSH user for workers (default from config).")
     fleet_init.add_argument("--identity-file", help="SSH identity file path (default ~/.ssh/bbx_fleet_ed25519).")
     fleet_init.add_argument("--skip-keygen", action="store_true", help="Do not create keypair if missing.")
     queen_mode_group = fleet_init.add_mutually_exclusive_group()
