@@ -551,7 +551,14 @@ class BumbleBoxV2GUI(tk.Tk):
         role: str,
     ) -> tk.Canvas:
         canvas = tk.Canvas(parent, bd=0, highlightthickness=0, relief=tk.FLAT, bg=bg)
-        rect_id = canvas.create_polygon([], smooth=True, splinesteps=24)
+        # Initialize with a tiny valid polygon; coordinates are replaced during layout.
+        rect_id = canvas.create_polygon(
+            1, 1, 2, 1, 2, 2, 1, 2,
+            smooth=True,
+            splinesteps=24,
+            fill=fill,
+            outline=fill,
+        )
         text_id = canvas.create_text(0, 0, text=text, fill=fg, font=font)
         meta: dict[str, object] = {
             "canvas": canvas,
