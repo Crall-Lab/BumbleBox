@@ -99,16 +99,16 @@ OCEAN_SLATE_PALETTE = {
 }
 
 LAVENDER_LIGHT_PALETTE = {
-    "app_bg": "#EFE7FA",
-    "panel_bg": "#E3D8F3",
-    "tab_btn_bg": "#C8B7E8",
-    "tab_btn_active": "#B7A2DE",
-    "tab_selected": "#A38AD1",
+    "app_bg": "#EDE2FA",
+    "panel_bg": "#DFD1F4",
+    "tab_btn_bg": "#C4B0E6",
+    "tab_btn_active": "#B49ADB",
+    "tab_selected": "#9D82CE",
     "text_light": "#1A1428",
     "text_muted": "#4F4563",
-    "entry_bg": "#FFFFFF",
+    "entry_bg": "#F7F1FF",
     "entry_fg": "#111111",
-    "output_bg": "#FFFFFF",
+    "output_bg": "#FDFBFF",
     "output_text": "#111111",
 }
 
@@ -193,7 +193,7 @@ class BumbleBoxV2GUI(tk.Tk):
         style.configure(
             "IntroPrimary.TButton",
             background=colors["tab_selected"],
-            foreground=colors["text_light"],
+            foreground="#FFFFFF",
             borderwidth=1,
             padding=(12, 7),
         )
@@ -203,7 +203,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 ("pressed", colors["tab_btn_bg"]),
                 ("active", colors["tab_btn_active"]),
             ],
-            foreground=[("disabled", colors["text_muted"]), ("!disabled", colors["text_light"])],
+            foreground=[("disabled", "#E6E6E6"), ("!disabled", "#FFFFFF")],
         )
         style.configure("TCheckbutton", background=colors["panel_bg"], foreground=colors["text_light"])
         style.configure("TRadiobutton", background=colors["panel_bg"], foreground=colors["text_light"])
@@ -808,10 +808,11 @@ class BumbleBoxV2GUI(tk.Tk):
                 bg=colors["entry_bg"],
                 fg=colors["text_light"],
                 font=self._intro_card_title_font,
-                anchor="w",
+                anchor="center",
+                justify=tk.CENTER,
             )
             self._intro_card_title_labels.append(title_label)
-            title_label.pack(side=tk.LEFT, anchor="w")
+            title_label.pack(fill=tk.X, anchor="center", pady=(6, 0))
             badge_label = tk.Label(
                 header,
                 text=badge,
@@ -822,17 +823,17 @@ class BumbleBoxV2GUI(tk.Tk):
                 pady=2,
             )
             self._intro_badge_labels.append(badge_label)
-            badge_label.pack(side=tk.RIGHT, anchor="e")
+            badge_label.pack(anchor="center")
 
             desc_label = tk.Label(
                 card,
                 text=desc,
                 bg=colors["entry_bg"],
                 fg=colors["text_muted"],
-                justify=tk.LEFT,
-                anchor="w",
+                justify=tk.CENTER,
+                anchor="center",
             )
-            desc_label.pack(fill=tk.X, anchor="w", pady=(10, 12))
+            desc_label.pack(fill=tk.X, anchor="center", pady=(10, 12))
             self._intro_desc_labels.append(desc_label)
 
             ttk.Button(
@@ -840,7 +841,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 text=f"Open {label}",
                 style="IntroPrimary.TButton",
                 command=lambda workflow_key=key: self._open_workflow(workflow_key),
-            ).pack(anchor="w")
+            ).pack(anchor="center")
 
         self._intro_cards_frame.columnconfigure(0, weight=1)
         self._intro_cards_frame.columnconfigure(1, weight=1)
@@ -880,7 +881,7 @@ class BumbleBoxV2GUI(tk.Tk):
             from_=0.0,
             to=1.0,
             orient=tk.HORIZONTAL,
-            length=120,
+            length=72,
             command=self._on_theme_knob_changed,
         )
         self._theme_knob.pack(side=tk.LEFT)
