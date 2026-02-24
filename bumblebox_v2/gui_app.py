@@ -23,9 +23,7 @@ from .calibration import (
     parse_point,
 )
 from .camera_setup import (
-    format_camera_preview_result,
     format_tracking_test_result,
-    run_camera_preview,
     run_camera_tracking_test,
 )
 from .config import DEFAULT_USER_CONFIG_PATH, load_config, load_defaults, save_config, validate_config, write_default_config
@@ -2984,11 +2982,11 @@ class BumbleBoxV2GUI(tk.Tk):
             picker,
             row=3,
             column=0,
-            text="LabelMe JSON path",
+            text="Expected LabelMe JSON path",
             help_title="LabelMe JSON",
             help_details=(
                 "JSON saved by LabelMe containing your point annotations. "
-                "Defaults to the captured image path with .json extension."
+                "This is the expected save path and is not created until you save in LabelMe."
             ),
         )
         ttk.Entry(
@@ -4954,7 +4952,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
     def _run_camera_preview_setup(self) -> None:
         try:
-            config, _ = self._load_config_or_defaults()
+            _, config_path = self._load_config_or_defaults()
             seconds = float(self.camera_preview_seconds_var.get().strip())
             if seconds <= 0:
                 raise ValueError("Preview duration must be > 0")
@@ -4974,15 +4972,15 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Starting camera preview. A preview window should open now.\n",
             )
             self.update_idletasks()
-            result = run_camera_preview(
-                config=config,
+            preview_text = self._run_camera_preview_subprocess(
+                config_path=config_path,
                 preview_seconds=seconds,
                 window=self.camera_preview_window_var.get().strip(),
                 width=width,
                 height=height,
             )
             self.camera_setup_output.delete("1.0", tk.END)
-            self.camera_setup_output.insert(tk.END, format_camera_preview_result(result))
+            self.camera_setup_output.insert(tk.END, preview_text)
             self.notebook.select(self.camera_setup_tab)
         except Exception as exc:
             messagebox.showerror("Camera preview failed", str(exc))
@@ -5025,7 +5023,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
     def _run_full_camera_setup_check(self) -> None:
         try:
-            config, _ = self._load_config_or_defaults()
+            config, config_path = self._load_config_or_defaults()
             preview_seconds = float(self.camera_preview_seconds_var.get().strip())
             test_seconds = float(self.camera_test_seconds_var.get().strip())
             display_width = int(self.camera_test_display_width_var.get().strip())
@@ -5057,8 +5055,8 @@ class BumbleBoxV2GUI(tk.Tk):
                 ),
             )
             self.update_idletasks()
-            preview_result = run_camera_preview(
-                config=config,
+            preview_text = self._run_camera_preview_subprocess(
+                config_path=config_path,
                 preview_seconds=preview_seconds,
                 window=self.camera_preview_window_var.get().strip(),
                 width=width,
@@ -5081,12 +5079,77 @@ class BumbleBoxV2GUI(tk.Tk):
             )
 
             self.camera_setup_output.delete("1.0", tk.END)
-            self.camera_setup_output.insert(tk.END, format_camera_preview_result(preview_result))
+            self.camera_setup_output.insert(tk.END, preview_text)
             self.camera_setup_output.insert(tk.END, "\n\n")
             self.camera_setup_output.insert(tk.END, format_tracking_test_result(tracking_result))
             self.notebook.select(self.camera_setup_tab)
         except Exception as exc:
             messagebox.showerror("Full camera setup check failed", str(exc))
+
+    def _run_camera_preview_subprocess(
+        self,
+        *,
+        config_path: Path,
+        preview_seconds: float,
+        window: str,
+        width: int | None,
+        height: int | None,
+    ) -> str:
+        repo_root = Path(__file__).resolve().parents[1]
+        bbx_path = repo_root / "bbx.py"
+        requested_window = str(window or "QTGL").strip().upper()
+        if requested_window not in {"QTGL", "QT", "DRM"}:
+            requested_window = "QTGL"
+
+        attempt_windows = [requested_window]
+        for candidate in ("QT", "DRM"):
+            if candidate not in attempt_windows:
+                attempt_windows.append(candidate)
+
+        attempt_details: list[str] = []
+        for attempt_window in attempt_windows:
+            command = [
+                sys.executable,
+                str(bbx_path),
+                "camera-preview",
+                "--config",
+                str(config_path),
+                "--seconds",
+                f"{float(preview_seconds):.3f}",
+                "--window",
+                attempt_window,
+            ]
+            if width is not None:
+                command.extend(["--width", str(int(width))])
+            if height is not None:
+                command.extend(["--height", str(int(height))])
+
+            proc = subprocess.run(command, capture_output=True, text=True, check=False)
+            stdout = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
+            if proc.returncode == 0:
+                if attempt_window != requested_window:
+                    prefix = (
+                        f"Requested preview window '{requested_window}' failed; "
+                        f"used fallback '{attempt_window}'.\n\n"
+                    )
+                    return prefix + (stdout or f"Camera preview completed with fallback window '{attempt_window}'.")
+                return stdout or "Camera preview completed."
+
+            detail = [
+                f"Window={attempt_window}, exit={proc.returncode}",
+                f"Command: {' '.join(shlex.quote(part) for part in command)}",
+            ]
+            if stdout:
+                detail.append(f"stdout:\n{stdout}")
+            if stderr:
+                detail.append(f"stderr:\n{stderr}")
+            attempt_details.append("\n\n".join(detail))
+
+        raise RuntimeError(
+            "Camera preview failed for all window backends (QTGL/QT/DRM).\n\n"
+            + "\n\n---\n\n".join(attempt_details)
+        )
 
     def _refresh_roadmap(self, *, select_tab: bool = True) -> None:
         try:
@@ -5270,8 +5333,10 @@ class BumbleBoxV2GUI(tk.Tk):
                 tk.END,
                 (
                     f"Captured calibration image: {image_path}\n"
+                    f"Expected LabelMe JSON after Save: {json_path}\n"
                     f"Launched LabelMe (pid {process.pid}).\n"
                     f"Command: {' '.join(shlex.quote(part) for part in command)}\n\n"
+                    "No JSON exists yet until you save in LabelMe.\n"
                     "In LabelMe, place two point annotations on the known-distance endpoints and save.\n"
                     "Then click 'Load LabelMe Points -> Point A/B'."
                 ),
@@ -5308,6 +5373,13 @@ class BumbleBoxV2GUI(tk.Tk):
             if not json_text:
                 raise ValueError(
                     "No LabelMe JSON path is set. Capture/open an image first, label it, save, then retry."
+                )
+
+            json_path = Path(json_text).expanduser().resolve()
+            if not json_path.exists():
+                raise FileNotFoundError(
+                    f"LabelMe JSON not found yet: {json_path}\n"
+                    "After placing points in LabelMe, save the file, then click Load again."
                 )
 
             point_a, point_b, note = extract_points_from_labelme_json(json_text)

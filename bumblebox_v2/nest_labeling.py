@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -274,8 +275,31 @@ def launch_labelme(
         image_path=image_path,
         python_executable=python_executable,
     )
-    return subprocess.Popen(
+    process = subprocess.Popen(
         command,
         cwd=str(repo_root()),
         start_new_session=True,
     )
+    # Detect immediate startup failures (for example missing Qt plugin) and raise a clear error.
+    time.sleep(0.8)
+    return_code = process.poll()
+    if return_code is not None:
+        probe = subprocess.run(
+            command,
+            cwd=str(repo_root()),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        stdout = (probe.stdout or "").strip()
+        stderr = (probe.stderr or "").strip()
+        message_parts = [
+            f"LabelMe exited immediately (code {return_code}).",
+            f"Command: {' '.join(command)}",
+        ]
+        if stdout:
+            message_parts.append(f"stdout:\n{stdout}")
+        if stderr:
+            message_parts.append(f"stderr:\n{stderr}")
+        raise RuntimeError("\n\n".join(message_parts))
+    return process
