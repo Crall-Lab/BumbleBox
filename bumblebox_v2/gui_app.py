@@ -432,7 +432,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
         for frame in getattr(self, "_intro_card_frames", []):
             try:
-                frame.configure(bg=colors["entry_bg"], highlightbackground=colors["tab_btn_active"])
+                frame.configure(bg=colors["entry_bg"])
             except Exception:
                 continue
 
@@ -448,6 +448,7 @@ class BumbleBoxV2GUI(tk.Tk):
             except Exception:
                 continue
 
+        self._refresh_intro_card_tiles()
         self._refresh_intro_title_pills()
 
         footer = getattr(self, "_intro_theme_footer", None)
@@ -580,6 +581,99 @@ class BumbleBoxV2GUI(tk.Tk):
         self._layout_intro_title_pill(meta)
         return canvas
 
+    def _create_intro_card_tile(
+        self,
+        parent: tk.Widget,
+        *,
+        radius: int = 14,
+        pad_x: int = 14,
+        pad_y: int = 12,
+    ) -> tuple[tk.Canvas, tk.Frame]:
+        colors = self._palette
+        canvas = tk.Canvas(parent, bd=0, highlightthickness=0, relief=tk.FLAT, bg=colors["panel_bg"])
+        rect_id = canvas.create_polygon(
+            1, 1, 2, 1, 2, 2, 1, 2,
+            smooth=True,
+            splinesteps=24,
+            fill=colors["entry_bg"],
+            outline=colors["tab_btn_active"],
+        )
+        frame = tk.Frame(canvas, bg=colors["entry_bg"], padx=pad_x, pady=pad_y)
+        window_id = canvas.create_window((pad_x, pad_y), window=frame, anchor="nw", width=1)
+
+        meta: dict[str, object] = {
+            "canvas": canvas,
+            "rect_id": rect_id,
+            "window_id": window_id,
+            "frame": frame,
+            "radius": int(radius),
+            "pad_x": int(pad_x),
+            "pad_y": int(pad_y),
+        }
+        if not hasattr(self, "_intro_card_tiles"):
+            self._intro_card_tiles: list[dict[str, object]] = []
+        self._intro_card_tiles.append(meta)
+
+        canvas.bind("<Configure>", lambda _event, item=meta: self._layout_intro_card_tile(item), add="+")
+        self.after_idle(lambda item=meta: self._layout_intro_card_tile(item))
+        return canvas, frame
+
+    def _layout_intro_card_tile(self, meta: dict[str, object]) -> None:
+        canvas = meta.get("canvas")
+        frame = meta.get("frame")
+        if not isinstance(canvas, tk.Canvas) or not isinstance(frame, tk.Frame):
+            return
+        try:
+            if not canvas.winfo_exists():
+                return
+        except Exception:
+            return
+
+        pad_x = max(0, int(meta.get("pad_x", 14)))
+        pad_y = max(0, int(meta.get("pad_y", 12)))
+        radius = max(0, int(meta.get("radius", 14)))
+        width = max(80, int(canvas.winfo_width()))
+
+        window_id = meta.get("window_id")
+        if isinstance(window_id, int):
+            content_width = max(1, width - (pad_x * 2))
+            try:
+                canvas.coords(window_id, pad_x, pad_y)
+                canvas.itemconfigure(window_id, width=content_width)
+            except Exception:
+                return
+
+        try:
+            frame.update_idletasks()
+        except Exception:
+            pass
+        min_height = max(120, int(frame.winfo_reqheight()) + (pad_y * 2))
+        current_height = max(1, int(canvas.winfo_height()))
+        target_height = max(current_height, min_height)
+        if abs(target_height - current_height) > 1:
+            try:
+                canvas.configure(height=target_height)
+            except Exception:
+                return
+        height = max(target_height, max(1, int(canvas.winfo_height())))
+
+        points = self._rounded_rect_points(1, 1, max(2, width - 1), max(2, height - 1), radius)
+        try:
+            canvas.coords(meta["rect_id"], *points)
+            canvas.itemconfigure(
+                meta["rect_id"],
+                fill=self._palette["entry_bg"],
+                outline=self._palette["tab_btn_active"],
+            )
+            canvas.configure(bg=self._palette["panel_bg"])
+            frame.configure(bg=self._palette["entry_bg"])
+        except Exception:
+            return
+
+    def _refresh_intro_card_tiles(self) -> None:
+        for meta in getattr(self, "_intro_card_tiles", []):
+            self._layout_intro_card_tile(meta)
+
     def _layout_intro_title_pill(self, meta: dict[str, object]) -> None:
         canvas = meta["canvas"]
         if not isinstance(canvas, tk.Canvas):
@@ -693,6 +787,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._header_title_font.configure(size=max(12, int(round(self._header_title_base_size * scale))))
         self._intro_card_title_font.configure(size=max(10, int(round(self._intro_card_title_base_size * scale))))
         self._intro_button_font.configure(size=max(9, int(round(self._intro_button_base_size * scale))))
+        self._refresh_intro_card_tiles()
         self._refresh_intro_title_pills()
         self._refresh_intro_wraplength()
         self._refresh_roadmap_label_wraplength()
@@ -839,6 +934,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._intro_card_frames: list[tk.Frame] = []
         self._intro_card_header_frames: list[tk.Frame] = []
+        self._intro_card_tiles: list[dict[str, object]] = []
         self._intro_title_pills: list[dict[str, object]] = []
         self._intro_desc_labels: list[tk.Label] = []
 
@@ -895,16 +991,14 @@ class BumbleBoxV2GUI(tk.Tk):
         for idx, (key, label, desc) in enumerate(workflows):
             row = idx // 2
             col = idx % 2
-            card = tk.Frame(
+            card_canvas, card = self._create_intro_card_tile(
                 self._intro_cards_frame,
-                bg=colors["entry_bg"],
-                highlightthickness=1,
-                highlightbackground=colors["tab_btn_active"],
-                padx=14,
-                pady=12,
+                radius=14,
+                pad_x=14,
+                pad_y=12,
             )
             self._intro_card_frames.append(card)
-            card.grid(row=row, column=col, sticky="nsew", padx=7, pady=7)
+            card_canvas.grid(row=row, column=col, sticky="nsew", padx=7, pady=7)
 
             header = tk.Frame(card, bg=colors["entry_bg"])
             self._intro_card_header_frames.append(header)
@@ -1012,6 +1106,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._intro_theme_hint_label.pack(side=tk.LEFT, padx=(8, 0))
 
         self._sync_theme_knob_position()
+        self._refresh_intro_card_tiles()
         self._refresh_intro_wraplength()
 
     def _refresh_intro_wraplength(self) -> None:
