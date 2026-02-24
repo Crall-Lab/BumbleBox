@@ -44,20 +44,21 @@ def _findmnt_target(path: Path) -> Optional[tuple[str, str]]:
     return parts[0], parts[1]
 
 
-def _latest_mp4(data_root: Path) -> Optional[Path]:
+def _latest_recording_video(data_root: Path) -> Optional[Path]:
     if not data_root.exists():
         return None
 
     newest_path: Optional[Path] = None
     newest_mtime = -1.0
-    for path in data_root.rglob("*.mp4"):
-        try:
-            mtime = path.stat().st_mtime
-        except Exception:
-            continue
-        if mtime > newest_mtime:
-            newest_mtime = mtime
-            newest_path = path
+    for suffix in ("*.mp4", "*.mjpeg"):
+        for path in data_root.rglob(suffix):
+            try:
+                mtime = path.stat().st_mtime
+            except Exception:
+                continue
+            if mtime > newest_mtime:
+                newest_mtime = mtime
+                newest_path = path
     return newest_path
 
 
@@ -144,20 +145,24 @@ def _recording_freshness_alert(config: Dict[str, Any]) -> RuntimeAlert:
     latest_recorded_video = _latest_recorded_video_from_run_history(data_root)
     used_fallback_scan = False
     if latest_recorded_video is None:
-        latest_recorded_video = _latest_mp4(data_root)
+        latest_recorded_video = _latest_recording_video(data_root)
         used_fallback_scan = latest_recorded_video is not None
 
     if latest_recorded_video is None:
         return RuntimeAlert(
             "WARN",
             "Recording freshness",
-            f"No MP4 files found under {data_root} while scheduling is enabled.",
+            f"No recording videos (.mp4 or .mjpeg) found under {data_root} while scheduling is enabled.",
         )
 
     try:
         age_minutes = (time.time() - latest_recorded_video.stat().st_mtime) / 60.0
     except Exception as exc:
-        return RuntimeAlert("WARN", "Recording freshness", f"Could not stat latest MP4 ({latest_recorded_video}): {exc}")
+        return RuntimeAlert(
+            "WARN",
+            "Recording freshness",
+            f"Could not stat latest recording video ({latest_recorded_video}): {exc}",
+        )
 
     capture = config.get("capture", {})
     if not isinstance(capture, dict):
@@ -172,7 +177,7 @@ def _recording_freshness_alert(config: Dict[str, Any]) -> RuntimeAlert:
             "WARN",
             "Recording freshness",
             (
-                f"Latest recording MP4 is {age_minutes:.1f} minutes old ({latest_recorded_video.name}){source_note}, "
+                f"Latest recording video is {age_minutes:.1f} minutes old ({latest_recorded_video.name}){source_note}, "
                 f"which exceeds expected gap {expected_gap:.1f} minutes. "
                 "Check camera, storage mount, and scheduler."
             ),
@@ -182,7 +187,7 @@ def _recording_freshness_alert(config: Dict[str, Any]) -> RuntimeAlert:
         "PASS",
         "Recording freshness",
         (
-            f"Latest recording MP4 age is {age_minutes:.1f} minutes "
+            f"Latest recording video age is {age_minutes:.1f} minutes "
             f"({latest_recorded_video.name}){source_note}, within expected schedule window."
         ),
     )

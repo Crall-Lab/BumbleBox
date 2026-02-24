@@ -248,6 +248,11 @@ class BumbleBoxV2GUI(tk.Tk):
             foreground=colors["text_light"],
         )
         style.configure(
+            "RoadmapCardMutedText.TLabel",
+            background=colors["entry_bg"],
+            foreground=colors["text_muted"],
+        )
+        style.configure(
             "RoadmapStateDone.TLabel",
             background=colors["entry_bg"],
             foreground="#63D47C",
@@ -259,6 +264,11 @@ class BumbleBoxV2GUI(tk.Tk):
         )
         style.configure(
             "RoadmapStateOptional.TLabel",
+            background=colors["entry_bg"],
+            foreground=colors["text_muted"],
+        )
+        style.configure(
+            "RoadmapStateDisabled.TLabel",
             background=colors["entry_bg"],
             foreground=colors["text_muted"],
         )
@@ -961,12 +971,12 @@ class BumbleBoxV2GUI(tk.Tk):
         elif "mp4" in lower or "mjpeg" in lower:
             where = "BumbleBox Setup -> Config Editor"
             steps = [
-                "Find 'MP4 codec' in camera settings.",
-                "Keep an MP4 codec selected.",
+                "Find 'Codec' in camera settings.",
+                "Choose MP4 when MP4 framerate reporting is required.",
                 "Find 'FPS report each recording' in runtime settings and keep it enabled.",
                 "Save and validate config.",
             ]
-            done_check = "MP4 and FPS reporting settings are saved."
+            done_check = "Codec and FPS reporting settings are saved."
         elif "fps" in lower:
             where = "BumbleBox Setup -> FPS Report"
             steps = [
@@ -1022,6 +1032,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "TODO": "Status: not completed yet.",
             "OPTIONAL_DONE": "Status: completed optional step.",
             "OPTIONAL_TODO": "Status: optional step not completed yet.",
+            "DISABLED": "Status: currently disabled for this codec/config choice.",
             "OPTIONAL": "Status: optional step.",
             "INFO": "Status: optional informational step.",
         }.get(state.upper(), f"Status: {state}")
@@ -1126,20 +1137,24 @@ class BumbleBoxV2GUI(tk.Tk):
 
             is_optional = normalized_state.startswith("OPTIONAL") or normalized_state == "INFO"
             is_done = _is_done_state(normalized_state)
+            is_disabled = normalized_state == "DISABLED"
             if is_done:
                 state_label = "☑ DONE"
                 state_style = "RoadmapStateDone.TLabel" if not is_optional else "RoadmapStateOptionalDone.TLabel"
+            elif is_disabled:
+                state_label = "—"
+                state_style = "RoadmapStateDisabled.TLabel"
             else:
                 state_label = "☐ TO DO"
                 state_style = "RoadmapStateTodo.TLabel" if not is_optional else "RoadmapStateOptionalTodo.TLabel"
             ttk.Label(state_block, text=state_label, style=state_style).pack(anchor=tk.W)
             if is_optional:
-                ttk.Label(state_block, text="[optional]", style="RoadmapStateOptional.TLabel").pack(anchor=tk.W)
+                ttk.Label(state_block, text="optional", style="RoadmapStateOptional.TLabel").pack(anchor=tk.W)
 
             text_label = ttk.Label(
                 row,
                 text=text,
-                style="RoadmapCardText.TLabel",
+                style=("RoadmapCardMutedText.TLabel" if is_disabled else "RoadmapCardText.TLabel"),
                 justify=tk.LEFT,
                 wraplength=self._roadmap_wraplength(),
             )
@@ -1156,8 +1171,9 @@ class BumbleBoxV2GUI(tk.Tk):
         done_count = sum(1 for state, _text in indexed_items if _is_done_state(state))
         optional_count = sum(1 for state, _text in indexed_items if state.startswith("OPTIONAL") or state == "INFO")
         actionable_remaining = sum(1 for state, _text in indexed_items if state == "TODO")
+        disabled_count = sum(1 for state, _text in indexed_items if state == "DISABLED")
         self.roadmap_summary_var.set(
-            f"Completed: {done_count}/{total}   Remaining actionable: {actionable_remaining}   Optional: {optional_count}"
+            f"Completed: {done_count}/{total}   Remaining actionable: {actionable_remaining}   Optional: {optional_count}   Disabled: {disabled_count}"
         )
         current_page = self._roadmap_page + 1
         self.roadmap_page_var.set(f"Set {current_page}/{self._roadmap_page_count}")
@@ -1240,67 +1256,113 @@ class BumbleBoxV2GUI(tk.Tk):
 
     def _render_config_fields(self) -> None:
         specs = [
-            ("Colony ID", "system.colony_id", str, None),
-            ("Data root", "system.data_root", str, None),
-            ("Pi model", "system.pi_model", str, ["auto", "pi4", "pi5"]),
-            ("Camera model", "camera.model", str, ["auto", "hq", "hq_noir", "module3", "module3_wide", "module3_standard", "module3_noir"]),
-            ("Width (px)", "camera.width", int, None),
-            ("Height (px)", "camera.height", int, None),
-            ("FPS target", "camera.fps_target", float, None),
-            ("Shutter (us)", "camera.shutter_us", int, None),
-            ("Preview window", "camera.preview_window", str, ["QTGL", "QT", "DRM"]),
-            ("MP4 codec", "camera.mp4_codec", str, None),
-            ("Tuning file", "camera.tuning_file", str, None),
-            ("Pipeline mode", "pipeline.mode", str, ["record_only", "track_only", "record_and_track", "mixed_schedule"]),
-            ("Tracking source", "pipeline.tracking_source", str, ["ram", "video"]),
-            ("Deferred tracking", "pipeline.defer_tracking_until_after_recording", bool, None),
-            ("Parallel tracking", "pipeline.parallel_tracking", bool, None),
-            ("Behavior metrics", "pipeline.calculate_behavior_metrics", bool, None),
-            ("Recording seconds", "capture.recording_seconds", int, None),
-            ("Record interval (min)", "capture.record_interval_minutes", int, None),
-            ("Track interval (min)", "capture.track_interval_minutes", int, None),
-            ("Scheduler backend", "scheduling.backend", str, ["systemd", "cron"]),
-            ("Scheduler scope", "scheduling.scope", str, ["system", "user"]),
-            ("Scheduling enabled", "scheduling.enabled", bool, None),
-            ("Unit prefix", "scheduling.unit_prefix", str, None),
-            ("Service user", "scheduling.service_user", str, None),
-            ("Fleet role", "fleet.role", str, ["standalone", "queen", "worker"]),
-            ("Queen local pipeline", "fleet.queen_local_pipeline_enabled", bool, None),
-            ("Queen media enabled", "fleet.queen_media_schedule.enabled", bool, None),
-            ("Queen pull interval (min)", "fleet.queen_media_schedule.pull_interval_minutes", int, None),
-            ("Queen track interval (min)", "fleet.queen_media_schedule.track_interval_minutes", int, None),
-            ("Queen media max videos", "fleet.queen_media_schedule.max_videos_total", int, None),
-            ("Queen media cooldown (min)", "fleet.queen_media_schedule.cooldown_minutes", int, None),
-            ("Use mock camera", "runtime.use_mock_camera", bool, None),
-            ("Save frame timestamps", "runtime.save_frame_timestamps", bool, None),
-            ("FPS report each recording", "runtime.fps_report_on_each_recording", bool, None),
+            ("Colony ID", "system.colony_id", str, None, None),
+            ("Data root", "system.data_root", str, None, None),
+            ("Pi model", "system.pi_model", str, ["auto", "pi4", "pi5"], None),
+            (
+                "Camera model",
+                "camera.model",
+                str,
+                ["auto", "hq", "hq_noir", "module3", "module3_wide", "module3_standard", "module3_noir"],
+                None,
+            ),
+            ("Codec", "camera.codec", str, ["mp4", "mjpeg"], None),
+            ("Width (px)", "camera.width", int, None, None),
+            ("Height (px)", "camera.height", int, None, None),
+            ("FPS target", "camera.fps_target", float, None, None),
+            ("Shutter (us)", "camera.shutter_us", int, None, None),
+            ("Preview window", "camera.preview_window", str, ["QTGL", "QT", "DRM"], None),
+            ("Tuning file", "camera.tuning_file", str, None, None),
+            ("Pipeline mode", "pipeline.mode", str, ["record_only", "track_only", "record_and_track", "mixed_schedule"], None),
+            ("Tracking source", "pipeline.tracking_source", str, ["ram", "video"], None),
+            ("Deferred tracking", "pipeline.defer_tracking_until_after_recording", bool, None, None),
+            ("Parallel tracking", "pipeline.parallel_tracking", bool, None, None),
+            ("Behavior metrics", "pipeline.calculate_behavior_metrics", bool, None, None),
+            ("Recording seconds", "capture.recording_seconds", int, None, None),
+            ("Record interval (min)", "capture.record_interval_minutes", int, None, None),
+            ("Track interval (min)", "capture.track_interval_minutes", int, None, None),
+            ("Scheduler backend", "scheduling.backend", str, ["systemd", "cron"], None),
+            ("Scheduler scope", "scheduling.scope", str, ["system", "user"], None),
+            ("Scheduling enabled", "scheduling.enabled", bool, None, None),
+            ("Unit prefix", "scheduling.unit_prefix", str, None, None),
+            ("Service user", "scheduling.service_user", str, None, None),
+            ("Fleet role", "fleet.role", str, ["standalone", "queen", "worker"], None),
+            ("Queen local pipeline", "fleet.queen_local_pipeline_enabled", bool, None, {"queen"}),
+            ("Queen media enabled", "fleet.queen_media_schedule.enabled", bool, None, {"queen"}),
+            ("Queen pull interval (min)", "fleet.queen_media_schedule.pull_interval_minutes", int, None, {"queen"}),
+            ("Queen track interval (min)", "fleet.queen_media_schedule.track_interval_minutes", int, None, {"queen"}),
+            ("Queen media max videos", "fleet.queen_media_schedule.max_videos_total", int, None, {"queen"}),
+            ("Queen media cooldown (min)", "fleet.queen_media_schedule.cooldown_minutes", int, None, {"queen"}),
+            ("Use mock camera", "runtime.use_mock_camera", bool, None, None),
+            ("Save frame timestamps", "runtime.save_frame_timestamps", bool, None, None),
+            ("FPS report each recording", "runtime.fps_report_on_each_recording", bool, None, None),
         ]
 
-        for row, (label, key, value_type, choices) in enumerate(specs):
-            ttk.Label(self.config_form_frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+        self._config_field_rows: dict[str, ttk.Frame] = {}
+        self._config_field_roles: dict[str, set[str] | None] = {}
+
+        for row, (label, key, value_type, choices, roles) in enumerate(specs):
+            row_frame = ttk.Frame(self.config_form_frame)
+            row_frame.grid(row=row, column=0, sticky="ew", pady=2)
+            row_frame.columnconfigure(1, weight=1)
+            ttk.Label(row_frame, text=label).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=1)
 
             if value_type is bool:
                 variable = tk.BooleanVar(value=False)
-                widget = ttk.Checkbutton(self.config_form_frame, variable=variable)
-                widget.grid(row=row, column=1, sticky="w", pady=3)
+                widget = ttk.Checkbutton(row_frame, variable=variable)
+                widget.grid(row=0, column=1, sticky="w", pady=1)
             elif choices:
                 variable = tk.StringVar(value=str(choices[0]))
                 widget = ttk.Combobox(
-                    self.config_form_frame,
+                    row_frame,
                     textvariable=variable,
                     values=choices,
                     state="readonly",
                     width=28,
                 )
-                widget.grid(row=row, column=1, sticky="ew", pady=3)
+                widget.grid(row=0, column=1, sticky="ew", pady=1)
             else:
                 variable = tk.StringVar(value="")
-                widget = ttk.Entry(self.config_form_frame, textvariable=variable, width=34)
-                widget.grid(row=row, column=1, sticky="ew", pady=3)
+                widget = ttk.Entry(row_frame, textvariable=variable, width=34)
+                widget.grid(row=0, column=1, sticky="ew", pady=1)
 
             self.config_fields[key] = (variable, value_type)
+            self._config_field_rows[key] = row_frame
+            self._config_field_roles[key] = set(roles) if roles else None
 
-        self.config_form_frame.columnconfigure(1, weight=1)
+        self.config_form_frame.columnconfigure(0, weight=1)
+
+        role_binding = getattr(self, "_config_role_trace_bound", False)
+        role_field = self.config_fields.get("fleet.role")
+        if (not role_binding) and role_field is not None:
+            role_var = role_field[0]
+            try:
+                role_var.trace_add("write", lambda *_args: self._refresh_config_field_visibility())
+                self._config_role_trace_bound = True
+            except Exception:
+                self._config_role_trace_bound = False
+        self._refresh_config_field_visibility()
+
+    def _refresh_config_field_visibility(self) -> None:
+        rows = getattr(self, "_config_field_rows", {})
+        if not rows:
+            return
+        roles_cfg = getattr(self, "_config_field_roles", {})
+        fleet_role = "standalone"
+        role_field = self.config_fields.get("fleet.role")
+        if role_field is not None:
+            try:
+                fleet_role = str(role_field[0].get()).strip().lower() or "standalone"
+            except Exception:
+                fleet_role = "standalone"
+
+        for key, row in rows.items():
+            allowed_roles = roles_cfg.get(key)
+            should_show = allowed_roles is None or fleet_role in allowed_roles
+            if should_show:
+                row.grid()
+            else:
+                row.grid_remove()
 
     def _build_fps_tab(self) -> None:
         top = ttk.Frame(self.fps_tab)
@@ -2726,6 +2788,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     variable.set(bool(raw))
                 else:
                     variable.set("" if raw is None else str(raw))
+            self._refresh_config_field_visibility()
             self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(tk.END, "Loaded configuration into editor.")
@@ -2745,6 +2808,8 @@ class BumbleBoxV2GUI(tk.Tk):
                 text = str(variable.get()).strip()
                 if key == "camera.tuning_file" and text == "":
                     parsed = None
+                elif key == "camera.codec":
+                    parsed = text.lower() or "mp4"
                 else:
                     parsed = text
             self._set_nested(config, key, parsed)

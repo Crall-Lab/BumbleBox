@@ -11,6 +11,7 @@ camera:
   height: 3040
   fps_target: 5.0
   shutter_us: 2500
+  codec: "mp4"
   infrared: true
   noise_reduction: "Auto"
   preview_window: "QTGL"

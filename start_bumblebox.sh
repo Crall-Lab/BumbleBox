@@ -82,7 +82,7 @@ Run from command line:
   ${REPO_ROOT}/bbx gui
   ${REPO_ROOT}/bbx roadmap
 
-First-time bring-up checklist:
+First-time setup checklist:
   ${REPO_ROOT}/bbx init
   ${REPO_ROOT}/bbx doctor
   ${REPO_ROOT}/bbx camera-preview --seconds 20

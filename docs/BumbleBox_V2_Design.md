@@ -23,7 +23,7 @@ Backend core (`/Users/aec/Desktop/BumbleBox/bumblebox_v2`):
 
 - `config.py`: config schema, defaults, validation, and load/save.
 - `doctor.py`: hardware and dependency checks.
-- `camera_setup.py`: live camera preview and live ArUco tracking test for setup/bring-up.
+- `camera_setup.py`: live camera preview and live ArUco tracking test for setup.
 - `fps_report.py`: MP4 framerate quality report generation.
 - `fps_sweep.py`: increasing-FPS probe with recording-capacity and tracking-time estimates.
 - `calibration.py`: pixel-distance calibration (manual and ArUco workflows).
@@ -225,7 +225,7 @@ The V2 "next phase" runtime now includes:
    - `bbx gui-install-shortcut`.
    - Creates Desktop/app-menu `.desktop` launchers, icon, and a launcher script that prefers `.venv` Python.
 
-12. Camera bring-up integration:
+12. Camera setup integration:
    - `bbx camera-preview` command.
    - `bbx camera-test-tracking` command.
    - Tkinter `Camera Setup` tab with a guided "Preview then Live Tracking Test" workflow.

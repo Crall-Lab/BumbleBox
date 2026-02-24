@@ -78,7 +78,7 @@ sudo apt install python3-pyqt5 labelme
 
 - Pi 4/5 compatibility checks (`doctor`)
 - camera stack checks for HQ/Module3 workflows
-- camera bring-up tools for focus/framing and live tag-detection validation (`camera-preview`, `camera-test-tracking`)
+- camera setup tools for focus/framing and live tag-detection validation (`camera-preview`, `camera-test-tracking`)
 - flexible mode model (`record_only`, `track_only`, `record_and_track`, `mixed_schedule`)
 - MP4 framerate quality reporting (`fps-report`)
 - FPS sweep capacity test with target-vs-real FPS and recording/tracking duration estimates (`fps-sweep`)
@@ -108,7 +108,7 @@ sudo apt install python3-pyqt5 labelme
   - `Setup order`: one-click navigation strip for `Doctor -> Camera Setup -> Calibration -> FPS Report -> Schedule Check -> Run & Schedule`.
 - `Doctor`: dependency and hardware checks.
   - includes Storage Setup panel (mount-point edit/save, status refresh, and auto-mount setup button).
-- `Camera Setup`: run preview and live tracking test as camera bring-up steps.
+- `Camera Setup`: run preview and live tracking test as camera setup steps.
 - `Roadmap`: next-step checklist based on current config.
 - `Config Editor`: edit core settings, validate, and save.
 - `FPS Report`: includes single-video MP4 FPS analysis plus FPS sweep capacity testing.

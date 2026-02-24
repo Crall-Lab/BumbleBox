@@ -35,6 +35,7 @@ VALID_CAMERA_MODELS = {
     "module3_noir",
 }
 VALID_PREVIEW_WINDOWS = {"QTGL", "QT", "DRM"}
+VALID_CAMERA_CODECS = {"mp4", "mjpeg"}
 
 
 class ConfigError(ValueError):
@@ -238,6 +239,14 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ConfigError(
             f"camera.preview_window must be one of {sorted(VALID_PREVIEW_WINDOWS)}, got: {preview_window}"
         )
+    camera_codec = str(config["camera"].get("codec", "mp4")).strip().lower()
+    if camera_codec not in VALID_CAMERA_CODECS:
+        raise ConfigError(
+            f"camera.codec must be one of {sorted(VALID_CAMERA_CODECS)}, got: {camera_codec}"
+        )
+    mp4_codec = str(config["camera"].get("mp4_codec", "mp4v")).strip()
+    if not mp4_codec:
+        raise ConfigError("camera.mp4_codec must be a non-empty string")
 
     ram_override = config["system"].get("ram_gb_override")
     if ram_override not in (None, "", 0):

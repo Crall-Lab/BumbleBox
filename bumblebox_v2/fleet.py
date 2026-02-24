@@ -802,7 +802,7 @@ def _normalize_box_preset(box_preset: Any) -> Optional[str]:
     return str(box_preset)
 
 
-def _list_remote_latest_mp4s(
+def _list_remote_latest_recordings(
     worker: FleetWorker,
     identity_file: Path,
     timeout_seconds: int,
@@ -810,7 +810,7 @@ def _list_remote_latest_mp4s(
 ) -> list[tuple[float, str]]:
     data_root_q = shlex.quote(worker.data_root)
     cmd = (
-        f"find {data_root_q} -type f -name '*.mp4' -printf '%T@ %p\\n' 2>/dev/null "
+        f"find {data_root_q} -type f \\( -name '*.mp4' -o -name '*.mjpeg' \\) -printf '%T@ %p\\n' 2>/dev/null "
         f"| sort -nr | head -n {int(max(1, limit))} || true"
     )
     proc = _ssh_run(
@@ -897,8 +897,29 @@ def _worker_archive_dir(output_root: Path, worker: FleetWorker) -> Path:
     return _worker_output_root(output_root, worker) / datetime.now().strftime("%Y-%m-%d")
 
 
-def _latest_video_path(output_root: Path, worker: FleetWorker) -> Path:
-    return _worker_latest_dir(output_root, worker) / "latest_video.mp4"
+def _latest_video_path(output_root: Path, worker: FleetWorker, preferred_suffix: Optional[str] = None) -> Path:
+    suffix = str(preferred_suffix or ".mp4").strip().lower()
+    if not suffix.startswith("."):
+        suffix = f".{suffix}"
+    if suffix not in {".mp4", ".mjpeg"}:
+        suffix = ".mp4"
+    return _worker_latest_dir(output_root, worker) / f"latest_video{suffix}"
+
+
+def _resolve_latest_video_path(output_root: Path, worker: FleetWorker, latest_meta: Optional[dict[str, Any]] = None) -> Path:
+    if latest_meta is not None:
+        from_meta = str(latest_meta.get("latest_video_path", "")).strip()
+        if from_meta:
+            candidate = Path(from_meta).expanduser()
+            if candidate.exists():
+                return candidate
+    candidate_mp4 = _latest_video_path(output_root, worker, ".mp4")
+    if candidate_mp4.exists():
+        return candidate_mp4
+    candidate_mjpeg = _latest_video_path(output_root, worker, ".mjpeg")
+    if candidate_mjpeg.exists():
+        return candidate_mjpeg
+    return candidate_mp4
 
 
 def _latest_tracked_video_path(output_root: Path, worker: FleetWorker) -> Path:
@@ -1358,9 +1379,9 @@ def run_queen_pull_latest_videos(
             break
 
         report.videos_considered += 1
-        latest_video = _latest_video_path(output_root_path, worker)
         latest_meta_path = _latest_video_meta_path(output_root_path, worker)
         old_meta = _read_json_if_exists(latest_meta_path)
+        latest_video = _resolve_latest_video_path(output_root_path, worker, old_meta)
         old_pulled_at = str(old_meta.get("pulled_at", "")).strip() or None
         latest_tracked = _latest_tracked_video_path(output_root_path, worker)
         latest_tracked_meta_path = _latest_tracked_meta_path(output_root_path, worker)
@@ -1368,7 +1389,7 @@ def run_queen_pull_latest_videos(
         latest_tracked_at = str(latest_tracked_meta.get("tracked_at", "")).strip() or None
 
         try:
-            candidates = _list_remote_latest_mp4s(
+            candidates = _list_remote_latest_recordings(
                 worker=worker,
                 identity_file=identity,
                 timeout_seconds=timeout,
@@ -1408,7 +1429,7 @@ def run_queen_pull_latest_videos(
                     latest_tracked_video_path=str(latest_tracked) if latest_tracked.exists() else None,
                     latest_tracked_at=latest_tracked_at,
                     status="skipped_no_video",
-                    note=f"No MP4 files found under {worker.data_root}.",
+                    note=f"No recording videos (.mp4/.mjpeg) found under {worker.data_root}.",
                 )
             )
             report.videos_skipped += 1
@@ -1417,16 +1438,19 @@ def run_queen_pull_latest_videos(
         remote_epoch, remote_video = candidates[0]
         old_remote = str(old_meta.get("remote_video_path", "")).strip()
 
-        if old_remote == remote_video and latest_video.exists():
+        remote_suffix = Path(remote_video).suffix
+        latest_video_target = _latest_video_path(output_root_path, worker, preferred_suffix=remote_suffix)
+
+        if old_remote == remote_video and latest_video_target.exists():
             report.items.append(
                 QueenTrackItem(
                     worker_name=worker.name,
                     worker_host=worker.host,
                     remote_video_path=remote_video,
-                    local_video_path=str(latest_video),
+                    local_video_path=str(latest_video_target),
                     raw_csv_path=None,
                     tracked_video_path=None,
-                    latest_video_path=str(latest_video),
+                    latest_video_path=str(latest_video_target),
                     latest_video_pulled_at=old_pulled_at,
                     latest_tracked_video_path=str(latest_tracked) if latest_tracked.exists() else None,
                     latest_tracked_at=latest_tracked_at,
@@ -1471,8 +1495,17 @@ def run_queen_pull_latest_videos(
                 remote_path=remote_video,
                 local_path=archive_path,
             )
-            latest_video.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(archive_path, latest_video)
+            latest_video_target.parent.mkdir(parents=True, exist_ok=True)
+            for stale in (
+                _latest_video_path(output_root_path, worker, ".mp4"),
+                _latest_video_path(output_root_path, worker, ".mjpeg"),
+            ):
+                if stale != latest_video_target and stale.exists():
+                    try:
+                        stale.unlink()
+                    except Exception:
+                        pass
+            shutil.copy2(archive_path, latest_video_target)
 
             pulled_at = _now_iso()
             latest_meta = {
@@ -1482,7 +1515,7 @@ def run_queen_pull_latest_videos(
                 "remote_video_epoch": remote_epoch,
                 "pulled_at": pulled_at,
                 "local_archive_path": str(archive_path),
-                "latest_video_path": str(latest_video),
+                "latest_video_path": str(latest_video_target),
             }
             _write_json(latest_meta_path, latest_meta)
 
@@ -1494,12 +1527,12 @@ def run_queen_pull_latest_videos(
                     local_video_path=str(archive_path),
                     raw_csv_path=None,
                     tracked_video_path=None,
-                    latest_video_path=str(latest_video),
+                    latest_video_path=str(latest_video_target),
                     latest_video_pulled_at=pulled_at,
                     latest_tracked_video_path=str(latest_tracked) if latest_tracked.exists() else None,
                     latest_tracked_at=latest_tracked_at,
                     status="pulled",
-                    note="Pulled latest worker video and updated latest_video.mp4 pointer.",
+                    note="Pulled latest worker video and updated latest_video pointer.",
                 )
             )
             report.videos_processed += 1
@@ -1641,9 +1674,9 @@ def run_queen_track_latest_videos(
             break
 
         report.videos_considered += 1
-        latest_video = _latest_video_path(output_root_path, worker)
         latest_video_meta_path = _latest_video_meta_path(output_root_path, worker)
         latest_video_meta = _read_json_if_exists(latest_video_meta_path)
+        latest_video = _resolve_latest_video_path(output_root_path, worker, latest_video_meta)
         latest_video_pulled_at = str(latest_video_meta.get("pulled_at", "")).strip() or None
         source_remote_video = str(latest_video_meta.get("remote_video_path", "")).strip() or ""
         latest_tracked = _latest_tracked_video_path(output_root_path, worker)
@@ -1936,9 +1969,9 @@ def run_queen_latest_status(
     offline_count = 0
 
     for worker in workers:
-        latest_video = _latest_video_path(output_root_path, worker)
-        latest_tracked = _latest_tracked_video_path(output_root_path, worker)
         latest_video_meta = _read_json_if_exists(_latest_video_meta_path(output_root_path, worker))
+        latest_video = _resolve_latest_video_path(output_root_path, worker, latest_video_meta)
+        latest_tracked = _latest_tracked_video_path(output_root_path, worker)
         latest_tracked_meta = _read_json_if_exists(_latest_tracked_meta_path(output_root_path, worker))
 
         latest_video_pulled_at = str(latest_video_meta.get("pulled_at", "")).strip() or None

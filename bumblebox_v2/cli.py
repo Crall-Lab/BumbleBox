@@ -520,6 +520,9 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
     if args.mock_camera:
         config.setdefault("runtime", {})
         config["runtime"]["use_mock_camera"] = True
+    if args.codec:
+        config.setdefault("camera", {})
+        config["camera"]["codec"] = str(args.codec).strip().lower()
 
     try:
         summary = run_once(config=config, mode_override=args.mode)
@@ -1169,7 +1172,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_config_arg(roadmap_parser)
     roadmap_parser.set_defaults(func=_cmd_roadmap)
 
-    fps_parser = subparsers.add_parser("fps-report", help="Build FPS quality report for an MP4 recording.")
+    fps_parser = subparsers.add_parser("fps-report", help="Build FPS quality report for a recorded video.")
     fps_parser.add_argument("--video", required=True, help="Path to recorded video (.mp4/.mjpeg).")
     fps_parser.add_argument("--timestamps", help="Optional path to frame timestamp sidecar file.")
     fps_parser.add_argument("--recording-seconds", type=float, help="Expected recording duration in seconds.")
@@ -1231,6 +1234,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--mock-camera",
         action="store_true",
         help="Use synthetic frames instead of picamera2 capture (for testing).",
+    )
+    run_once_parser.add_argument(
+        "--codec",
+        choices=["mp4", "mjpeg"],
+        help="Optional one-run recording codec override (default from camera.codec in config).",
     )
     run_once_parser.set_defaults(func=_cmd_run_once)
 
@@ -1499,7 +1507,7 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument(
         "--skip-video",
         action="store_true",
-        help="Exclude session MP4 from bundle (smaller transfer size).",
+        help="Exclude session recording video (.mp4/.mjpeg) from bundle (smaller transfer size).",
     )
     export_parser.add_argument(
         "--core-only",

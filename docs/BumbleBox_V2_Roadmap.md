@@ -32,7 +32,7 @@ If storage is not mounted where BumbleBox expects it, run:
 python3 /Users/aec/Desktop/BumbleBox/bbx.py storage setup --apply-config
 ```
 
-Then run camera bring-up checks:
+Then run camera setup checks:
 
 ```bash
 python3 /Users/aec/Desktop/BumbleBox/bbx.py camera-preview --seconds 20

@@ -23,7 +23,9 @@ class RunSummary:
     tracking_elapsed_seconds: Optional[float]
     tracking_frames_processed: int
     tracking_processing_fps: Optional[float]
+    video_codec: Optional[str]
     video_path: Optional[str]
+    recording_preview_png_path: Optional[str]
     timestamp_path: Optional[str]
     raw_csv_path: Optional[str]
     noid_csv_path: Optional[str]
@@ -60,6 +62,16 @@ def _normalize_box_preset(box_preset: Any) -> Optional[str]:
     if text in {"none", "null", ""}:
         return None
     return str(box_preset)
+
+
+def _normalize_recording_codec(config: Dict[str, Any]) -> str:
+    camera = config.get("camera", {})
+    if not isinstance(camera, dict):
+        return "mp4"
+    raw = str(camera.get("codec", "mp4")).strip().lower()
+    if raw in {"mjpeg", "mjpg"}:
+        return "mjpeg"
+    return "mp4"
 
 
 def _make_session_paths(config: Dict[str, Any]) -> Tuple[str, Path]:
@@ -198,22 +210,28 @@ def capture_probe(
     return frame_count, float(actual_fps), float(elapsed)
 
 
-def _write_mp4(
+def _write_recording_video(
     frames: List[Any],
     session_dir: Path,
     session_name: str,
     fps: float,
     width: int,
     height: int,
-    codec: str,
+    recording_codec: str,
+    mp4_codec: str,
 ) -> Path:
     try:
         import cv2
     except ImportError as exc:  # pragma: no cover - dependency/runtime
-        raise RuntimeError("OpenCV is required to write MP4 output.") from exc
+        raise RuntimeError("OpenCV is required to write recording output.") from exc
 
-    output = session_dir / f"{session_name}.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*str(codec)[:4])
+    codec_name = str(recording_codec).strip().lower()
+    if codec_name == "mjpeg":
+        output = session_dir / f"{session_name}.mjpeg"
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    else:
+        output = session_dir / f"{session_name}.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*str(mp4_codec or "mp4v")[:4])
     writer = cv2.VideoWriter(str(output), fourcc, fps, (width, height))
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open VideoWriter for {output}")
@@ -224,6 +242,28 @@ def _write_mp4(
 
     writer.release()
     return output
+
+
+def _write_midpoint_preview_png(
+    frames: List[Any],
+    session_dir: Path,
+    session_name: str,
+) -> Optional[Path]:
+    if not frames:
+        return None
+    try:
+        import cv2
+    except ImportError:
+        return None
+
+    mid_idx = max(0, min(len(frames) - 1, len(frames) // 2))
+    frame = frames[mid_idx]
+    bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+    out = session_dir / f"{session_name}_midframe.png"
+    ok = cv2.imwrite(str(out), bgr)
+    if not ok:
+        return None
+    return out
 
 
 def _track_from_ram(
@@ -363,6 +403,8 @@ def _run_fps_report_if_needed(
 ) -> Optional[Path]:
     if video_path is None:
         return None
+    if video_path.suffix.lower() != ".mp4":
+        return None
     if not bool(config["runtime"].get("fps_report_on_each_recording", False)):
         return None
 
@@ -411,7 +453,9 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     tracking_elapsed_seconds: Optional[float] = None
     tracking_frames_processed = 0
     tracking_processing_fps: Optional[float] = None
+    video_codec: Optional[str] = None
     video_path: Optional[Path] = None
+    recording_preview_png_path: Optional[Path] = None
     timestamp_path: Optional[Path] = None
     raw_csv: Optional[Path] = None
     noid_csv: Optional[Path] = None
@@ -430,17 +474,24 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
             timestamp_path = _write_timestamps(timestamps, session_dir, session_name)
 
         if should_record:
-            video_path = _write_mp4(
+            video_codec = _normalize_recording_codec(config)
+            video_path = _write_recording_video(
                 frames,
                 session_dir,
                 session_name,
                 fps=float(config["camera"]["fps_target"]),
                 width=int(config["camera"]["width"]),
                 height=int(config["camera"]["height"]),
-                codec=str(config["camera"].get("mp4_codec", "mp4v")),
+                recording_codec=video_codec,
+                mp4_codec=str(config["camera"].get("mp4_codec", "mp4v")),
             )
 
-            if bool(config["runtime"].get("save_mp4_sidecar_fps_txt", True)):
+            if video_codec == "mjpeg":
+                recording_preview_png_path = _write_midpoint_preview_png(frames, session_dir, session_name)
+                if recording_preview_png_path is None:
+                    warnings.append("Could not write MJPEG midpoint preview PNG.")
+
+            if video_codec == "mp4" and bool(config["runtime"].get("save_mp4_sidecar_fps_txt", True)):
                 sidecar = session_dir / f"{session_name}_actual_fps.txt"
                 sidecar.write_text(f"{actual_fps:.6f}\n")
 
@@ -505,7 +556,9 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         tracking_processing_fps=(
             round(tracking_processing_fps, 6) if tracking_processing_fps is not None else None
         ),
+        video_codec=video_codec,
         video_path=str(video_path) if video_path else None,
+        recording_preview_png_path=str(recording_preview_png_path) if recording_preview_png_path else None,
         timestamp_path=str(timestamp_path) if timestamp_path else None,
         raw_csv_path=str(raw_csv) if raw_csv else None,
         noid_csv_path=str(noid_csv) if noid_csv else None,
@@ -532,7 +585,9 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Tracking elapsed (s): {summary.tracking_elapsed_seconds if summary.tracking_elapsed_seconds is not None else 'n/a'}",
         f"Tracking frames processed: {summary.tracking_frames_processed}",
         f"Tracking processing FPS: {summary.tracking_processing_fps if summary.tracking_processing_fps is not None else 'n/a'}",
+        f"Recording codec: {summary.video_codec or 'n/a'}",
         f"Video: {summary.video_path or 'none'}",
+        f"MJPEG midpoint PNG: {summary.recording_preview_png_path or 'none'}",
         f"Timestamps: {summary.timestamp_path or 'none'}",
         f"Raw CSV: {summary.raw_csv_path or 'none'}",
         f"NoID CSV: {summary.noid_csv_path or 'none'}",

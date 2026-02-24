@@ -102,10 +102,14 @@ def _resolve_session_dir(summary_payload: dict[str, Any], summary_path: Path) ->
     return summary_path.parent.resolve()
 
 
-def _expected_artifacts(session_name: str, session_dir: Path) -> list[tuple[str, Path, bool]]:
-    return [
+def _expected_artifacts(
+    session_name: str,
+    session_dir: Path,
+    summary_payload: dict[str, Any],
+) -> list[tuple[str, Path, bool]]:
+    items: list[tuple[str, Path, bool]] = [
         ("run_config_snapshot_json", session_dir / f"{session_name}_config_snapshot.json", False),
-        ("video_mp4", session_dir / f"{session_name}.mp4", False),
+        ("recording_midframe_png", session_dir / f"{session_name}_midframe.png", False),
         ("frame_timestamps_csv", session_dir / f"{session_name}_frame_timestamps.csv", False),
         ("actual_fps_txt", session_dir / f"{session_name}_actual_fps.txt", False),
         ("tracking_raw_csv", session_dir / f"{session_name}_raw.csv", False),
@@ -113,6 +117,23 @@ def _expected_artifacts(session_name: str, session_dir: Path) -> list[tuple[str,
         ("tracking_cleaned_csv", session_dir / f"{session_name}_cleaned.csv", False),
         ("fps_report_json", session_dir / f"{session_name}_fps_report.json", False),
     ]
+
+    seen: set[Path] = set()
+    video_raw = str(summary_payload.get("video_path", "")).strip()
+    if video_raw:
+        candidate = Path(video_raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = (session_dir / candidate).resolve()
+        seen.add(candidate)
+        items.insert(1, ("video_mp4", candidate, False))
+
+    for fallback in (session_dir / f"{session_name}.mp4", session_dir / f"{session_name}.mjpeg"):
+        resolved = fallback.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        items.insert(1, ("video_mp4", fallback, False))
+    return items
 
 
 def _preferred_tracking_relpath(included: list[BundleArtifact]) -> Optional[str]:
@@ -218,7 +239,7 @@ def export_run_bundle(
                 }
             )
 
-    for kind, candidate, required in _expected_artifacts(session_name, session_dir):
+    for kind, candidate, required in _expected_artifacts(session_name, session_dir, summary_payload):
         if kind == "video_mp4" and not include_video:
             continue
         if candidate.exists() and candidate.is_file():
@@ -251,7 +272,7 @@ def export_run_bundle(
             resolved = path.resolve()
             if resolved in included_sources:
                 continue
-            if (path.name == f"{session_name}.mp4") and not include_video:
+            if (path.suffix.lower() in {".mp4", ".mjpeg"}) and not include_video:
                 continue
             copied = _copy_with_unique_name(path, artifacts_dir, path.name)
             included_sources.add(resolved)
