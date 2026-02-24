@@ -12,6 +12,7 @@ Options:
   --python <bin>            Python interpreter to use for main env (default: python3)
   --venv-dir <path>         Main BumbleBox venv path (default: <repo>/.venv)
   --system-site-packages    Create main env with system site packages visible
+  --no-system-site-packages Keep main env isolated from system site packages
   --skip-nest-label         Skip pip install of PyQt5 + labelme in main env
   --skip-picamera2          Skip pip install of picamera2 in main env
   --force-pip-nest-label    Force pip install for PyQt5 + labelme in main env (Pi defaults to skip)
@@ -32,6 +33,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="python3"
 VENV_DIR="${REPO_ROOT}/.venv"
 USE_SYSTEM_SITE_PACKAGES=0
+USER_SET_SYSTEM_SITE_PACKAGES=0
 INSTALL_NEST_LABEL=1
 INSTALL_PICAMERA2=1
 FORCE_PIP_NEST_LABEL=0
@@ -247,6 +249,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --system-site-packages)
       USE_SYSTEM_SITE_PACKAGES=1
+      USER_SET_SYSTEM_SITE_PACKAGES=1
+      shift
+      ;;
+    --no-system-site-packages)
+      USE_SYSTEM_SITE_PACKAGES=0
+      USER_SET_SYSTEM_SITE_PACKAGES=1
       shift
       ;;
     --skip-nest-label)
@@ -318,6 +326,10 @@ fi
 
 if PI_MODEL="$(detect_pi_model)"; then
   echo "[BumbleBox] Detected Raspberry Pi hardware: ${PI_MODEL}"
+  if [[ "$USER_SET_SYSTEM_SITE_PACKAGES" -eq 0 ]]; then
+    USE_SYSTEM_SITE_PACKAGES=1
+    echo "[BumbleBox] Pi mode: enabling --system-site-packages for main env (recommended for apt picamera2)."
+  fi
   if [[ "$INSTALL_NEST_LABEL" -eq 1 && "$FORCE_PIP_NEST_LABEL" -eq 0 ]]; then
     INSTALL_NEST_LABEL=0
     SKIPPED_PIP_NEST_LABEL_ON_PI=1

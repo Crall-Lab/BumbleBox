@@ -88,6 +88,53 @@ def _dependency_check(module_name: str, install_hint: str) -> CheckResult:
         )
 
 
+def _picamera2_check(detected_model: str | None) -> CheckResult:
+    try:
+        importlib.import_module("picamera2")
+        return CheckResult("Dependency: picamera2", "PASS", "Installed")
+    except Exception:
+        pass
+
+    is_pi = bool(detected_model and "raspberry pi" in detected_model.lower())
+    if not is_pi:
+        return CheckResult(
+            "Dependency: picamera2",
+            "FAIL",
+            "Missing (install with: pip3 install picamera2)",
+        )
+
+    apt_installed = False
+    dpkg = _run_command(["dpkg-query", "-W", "-f=${Status}", "python3-picamera2"])
+    if dpkg is not None and dpkg.returncode == 0:
+        text = f"{dpkg.stdout}\n{dpkg.stderr}".lower()
+        apt_installed = "install ok installed" in text
+
+    system_python_has_module = False
+    system_py = _run_command(["/usr/bin/python3", "-c", "import picamera2"])
+    if system_py is not None and system_py.returncode == 0:
+        system_python_has_module = True
+
+    if apt_installed or system_python_has_module:
+        return CheckResult(
+            "Dependency: picamera2",
+            "WARN",
+            (
+                "python3-picamera2 appears installed for system Python, but not in the current interpreter. "
+                "You are likely using a venv without system-site-packages. "
+                "Recreate with: bash scripts/setup_venv.sh --system-site-packages"
+            ),
+        )
+
+    return CheckResult(
+        "Dependency: picamera2",
+        "FAIL",
+        (
+            "Missing (install with: sudo apt install python3-picamera2 on Pi, or pip3 install picamera2). "
+            "If using BumbleBox venv, prefer setup with --system-site-packages on Pi."
+        ),
+    )
+
+
 def _opencv_aruco_check() -> CheckResult:
     try:
         import cv2
@@ -244,12 +291,7 @@ def run_doctor(config: Dict[str, Any]) -> List[CheckResult]:
 
     results.append(_dependency_check("cv2", "pip3 install opencv-contrib-python"))
     results.append(_opencv_aruco_check())
-    results.append(
-        _dependency_check(
-            "picamera2",
-            "sudo apt install python3-picamera2 (preferred on Pi) or pip3 install picamera2",
-        )
-    )
+    results.append(_picamera2_check(detected_model))
     results.append(_dependency_check("yaml", "pip3 install pyyaml"))
     results.append(_dependency_check("pandas", "pip3 install pandas"))
     results.append(_camera_stack_check())

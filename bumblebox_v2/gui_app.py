@@ -378,6 +378,7 @@ class BumbleBoxV2GUI(tk.Tk):
         text_height: int = 9,
         default_visible: bool = False,
         auto_hide_when_empty: bool = True,
+        show_status: bool = True,
         fill: str = tk.BOTH,
         expand: bool = True,
         pady: tuple[int, int] = (10, 0),
@@ -387,9 +388,10 @@ class BumbleBoxV2GUI(tk.Tk):
 
         header = ttk.Frame(container)
         header.pack(fill=tk.X)
-        status_var = tk.StringVar(value="No output")
+        status_var = tk.StringVar(value="No output") if show_status else None
         ttk.Label(header, text=title).pack(side=tk.LEFT)
-        ttk.Label(header, textvariable=status_var).pack(side=tk.LEFT, padx=(8, 0))
+        if status_var is not None:
+            ttk.Label(header, textvariable=status_var).pack(side=tk.LEFT, padx=(8, 0))
 
         body = ttk.Frame(container)
         text_widget = tk.Text(body, wrap=tk.WORD, height=text_height)
@@ -456,7 +458,8 @@ class BumbleBoxV2GUI(tk.Tk):
 
         content = text_widget.get("1.0", tk.END).strip()
         status_var = meta["status_var"]
-        status_var.set("Output available" if content else "No output")
+        if isinstance(status_var, tk.StringVar):
+            status_var.set("Output available" if content else "No output")
 
         if content:
             self._set_results_section_visible(text_widget, True)
@@ -824,13 +827,19 @@ class BumbleBoxV2GUI(tk.Tk):
         controls = ttk.Frame(self.doctor_tab)
         controls.pack(fill=tk.X)
         ttk.Button(controls, text="Run Doctor", command=self._run_doctor).pack(side=tk.LEFT)
+        ttk.Button(
+            controls,
+            text="Fix Venv Package Visibility",
+            command=self._doctor_fix_venv_package_visibility,
+        ).pack(side=tk.LEFT, padx=8)
 
         self.doctor_output = self._create_results_section(
             self.doctor_tab,
-            title="Doctor Results",
+            title="The Doctor's Results",
             text_height=12,
             default_visible=False,
             auto_hide_when_empty=True,
+            show_status=False,
         )
 
     def _build_storage_tab(self) -> None:
@@ -3299,11 +3308,116 @@ class BumbleBoxV2GUI(tk.Tk):
         try:
             config, _ = self._load_config_or_defaults()
             results = run_doctor(config)
-            self.doctor_output.delete("1.0", tk.END)
-            self.doctor_output.insert(tk.END, format_doctor_report(results))
+            self._render_doctor_report(results)
             self._refresh_storage_status()
         except Exception as exc:
             messagebox.showerror("Doctor failed", str(exc))
+
+    def _render_doctor_report(self, results) -> None:
+        text = format_doctor_report(results)
+        self.doctor_output.delete("1.0", tk.END)
+        self.doctor_output.tag_configure("doctor_fail", foreground="#FF6B6B")
+        self.doctor_output.tag_configure("doctor_warn", foreground="#EACB63")
+        self.doctor_output.tag_configure("doctor_pass", foreground="#63D47C")
+
+        for line in text.splitlines(keepends=True):
+            stripped = line.lstrip()
+            if stripped.startswith("[FAIL]"):
+                self.doctor_output.insert(tk.END, line, ("doctor_fail",))
+            elif stripped.startswith("[WARN]"):
+                self.doctor_output.insert(tk.END, line, ("doctor_warn",))
+            elif stripped.startswith("[PASS]"):
+                self.doctor_output.insert(tk.END, line, ("doctor_pass",))
+            else:
+                self.doctor_output.insert(tk.END, line)
+
+    def _doctor_fix_venv_package_visibility(self) -> None:
+        try:
+            in_venv = (
+                hasattr(sys, "base_prefix")
+                and str(sys.prefix) != str(getattr(sys, "base_prefix", sys.prefix))
+            )
+            if not in_venv:
+                message = (
+                    "Current Python is not running inside a virtual environment. "
+                    "No venv package-visibility fix is needed."
+                )
+                self.doctor_output.delete("1.0", tk.END)
+                self.doctor_output.insert(tk.END, message)
+                return
+
+            major = int(sys.version_info.major)
+            minor = int(sys.version_info.minor)
+            venv_site = Path(sys.prefix) / "lib" / f"python{major}.{minor}" / "site-packages"
+            venv_site.mkdir(parents=True, exist_ok=True)
+
+            candidate_paths = {
+                "/usr/lib/python3/dist-packages",
+                "/usr/local/lib/python3/dist-packages",
+                f"/usr/lib/python{major}.{minor}/dist-packages",
+                f"/usr/local/lib/python{major}.{minor}/dist-packages",
+            }
+
+            probe = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-c",
+                    (
+                        "import json,site,sys;"
+                        "print(json.dumps({'site': site.getsitepackages(), 'path': sys.path}))"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if probe.returncode == 0:
+                try:
+                    payload = json.loads((probe.stdout or "").strip() or "{}")
+                except Exception:
+                    payload = {}
+                for key in ("site", "path"):
+                    for entry in payload.get(key, []) or []:
+                        entry_text = str(entry).strip()
+                        if "dist-packages" in entry_text:
+                            candidate_paths.add(entry_text)
+
+            existing = sorted(
+                {
+                    str(Path(path).resolve())
+                    for path in candidate_paths
+                    if str(path).strip() and Path(path).exists()
+                }
+            )
+            if not existing:
+                raise RuntimeError(
+                    "No system dist-packages directories were found to link into this venv."
+                )
+
+            pth_path = venv_site / "bumblebox_system_packages.pth"
+            pth_path.write_text("\n".join(existing) + "\n")
+
+            for path in existing:
+                if path not in sys.path:
+                    sys.path.append(path)
+
+            config, _ = self._load_config_or_defaults()
+            results = run_doctor(config)
+            self._render_doctor_report(results)
+            self.doctor_output.insert(
+                tk.END,
+                (
+                    "\n\nApplied venv system-package visibility fix.\n"
+                    f"Created: {pth_path}\n"
+                    f"Linked {len(existing)} system path(s)."
+                ),
+            )
+            messagebox.showinfo(
+                "Venv package visibility fixed",
+                "Linked system Python package paths into this venv. Re-run Doctor to verify dependencies.",
+            )
+        except Exception as exc:
+            messagebox.showerror("Fix failed", str(exc))
 
     def _run_camera_preview_setup(self) -> None:
         try:
