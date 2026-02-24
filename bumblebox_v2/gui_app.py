@@ -442,31 +442,13 @@ class BumbleBoxV2GUI(tk.Tk):
             except Exception:
                 continue
 
-        for label in getattr(self, "_intro_card_title_labels", []):
-            try:
-                label.configure(bg=colors["tab_selected"], fg="#FFFFFF")
-            except Exception:
-                continue
-
         for label in getattr(self, "_intro_desc_labels", []):
             try:
                 label.configure(bg=colors["entry_bg"], fg=colors["text_muted"])
             except Exception:
                 continue
 
-        hero_title = getattr(self, "_intro_hero_title", None)
-        if hero_title is not None:
-            try:
-                hero_title.configure(bg=colors["entry_bg"], fg=colors["text_light"])
-            except Exception:
-                pass
-
-        hero_subtitle = getattr(self, "_intro_hero_subtitle", None)
-        if hero_subtitle is not None:
-            try:
-                hero_subtitle.configure(bg=colors["entry_bg"], fg=colors["text_muted"])
-            except Exception:
-                pass
+        self._refresh_intro_title_pills()
 
         footer = getattr(self, "_intro_theme_footer", None)
         if footer is not None:
@@ -530,6 +512,118 @@ class BumbleBoxV2GUI(tk.Tk):
             except Exception:
                 pass
 
+    def _rounded_rect_points(
+        self,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        radius: float,
+    ) -> list[float]:
+        r = max(0.0, min(float(radius), (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+        return [
+            x1 + r, y1,
+            x2 - r, y1,
+            x2, y1,
+            x2, y1 + r,
+            x2, y2 - r,
+            x2, y2,
+            x2 - r, y2,
+            x1 + r, y2,
+            x1, y2,
+            x1, y2 - r,
+            x1, y1 + r,
+            x1, y1,
+        ]
+
+    def _create_intro_title_pill(
+        self,
+        parent: tk.Widget,
+        *,
+        text: str,
+        font: tkfont.Font,
+        fill: str,
+        fg: str,
+        bg: str,
+        pad_x: int,
+        pad_y: int,
+        radius: int,
+        role: str,
+    ) -> tk.Canvas:
+        canvas = tk.Canvas(parent, bd=0, highlightthickness=0, relief=tk.FLAT, bg=bg)
+        rect_id = canvas.create_polygon([], smooth=True, splinesteps=24)
+        text_id = canvas.create_text(0, 0, text=text, fill=fg, font=font)
+        meta: dict[str, object] = {
+            "canvas": canvas,
+            "rect_id": rect_id,
+            "text_id": text_id,
+            "text": text,
+            "font": font,
+            "fill": fill,
+            "fg": fg,
+            "bg": bg,
+            "pad_x": int(pad_x),
+            "pad_y": int(pad_y),
+            "radius": int(radius),
+            "role": role,
+        }
+        if not hasattr(self, "_intro_title_pills"):
+            self._intro_title_pills: list[dict[str, object]] = []
+        self._intro_title_pills.append(meta)
+        self._layout_intro_title_pill(meta)
+        return canvas
+
+    def _layout_intro_title_pill(self, meta: dict[str, object]) -> None:
+        canvas = meta["canvas"]
+        if not isinstance(canvas, tk.Canvas):
+            return
+        font_obj = meta["font"]
+        if not isinstance(font_obj, tkfont.Font):
+            return
+        text = str(meta.get("text", ""))
+        pad_x = max(0, int(meta.get("pad_x", 10)))
+        pad_y = max(0, int(meta.get("pad_y", 6)))
+        width = max(12, int(font_obj.measure(text)) + (pad_x * 2))
+        height = max(12, int(font_obj.metrics("linespace")) + (pad_y * 2))
+        try:
+            canvas.configure(width=width, height=height, bg=str(meta.get("bg", "#000000")))
+        except Exception:
+            return
+        points = self._rounded_rect_points(1, 1, width - 1, height - 1, int(meta.get("radius", 10)))
+        canvas.coords(meta["rect_id"], *points)
+        canvas.coords(meta["text_id"], width / 2.0, height / 2.0)
+        canvas.itemconfigure(
+            meta["rect_id"],
+            fill=str(meta.get("fill", "#333333")),
+            outline=str(meta.get("fill", "#333333")),
+        )
+        canvas.itemconfigure(
+            meta["text_id"],
+            text=text,
+            fill=str(meta.get("fg", "#FFFFFF")),
+            font=font_obj,
+        )
+
+    def _refresh_intro_title_pills(self) -> None:
+        colors = self._palette
+        pills = getattr(self, "_intro_title_pills", [])
+        for meta in pills:
+            role = str(meta.get("role", "card"))
+            meta["fill"] = colors["tab_selected"]
+            meta["fg"] = "#FFFFFF"
+            meta["bg"] = colors["entry_bg"]
+            if role == "hero":
+                meta["font"] = self._hero_title_font
+                meta["radius"] = 14
+                meta["pad_x"] = 24
+                meta["pad_y"] = 10
+            else:
+                meta["font"] = self._intro_card_title_font
+                meta["radius"] = 10
+                meta["pad_x"] = 16
+                meta["pad_y"] = 7
+            self._layout_intro_title_pill(meta)
+
     def _setup_responsive_typography(self) -> None:
         self._base_window_width = 980
         self._base_window_height = 680
@@ -547,12 +641,19 @@ class BumbleBoxV2GUI(tk.Tk):
         default_font = tkfont.nametofont("TkDefaultFont")
         family = str(default_font.cget("family"))
         default_size = self._font_base_sizes.get("TkDefaultFont", 10)
-        self._hero_title_font = tkfont.Font(self, family=family, size=max(14, default_size + 4), weight="bold")
+        hero_base = max(14, default_size + 4)
+        card_base = max(11, default_size + 1)
+        self._hero_title_font = tkfont.Font(
+            self,
+            family=family,
+            size=max(18, int(round(hero_base * 1.5))),
+            weight="bold",
+        )
         self._header_title_font = tkfont.Font(self, family=family, size=max(13, default_size + 3), weight="bold")
         self._intro_card_title_font = tkfont.Font(
             self,
             family=family,
-            size=max(22, max(11, default_size + 1) * 2),
+            size=max(16, int(round(card_base * 1.5))),
             weight="bold",
         )
         self._intro_button_font = tkfont.Font(self, family=family, size=max(10, default_size), weight="bold")
@@ -585,6 +686,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._header_title_font.configure(size=max(12, int(round(self._header_title_base_size * scale))))
         self._intro_card_title_font.configure(size=max(10, int(round(self._intro_card_title_base_size * scale))))
         self._intro_button_font.configure(size=max(9, int(round(self._intro_button_base_size * scale))))
+        self._refresh_intro_title_pills()
         self._refresh_intro_wraplength()
         self._refresh_roadmap_label_wraplength()
 
@@ -730,7 +832,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._intro_card_frames: list[tk.Frame] = []
         self._intro_card_header_frames: list[tk.Frame] = []
-        self._intro_card_title_labels: list[tk.Label] = []
+        self._intro_title_pills: list[dict[str, object]] = []
         self._intro_desc_labels: list[tk.Label] = []
 
         hero = tk.Frame(
@@ -743,16 +845,19 @@ class BumbleBoxV2GUI(tk.Tk):
         )
         self._intro_hero_frame = hero
         hero.pack(fill=tk.X, pady=(0, 14))
-        self._intro_hero_title = tk.Label(
+        self._intro_hero_title = self._create_intro_title_pill(
             hero,
             text="BumbleBox Control Center",
-            bg=colors["entry_bg"],
-            fg=colors["text_light"],
             font=self._hero_title_font,
-            anchor="center",
-            justify=tk.CENTER,
+            fill=colors["tab_selected"],
+            fg="#FFFFFF",
+            bg=colors["entry_bg"],
+            pad_x=24,
+            pad_y=10,
+            radius=14,
+            role="hero",
         )
-        self._intro_hero_title.pack(fill=tk.X, anchor="center")
+        self._intro_hero_title.pack(anchor="center", pady=(2, 2))
 
         self._intro_cards_frame = ttk.Frame(self.intro_frame)
         self._intro_cards_frame.pack(fill=tk.BOTH, expand=True)
@@ -797,19 +902,19 @@ class BumbleBoxV2GUI(tk.Tk):
             header = tk.Frame(card, bg=colors["entry_bg"])
             self._intro_card_header_frames.append(header)
             header.pack(fill=tk.X)
-            title_label = tk.Label(
+            title_label = self._create_intro_title_pill(
                 header,
                 text=label,
-                bg=colors["tab_selected"],
-                fg="#FFFFFF",
                 font=self._intro_card_title_font,
-                anchor="center",
-                justify=tk.CENTER,
-                padx=14,
-                pady=7,
+                fill=colors["tab_selected"],
+                fg="#FFFFFF",
+                bg=colors["entry_bg"],
+                pad_x=16,
+                pad_y=7,
+                radius=10,
+                role="card",
             )
-            self._intro_card_title_labels.append(title_label)
-            title_label.pack(fill=tk.X, anchor="center", pady=(6, 0))
+            title_label.pack(anchor="center", pady=(6, 0))
 
             desc_label = tk.Label(
                 card,
@@ -868,7 +973,7 @@ class BumbleBoxV2GUI(tk.Tk):
             to=1.0,
             resolution=1.0,
             orient=tk.HORIZONTAL,
-            length=40,
+            length=50,
             showvalue=False,
             sliderlength=14,
             width=8,
@@ -919,13 +1024,6 @@ class BumbleBoxV2GUI(tk.Tk):
                 label.configure(wraplength=text_wrap)
             except Exception:
                 continue
-
-        subtitle = getattr(self, "_intro_hero_subtitle", None)
-        if subtitle is not None:
-            try:
-                subtitle.configure(wraplength=max(540, frame_width - 24))
-            except Exception:
-                pass
 
     def _show_intro(self) -> None:
         self._workflow_label_var.set("Home")
