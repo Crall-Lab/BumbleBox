@@ -79,6 +79,7 @@ sudo apt install python3-pyqt5 labelme
 - Pi 4/5 compatibility checks (`doctor`)
 - camera stack checks for HQ/Module3 workflows
 - camera setup tools for focus/framing and live tag-detection validation (`camera-preview`, `camera-test-tracking`)
+- explicit camera tuning selection: auto-resolve by camera model + IR/NoIR flag (Pi4 `vc4` / Pi5 `pisp`) with manual override via `camera.tuning_file`
 - flexible mode model (`record_only`, `track_only`, `record_and_track`, `mixed_schedule`)
 - MP4 framerate quality reporting (`fps-report`)
 - FPS sweep capacity test with target-vs-real FPS and recording/tracking duration estimates (`fps-sweep`)

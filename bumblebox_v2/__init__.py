@@ -13,6 +13,7 @@ __all__ = [
     "status_history",
     "nest_labeling",
     "tracking_optimizer",
+    "tuning",
     "schedule_check",
     "storage_manager",
     "fleet",

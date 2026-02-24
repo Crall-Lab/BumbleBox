@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .tuning import resolve_camera_tuning_file
+
 
 @dataclass
 class RunSummary:
@@ -135,7 +137,17 @@ def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[fl
     digital_zoom = config["camera"].get("digital_zoom")
     noise_reduction = config["camera"].get("noise_reduction", "Auto")
 
-    picam2 = Picamera2()
+    resolved_tuning_file = resolve_camera_tuning_file(config)
+    if resolved_tuning_file:
+        try:
+            tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
+            picam2 = Picamera2(tuning=tuning)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load tuning file '{resolved_tuning_file}': {exc}"
+            ) from exc
+    else:
+        picam2 = Picamera2()
     preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
     picam2.align_configuration(preview)
     picam2.configure(preview)

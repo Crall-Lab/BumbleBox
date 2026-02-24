@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .tuning import TUNING_SEARCH_DIRS, inspect_camera_tuning_resolution
+
 
 @dataclass
 class CheckResult:
@@ -228,6 +230,61 @@ def _data_root_check(data_root: str) -> CheckResult:
     return CheckResult("Data root", "PASS", f"Writable: {path}")
 
 
+def _camera_tuning_check(config: Dict[str, Any]) -> CheckResult:
+    info = inspect_camera_tuning_resolution(config)
+    source = str(info.get("source", "default"))
+    requested = info.get("requested")
+    resolved = info.get("resolved")
+    resolved_path = info.get("resolved_path")
+    camera_model = info.get("camera_model")
+    infrared = info.get("infrared")
+    search_paths = ", ".join(str(path) for path in TUNING_SEARCH_DIRS)
+
+    if source == "default":
+        return CheckResult(
+            "Camera tuning",
+            "PASS",
+            "No tuning file selected; using libcamera default sensor tuning.",
+        )
+
+    if resolved_path:
+        if source == "explicit":
+            return CheckResult(
+                "Camera tuning",
+                "PASS",
+                f"Explicit tuning_file='{requested}' resolved to {resolved_path}.",
+            )
+        return CheckResult(
+            "Camera tuning",
+            "PASS",
+            (
+                f"Auto-selected tuning='{resolved}' for camera.model={camera_model}, "
+                f"camera.infrared={infrared}; resolved to {resolved_path}."
+            ),
+        )
+
+    if source == "explicit":
+        return CheckResult(
+            "Camera tuning",
+            "WARN",
+            (
+                f"Explicit tuning_file='{requested}' was not found in common Pi tuning paths. "
+                f"Searched: {search_paths}. "
+                "Capture may fail if libcamera cannot resolve this file."
+            ),
+        )
+
+    return CheckResult(
+        "Camera tuning",
+        "WARN",
+        (
+            f"Auto-selected tuning='{resolved}' for camera.model={camera_model}, "
+            f"camera.infrared={infrared}, but file was not found in common Pi tuning paths. "
+            f"Searched: {search_paths}."
+        ),
+    )
+
+
 def _findmnt_target(path: Path) -> tuple[str, str] | None:
     result = _run_command(
         ["findmnt", "--noheadings", "--output", "SOURCE,TARGET", "--target", str(path)]
@@ -295,6 +352,7 @@ def run_doctor(config: Dict[str, Any]) -> List[CheckResult]:
     results.append(_dependency_check("yaml", "pip3 install pyyaml"))
     results.append(_dependency_check("pandas", "pip3 install pandas"))
     results.append(_camera_stack_check())
+    results.append(_camera_tuning_check(config))
     results.append(_data_root_check(config["system"]["data_root"]))
     results.append(_data_root_mount_check(config["system"]["data_root"]))
 

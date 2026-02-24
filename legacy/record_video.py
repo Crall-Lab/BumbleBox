@@ -14,6 +14,7 @@ from config_loader import load_config
 import behavioral_metrics
 import data_cleaning
 from tag_tracking_utils import trackTagsFromVid
+from tuning_utils import resolve_recording_tuning_from_config
 
 config = load_config()
 username = pwd.getpwuid(os.getuid())[0]
@@ -39,12 +40,13 @@ def picam2_record_mp4(filename, outdir):
     shutter_speed = config["camera_settings"]["shutter_speed"]
     width = config["camera_settings"]["width"]
     height = config["camera_settings"]["height"]
-    tuning_file = config["camera_settings"]["tuning_file"]
+    tuning_file = resolve_recording_tuning_from_config(config)
     noise_reduction_mode = config["camera_settings"]["noise_reduction_mode"]
     digital_zoom = config["camera_settings"]["recording_digital_zoom"]
     
     recording_time = config["recording_options"]["recording_time"]
 
+    print(f"Using tuning file: {tuning_file}")
     tuning = Picamera2.load_tuning_file(tuning_file)
     picam2 = Picamera2(tuning=tuning)
     preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})

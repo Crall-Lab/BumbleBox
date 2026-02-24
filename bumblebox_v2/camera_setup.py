@@ -7,6 +7,8 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Optional
 
+from .tuning import resolve_camera_tuning_file
+
 
 PREVIEW_WINDOWS = {"QTGL", "QT", "DRM"}
 
@@ -95,7 +97,7 @@ def _apply_custom_aruco_params(parameters: Any, aruco_params: Any, notes: list[s
 
 def _open_picamera2(
     config: dict[str, Any], width: int, height: int, frame_format: Optional[str]
-) -> Any:
+) -> tuple[Any, Optional[str]]:
     try:
         from picamera2 import Picamera2
     except Exception as exc:  # pragma: no cover - runtime dependency
@@ -103,13 +105,15 @@ def _open_picamera2(
             "picamera2 is not available. Install Raspberry Pi camera stack and retry."
         ) from exc
 
-    tuning_file = config.get("camera", {}).get("tuning_file")
-    if tuning_file:
+    resolved_tuning_file = resolve_camera_tuning_file(config)
+    if resolved_tuning_file:
         try:
-            tuning = Picamera2.load_tuning_file(str(tuning_file))
+            tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
             picam2 = Picamera2(tuning=tuning)
         except Exception as exc:
-            raise RuntimeError(f"Failed to load tuning file '{tuning_file}': {exc}") from exc
+            raise RuntimeError(
+                f"Failed to load tuning file '{resolved_tuning_file}': {exc}"
+            ) from exc
     else:
         picam2 = Picamera2()
 
@@ -120,7 +124,7 @@ def _open_picamera2(
     camera_config = picam2.create_preview_configuration(main_stream)
     picam2.align_configuration(camera_config)
     picam2.configure(camera_config)
-    return picam2
+    return picam2, resolved_tuning_file
 
 
 def _apply_camera_controls(config: dict[str, Any], picam2: Any, notes: list[str]) -> bool:
@@ -177,7 +181,12 @@ def run_camera_preview(
 
     preview_mode = getattr(Preview, window_name)
     notes: list[str] = []
-    picam2 = _open_picamera2(config, width=width, height=height, frame_format=None)
+    picam2, resolved_tuning_file = _open_picamera2(
+        config,
+        width=width,
+        height=height,
+        frame_format=None,
+    )
     digital_zoom_applied = _apply_camera_controls(config, picam2, notes)
 
     started = False
@@ -215,7 +224,7 @@ def run_camera_preview(
         shutter_us=int(camera_cfg.get("shutter_us", 2500)),
         noise_reduction=str(camera_cfg.get("noise_reduction", "Auto")),
         digital_zoom_applied=digital_zoom_applied,
-        tuning_file=str(camera_cfg.get("tuning_file")) if camera_cfg.get("tuning_file") else None,
+        tuning_file=resolved_tuning_file,
     )
 
 
@@ -265,7 +274,12 @@ def run_camera_tracking_test(
 
     width = int(camera_cfg.get("width", 4056))
     height = int(camera_cfg.get("height", 3040))
-    picam2 = _open_picamera2(config, width=width, height=height, frame_format="YUV420")
+    picam2, _resolved_tuning_file = _open_picamera2(
+        config,
+        width=width,
+        height=height,
+        frame_format="YUV420",
+    )
     _apply_camera_controls(config, picam2, notes)
     warmup_s = float(config.get("runtime", {}).get("camera_warmup_seconds", 2.0))
 

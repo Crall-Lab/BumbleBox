@@ -147,7 +147,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._results_sections: dict[tk.Text, dict[str, object]] = {}
         self._tab_titles: dict[str, str] = {}
         self._workflow_tabs: dict[str, list[str]] = {}
-        self._workflow_label_var = tk.StringVar(value="Home")
+        self._workflow_label_var = tk.StringVar(value="")
         self._session_started_iso = datetime.now().isoformat(timespec="seconds")
 
         self._apply_ocean_slate_theme()
@@ -492,13 +492,6 @@ class BumbleBoxV2GUI(tk.Tk):
             except Exception:
                 pass
 
-        hint_label = getattr(self, "_intro_theme_hint_label", None)
-        if hint_label is not None:
-            try:
-                hint_label.configure(bg=colors["entry_bg"], fg=colors["text_muted"])
-            except Exception:
-                pass
-
         knob = getattr(self, "_theme_knob", None)
         if knob is not None:
             try:
@@ -757,7 +750,7 @@ class BumbleBoxV2GUI(tk.Tk):
             size=max(16, int(round(card_base * 1.5))),
             weight="bold",
         )
-        self._intro_button_font = tkfont.Font(self, family=family, size=max(10, default_size), weight="bold")
+        self._intro_button_font = tkfont.Font(self, family=family, size=max(11, default_size + 1), weight="bold")
         self._hero_title_base_size = abs(int(self._hero_title_font.cget("size")))
         self._header_title_base_size = abs(int(self._header_title_font.cget("size")))
         self._intro_card_title_base_size = abs(int(self._intro_card_title_font.cget("size")))
@@ -1030,7 +1023,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
             ttk.Button(
                 card,
-                text=f"Open {label}",
+                text="Open",
                 style="IntroPrimary.TButton",
                 command=lambda workflow_key=key: self._open_workflow(workflow_key),
             ).pack(anchor="center")
@@ -1097,14 +1090,6 @@ class BumbleBoxV2GUI(tk.Tk):
         )
         self._intro_theme_light_label.pack(side=tk.LEFT, padx=(6, 0))
 
-        self._intro_theme_hint_label = tk.Label(
-            self._intro_theme_panel,
-            text="(home only)",
-            bg=colors["entry_bg"],
-            fg=colors["text_muted"],
-        )
-        self._intro_theme_hint_label.pack(side=tk.LEFT, padx=(8, 0))
-
         self._sync_theme_knob_position()
         self._refresh_intro_card_tiles()
         self._refresh_intro_wraplength()
@@ -1128,7 +1113,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 continue
 
     def _show_intro(self) -> None:
-        self._workflow_label_var.set("Home")
+        self._workflow_label_var.set("")
         if hasattr(self, "home_button"):
             self.home_button.pack_forget()
         if hasattr(self, "notebook") and self.notebook.winfo_manager() == "pack":
@@ -1190,7 +1175,17 @@ class BumbleBoxV2GUI(tk.Tk):
 
         mode_row = ttk.Frame(frame)
         mode_row.grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(mode_row, text="View mode:").pack(side=tk.LEFT, padx=(0, 4))
+        self._pack_help_label(
+            mode_row,
+            text="View mode:",
+            help_title="Basic vs Advanced",
+            help_details=(
+                "Basic mode hides less-common tuning controls so setup is simpler for first-time use.\n\n"
+                "Advanced mode shows all controls, including deeper optimization/sweep options. "
+                "Use Advanced when you need manual tuning."
+            ),
+            padx=(0, 4),
+        )
         ttk.Radiobutton(
             mode_row,
             text="Basic",
@@ -1205,10 +1200,17 @@ class BumbleBoxV2GUI(tk.Tk):
             variable=self.ui_mode_var,
             command=self._set_ui_mode,
         ).pack(side=tk.LEFT, padx=(2, 8))
-        ttk.Label(
-            mode_row,
+        hint_row = ttk.Frame(frame)
+        hint_row.grid(row=2, column=0, sticky="w", pady=(2, 0))
+        self._pack_help_label(
+            hint_row,
             text="Basic hides rarely used tuning controls.",
-        ).pack(side=tk.LEFT)
+            help_title="What Basic Hides",
+            help_details=(
+                "Basic mode hides advanced controls such as detailed sweep overrides and certain optional "
+                "parameters. Core setup, scheduling, recording, and tracking workflows remain available."
+            ),
+        )
         frame.columnconfigure(0, weight=1)
 
     def _build_notebook(self) -> None:
@@ -1339,11 +1341,27 @@ class BumbleBoxV2GUI(tk.Tk):
         controls = ttk.Frame(self.doctor_tab)
         controls.pack(fill=tk.X)
         ttk.Button(controls, text="Run Doctor", command=self._run_doctor).pack(side=tk.LEFT)
+        self._make_help_button(
+            controls,
+            title="Run Doctor",
+            details=(
+                "Runs environment checks for Python dependencies, camera stack availability, "
+                "data-root write access, and key config sanity checks."
+            ),
+        ).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Button(
             controls,
             text="Fix Venv Package Visibility",
             command=self._doctor_fix_venv_package_visibility,
         ).pack(side=tk.LEFT, padx=8)
+        self._make_help_button(
+            controls,
+            title="Fix Venv Package Visibility",
+            details=(
+                "Attempts to make apt-installed Python camera packages (for example picamera2) "
+                "visible to this BumbleBox virtual environment."
+            ),
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
         self.doctor_output = self._create_results_section(
             self.doctor_tab,
@@ -1368,7 +1386,17 @@ class BumbleBoxV2GUI(tk.Tk):
         settings = ttk.LabelFrame(top, text="Storage Configuration", padding=10)
         settings.pack(fill=tk.X)
 
-        ttk.Label(settings, text="Mount point").grid(row=0, column=0, sticky="w")
+        self._grid_help_label(
+            settings,
+            row=0,
+            column=0,
+            text="Mount point",
+            help_title="Mount Point",
+            help_details=(
+                "Directory where BumbleBox writes videos and outputs. "
+                "Example: /mnt/bumblebox/data. This path should be writable."
+            ),
+        )
         ttk.Entry(settings, textvariable=self.storage_mount_point_var, width=48).grid(
             row=0, column=1, sticky="ew", padx=10, pady=4
         )
@@ -1378,7 +1406,17 @@ class BumbleBoxV2GUI(tk.Tk):
             command=self._save_storage_mount_point_to_config,
         ).grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
 
-        ttk.Label(settings, text="Storage device").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            settings,
+            row=1,
+            column=0,
+            text="Storage device",
+            help_title="Storage Device",
+            help_details=(
+                "Choose Auto to let BumbleBox select a detected partition, or pick a specific "
+                "/dev/... device when you want explicit control."
+            ),
+        )
         self.storage_device_combo = ttk.Combobox(
             settings,
             textvariable=self.storage_device_var,
@@ -1399,11 +1437,24 @@ class BumbleBoxV2GUI(tk.Tk):
             text="Refresh Storage Status",
             command=self._refresh_storage_status,
         ).pack(side=tk.LEFT)
+        self._make_help_button(
+            actions,
+            title="Refresh Storage Status",
+            details="Re-checks mounted devices and reports where BumbleBox is currently writing data.",
+        ).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Button(
             actions,
             text="Setup Storage Auto-Mount",
             command=self._setup_storage_auto_mount,
         ).pack(side=tk.LEFT, padx=(8, 0))
+        self._make_help_button(
+            actions,
+            title="Setup Storage Auto-Mount",
+            details=(
+                "Creates/updates persistent mount setup so the selected storage is mounted automatically "
+                "at boot to your configured mount point."
+            ),
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
         info = (
             "Select Auto to let BumbleBox choose the best detected partition, or select a specific /dev/... device "
@@ -1455,9 +1506,26 @@ class BumbleBoxV2GUI(tk.Tk):
             wraplength=420,
             justify=tk.LEFT,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        ttk.Label(preview, text="Duration (seconds)").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            preview,
+            row=1,
+            column=0,
+            text="Duration (seconds)",
+            help_title="Preview Duration",
+            help_details="How long camera preview runs before closing automatically.",
+        )
         ttk.Entry(preview, textvariable=self.camera_preview_seconds_var, width=8).grid(row=1, column=1, sticky="w", padx=8, pady=3)
-        ttk.Label(preview, text="Preview window").grid(row=2, column=0, sticky="w")
+        self._grid_help_label(
+            preview,
+            row=2,
+            column=0,
+            text="Preview window",
+            help_title="Preview Window Backend",
+            help_details=(
+                "Select preview backend. QTGL is usually best on desktop sessions. "
+                "DRM can be useful on direct-display/headless-style Pi setups."
+            ),
+        )
         ttk.Combobox(
             preview,
             textvariable=self.camera_preview_window_var,
@@ -1465,9 +1533,23 @@ class BumbleBoxV2GUI(tk.Tk):
             state="readonly",
             width=10,
         ).grid(row=2, column=1, sticky="w", padx=8, pady=3)
-        ttk.Label(preview, text="Width override (optional)").grid(row=3, column=0, sticky="w")
+        self._grid_help_label(
+            preview,
+            row=3,
+            column=0,
+            text="Width override (optional)",
+            help_title="Preview Width Override",
+            help_details="Optional temporary width override for preview/testing only.",
+        )
         ttk.Entry(preview, textvariable=self.camera_preview_width_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=3)
-        ttk.Label(preview, text="Height override (optional)").grid(row=4, column=0, sticky="w")
+        self._grid_help_label(
+            preview,
+            row=4,
+            column=0,
+            text="Height override (optional)",
+            help_title="Preview Height Override",
+            help_details="Optional temporary height override for preview/testing only.",
+        )
         ttk.Entry(preview, textvariable=self.camera_preview_height_var, width=10).grid(row=4, column=1, sticky="w", padx=8, pady=3)
         ttk.Button(preview, text="Run Camera Preview", command=self._run_camera_preview_setup).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(8, 0)
@@ -1484,13 +1566,41 @@ class BumbleBoxV2GUI(tk.Tk):
             wraplength=420,
             justify=tk.LEFT,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        ttk.Label(tracking, text="Duration (seconds)").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            tracking,
+            row=1,
+            column=0,
+            text="Duration (seconds)",
+            help_title="Tracking Test Duration",
+            help_details="How long to run live tag detection before summarizing results.",
+        )
         ttk.Entry(tracking, textvariable=self.camera_test_seconds_var, width=8).grid(row=1, column=1, sticky="w", padx=8, pady=3)
-        ttk.Label(tracking, text="Display width").grid(row=2, column=0, sticky="w")
+        self._grid_help_label(
+            tracking,
+            row=2,
+            column=0,
+            text="Display width",
+            help_title="Display Width",
+            help_details="Resizes preview display for readability; does not change sensor capture resolution.",
+        )
         ttk.Entry(tracking, textvariable=self.camera_test_display_width_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=3)
-        ttk.Label(tracking, text="Dictionary override (optional)").grid(row=3, column=0, sticky="w")
+        self._grid_help_label(
+            tracking,
+            row=3,
+            column=0,
+            text="Dictionary override (optional)",
+            help_title="ArUco Dictionary Override",
+            help_details="Use only when your printed tags are not using the dictionary defined in config.",
+        )
         ttk.Entry(tracking, textvariable=self.camera_test_dictionary_var, width=14).grid(row=3, column=1, sticky="w", padx=8, pady=3)
-        ttk.Label(tracking, text="Box preset").grid(row=4, column=0, sticky="w")
+        self._grid_help_label(
+            tracking,
+            row=4,
+            column=0,
+            text="Box preset",
+            help_title="Box Preset",
+            help_details="Applies preset ArUco tuning profiles matched to common enclosure/camera setups.",
+        )
         ttk.Combobox(
             tracking,
             textvariable=self.camera_test_box_preset_var,
@@ -1503,11 +1613,24 @@ class BumbleBoxV2GUI(tk.Tk):
             text="Show rejected marker candidates",
             variable=self.camera_test_show_rejected_var,
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self._make_help_button(
+            tracking,
+            title="Show Rejected Marker Candidates",
+            details="Draws candidate quads that failed marker decoding to help diagnose threshold/perimeter settings.",
+        ).grid(row=5, column=2, sticky="w", padx=(6, 0))
         ttk.Checkbutton(
             tracking,
             text="Disable CLAHE pre-processing",
             variable=self.camera_test_no_clahe_var,
         ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self._make_help_button(
+            tracking,
+            title="Disable CLAHE",
+            details=(
+                "CLAHE can improve contrast for small tags in uneven lighting. "
+                "Disable this only when it appears to harm detection quality."
+            ),
+        ).grid(row=6, column=2, sticky="w", padx=(6, 0))
         actions = ttk.Frame(tracking)
         actions.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Button(actions, text="Run Live Tracking Test", command=self._run_camera_tracking_test_setup).pack(side=tk.LEFT)
@@ -1785,6 +1908,137 @@ class BumbleBoxV2GUI(tk.Tk):
         details = self._roadmap_help_details(state, text)
         self._open_roadmap_help_dialog("Roadmap Task", details)
 
+    def _split_help_summary_details(self, details: str) -> tuple[str, str]:
+        text = str(details or "").strip()
+        if not text:
+            return ("No additional information is available for this item.", "")
+
+        flat = " ".join(line.strip() for line in text.splitlines() if line.strip())
+        summary = flat
+        sentence_end = -1
+        for idx, ch in enumerate(flat):
+            if ch in ".!?":
+                if idx >= 24:
+                    sentence_end = idx
+                    break
+        if sentence_end >= 0:
+            summary = flat[: sentence_end + 1].strip()
+        elif len(flat) > 170:
+            summary = flat[:167].rstrip() + "..."
+
+        if len(flat) <= len(summary) + 4:
+            return summary, ""
+        return summary, text
+
+    def _show_help_dialog(self, title: str, details: str) -> None:
+        summary, full_details = self._split_help_summary_details(details)
+        has_more = bool(full_details)
+
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.transient(self)
+        dialog.configure(bg=self._palette["panel_bg"])
+        dialog.geometry("620x250")
+        dialog.minsize(520, 220)
+
+        container = ttk.Frame(dialog, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(container, text=title, font=self._header_title_font).pack(anchor=tk.W)
+        ttk.Label(container, text=summary, justify=tk.LEFT, wraplength=580).pack(
+            anchor=tk.W, fill=tk.X, pady=(6, 10)
+        )
+
+        details_frame = ttk.Frame(container)
+        details_text = tk.Text(details_frame, wrap=tk.WORD, height=8)
+        self._style_output_text(details_text)
+        details_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        details_scroll = ttk.Scrollbar(details_frame, orient=tk.VERTICAL, command=details_text.yview)
+        details_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        details_text.configure(yscrollcommand=details_scroll.set)
+        details_text.insert("1.0", full_details if full_details else summary)
+        details_text.configure(state=tk.DISABLED)
+
+        footer = ttk.Frame(container)
+        footer.pack(fill=tk.X)
+
+        shown = {"value": False}
+
+        def _toggle_more() -> None:
+            if not has_more:
+                return
+            if shown["value"]:
+                details_frame.pack_forget()
+                toggle_btn.configure(text="Show More")
+                dialog.geometry("620x250")
+                shown["value"] = False
+            else:
+                details_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+                toggle_btn.configure(text="Hide Details")
+                dialog.geometry("720x500")
+                shown["value"] = True
+
+        if has_more:
+            toggle_btn = ttk.Button(footer, text="Show More", command=_toggle_more)
+            toggle_btn.pack(side=tk.LEFT)
+
+        ttk.Button(footer, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
+
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        try:
+            x = self.winfo_rootx() + max(0, (self.winfo_width() - dialog.winfo_width()) // 2)
+            y = self.winfo_rooty() + max(0, (self.winfo_height() - dialog.winfo_height()) // 2)
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+        dialog.grab_set()
+        dialog.focus_set()
+
+    def _make_help_button(self, parent: tk.Widget, *, title: str, details: str) -> ttk.Button:
+        return ttk.Button(
+            parent,
+            text="?",
+            width=2,
+            command=lambda t=title, d=details: self._show_help_dialog(t, d),
+        )
+
+    def _pack_help_label(
+        self,
+        parent: tk.Widget,
+        *,
+        text: str,
+        help_title: str,
+        help_details: str,
+        padx: tuple[int, int] = (0, 0),
+    ) -> ttk.Frame:
+        frame = ttk.Frame(parent)
+        frame.pack(side=tk.LEFT, padx=padx)
+        ttk.Label(frame, text=text).pack(side=tk.LEFT)
+        self._make_help_button(frame, title=help_title, details=help_details).pack(side=tk.LEFT, padx=(4, 0))
+        return frame
+
+    def _grid_help_label(
+        self,
+        parent: tk.Widget,
+        *,
+        row: int,
+        column: int,
+        text: str,
+        help_title: str,
+        help_details: str,
+        sticky: str = "w",
+        padx: tuple[int, int] = (0, 0),
+        pady: int = 0,
+        columnspan: int = 1,
+    ) -> ttk.Frame:
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=column, sticky=sticky, padx=padx, pady=pady, columnspan=columnspan)
+        ttk.Label(frame, text=text).pack(side=tk.LEFT)
+        self._make_help_button(frame, title=help_title, details=help_details).pack(side=tk.LEFT, padx=(4, 0))
+        return frame
+
     def _render_roadmap_steps(self, items: list[tuple[str, str]]) -> None:
         self._roadmap_items = list(items)
         for child in self.roadmap_steps_frame.winfo_children():
@@ -1881,27 +2135,46 @@ class BumbleBoxV2GUI(tk.Tk):
         container = ttk.Frame(self.config_tab)
         container.pack(fill=tk.BOTH, expand=True)
 
-        source_frame = ttk.LabelFrame(container, text="Config File", padding=8)
-        source_frame.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(source_frame, text="Current config path").grid(row=0, column=0, sticky="w")
+        top_row = ttk.Frame(container)
+        top_row.pack(fill=tk.X, pady=(0, 8))
+
+        source_frame = ttk.Frame(top_row)
+        source_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(source_frame, text="Config path").grid(row=0, column=0, sticky="w")
         self.config_path_display = ttk.Entry(source_frame, textvariable=self.config_path_var, width=82, state="readonly")
         self.config_path_display.grid(row=0, column=1, sticky="ew", padx=8, pady=3)
         self.config_action_button = ttk.Button(source_frame, text="", command=self._handle_config_path_action)
         self.config_action_button.grid(row=0, column=2, sticky="w")
+        source_frame.columnconfigure(1, weight=1)
+
+        top_buttons = ttk.Frame(top_row)
+        top_buttons.pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(top_buttons, text="Load From File", command=self._load_config_into_editor).pack(side=tk.LEFT)
+        self._make_help_button(
+            top_buttons,
+            title="Load From File",
+            details="Loads values from the current config file path into editable UI fields.",
+        ).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Button(top_buttons, text="Validate", command=self._validate_editor_config).pack(side=tk.LEFT, padx=6)
+        self._make_help_button(
+            top_buttons,
+            title="Validate",
+            details="Checks current editor values against BumbleBox config schema without writing to disk.",
+        ).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Button(top_buttons, text="Save Config", command=self._save_editor_config).pack(side=tk.LEFT)
+        self._make_help_button(
+            top_buttons,
+            title="Save Config",
+            details="Validates and writes current editor values to the selected config path.",
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
         ttk.Label(
-            source_frame,
+            container,
             text=(
                 "Path is read-only here. Use the button to switch config files or create a missing default file."
             ),
             justify=tk.LEFT,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        source_frame.columnconfigure(1, weight=1)
-
-        top_buttons = ttk.Frame(container)
-        top_buttons.pack(fill=tk.X, pady=(0, 8))
-        ttk.Button(top_buttons, text="Load From File", command=self._load_config_into_editor).pack(side=tk.LEFT)
-        ttk.Button(top_buttons, text="Validate", command=self._validate_editor_config).pack(side=tk.LEFT, padx=6)
-        ttk.Button(top_buttons, text="Save Config", command=self._save_editor_config).pack(side=tk.LEFT, padx=6)
+        ).pack(fill=tk.X, pady=(0, 6))
 
         self.config_page_var = tk.StringVar(value="")
         config_page_nav = ttk.Frame(container)
@@ -1911,6 +2184,16 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Label(config_page_nav, textvariable=self.config_page_var).pack(side=tk.LEFT, padx=10)
         self.config_next_btn = ttk.Button(config_page_nav, text="Next", command=self._config_next_page)
         self.config_next_btn.pack(side=tk.LEFT)
+        self._make_help_button(
+            config_page_nav,
+            title="Config Groups",
+            details=(
+                "Config fields are split into pages by topic to reduce clutter:\n"
+                "1) System Basics\n"
+                "2) Camera Configuration\n"
+                "3) Recording, Tracking, and Scheduling"
+            ),
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         form_canvas = tk.Canvas(
             container,
@@ -2012,31 +2295,127 @@ class BumbleBoxV2GUI(tk.Tk):
             ),
         ]
 
+    def _config_widget_width(self, key: str, value_type: type, choices: list[str] | None) -> int:
+        if choices:
+            longest = max((len(str(choice)) for choice in choices), default=12)
+            return max(10, min(24, longest + 3))
+
+        if key in {"system.data_root", "camera.tuning_file"}:
+            return 24
+        if key in {"system.colony_id"}:
+            return 10
+        if key in {"scheduling.unit_prefix", "scheduling.service_user", "camera.model"}:
+            return 18
+        if value_type in {int, float}:
+            return 10
+        return 20
+
+    def _config_field_help_details(self, key: str) -> str:
+        details = {
+            "system.colony_id": "Short identifier used in output filenames and metadata.",
+            "system.data_root": "Root folder where recordings and outputs are written.",
+            "system.pi_model": "Hardware target hint. Use auto unless you need to force Pi4/Pi5 assumptions.",
+            "camera.model": "Camera hardware model hint. Affects defaults and camera-specific assumptions.",
+            "fleet.role": "Choose standalone, queen, or worker behavior mode.",
+            "scheduling.unit_prefix": "Prefix for generated timer/service unit names in systemd.",
+            "scheduling.service_user": "Linux account that runs scheduled jobs in system-scope systemd mode.",
+            "runtime.ui_theme_mode": "Default GUI theme mode when app starts.",
+            "runtime.use_mock_camera": "Use synthetic camera frames for testing without camera hardware.",
+            "camera.codec": "Recording codec. MP4 is compact and convenient; MJPEG is larger but simple per-frame encoding.",
+            "camera.width": "Capture width in pixels. Higher values increase detail and resource usage.",
+            "camera.height": "Capture height in pixels. Higher values increase detail and resource usage.",
+            "camera.fps_target": "Requested capture framerate. Real framerate can differ; verify with FPS Report.",
+            "camera.shutter_us": "Exposure time in microseconds. Longer exposure can brighten image but increase motion blur.",
+            "camera.preview_window": "Preview backend type used by camera preview tools.",
+            "camera.tuning_file": "Optional libcamera tuning JSON file for sensor-specific imaging tuning.",
+            "pipeline.mode": "Main run mode: record only, track only, record+track, or mixed schedule lanes.",
+            "pipeline.tracking_source": "Track from in-memory frames (ram) or saved video files (video).",
+            "pipeline.defer_tracking_until_after_recording": "When enabled, tracking runs after recording to reduce runtime contention.",
+            "pipeline.parallel_tracking": "Allow concurrent tracking work. Faster on strong hardware, heavier on limited Pi resources.",
+            "pipeline.calculate_behavior_metrics": "Enable legacy in-box behavior metrics during tracking pipeline.",
+            "capture.recording_seconds": "Length of each recording chunk.",
+            "capture.record_interval_minutes": "Time between recording starts for scheduled capture.",
+            "capture.track_interval_minutes": "Time between scheduled tracking jobs.",
+            "scheduling.backend": "Scheduler backend implementation (systemd recommended on Pi OS).",
+            "scheduling.scope": "System scope runs regardless of user login; user scope runs per-user session.",
+            "runtime.save_frame_timestamps": "Write frame timestamp sidecars for real-FPS and timing analysis.",
+            "runtime.fps_report_on_each_recording": "Automatically emit FPS summary after each recording.",
+            "fleet.queen_local_pipeline_enabled": "When false, queen acts as interface/orchestrator without running local bbox pipeline.",
+            "fleet.queen_media_schedule.enabled": "Enable queen media pull/track schedule from workers.",
+            "fleet.queen_media_schedule.pull_interval_minutes": "How often queen pulls latest worker videos.",
+            "fleet.queen_media_schedule.track_interval_minutes": "How often queen runs tracking/visualization on pulled media.",
+            "fleet.queen_media_schedule.max_videos_total": "Upper bound on retained pulled/tracked videos for queen workload control.",
+            "fleet.queen_media_schedule.cooldown_minutes": "Minimum delay before reprocessing same worker media set.",
+        }
+        return details.get(
+            key,
+            (
+                f"Config parameter: {key}\n\n"
+                "Use default unless you have a specific experiment or hardware reason to change it."
+            ),
+        )
+
+    def _set_entry_width(self, widget: tk.Widget, width: int) -> None:
+        try:
+            widget.configure(width=max(8, int(width)))
+        except Exception:
+            return
+
+    def _bind_expandable_entry(self, widget: tk.Widget, *, compact_width: int, expanded_width: int) -> None:
+        self._set_entry_width(widget, compact_width)
+        widget.bind(
+            "<FocusIn>",
+            lambda _event, w=widget, expanded=expanded_width: self._set_entry_width(w, expanded),
+            add="+",
+        )
+        widget.bind(
+            "<FocusOut>",
+            lambda _event, w=widget, compact=compact_width: self._set_entry_width(w, compact),
+            add="+",
+        )
+
     def _render_config_fields(self) -> None:
         group_defs = self._config_group_specs()
         self._config_field_rows: dict[str, ttk.Frame] = {}
         self._config_field_roles: dict[str, set[str] | None] = {}
+        self._config_field_widgets: dict[str, tk.Widget] = {}
         self._config_group_frames: dict[str, ttk.LabelFrame] = {}
+        self._config_group_bodies: dict[str, ttk.Frame] = {}
         self._config_group_order: list[str] = []
         self._config_group_titles: dict[str, str] = {}
         self._config_page_index = 0
 
         for group_id, group_title, _specs in group_defs:
             group_frame = ttk.LabelFrame(self.config_form_frame, text=group_title, padding=8)
-            group_frame.grid(row=0, column=0, sticky="ew")
+            group_frame.grid(row=0, column=0, sticky="n")
             group_frame.columnconfigure(0, weight=1)
+            group_frame.grid_anchor("n")
+            group_body = ttk.Frame(group_frame)
+            group_body.grid(row=0, column=0, sticky="")
             self._config_group_frames[group_id] = group_frame
+            self._config_group_bodies[group_id] = group_body
             self._config_group_order.append(group_id)
             self._config_group_titles[group_id] = group_title
 
         for group_id, _group_title, specs in group_defs:
             group_frame = self._config_group_frames[group_id]
+            group_body = self._config_group_bodies[group_id]
             row_index = 0
             for label, key, value_type, choices, roles in specs:
-                row_frame = ttk.Frame(group_frame)
-                row_frame.grid(row=row_index, column=0, sticky="ew", pady=2)
-                row_frame.columnconfigure(1, weight=1)
-                ttk.Label(row_frame, text=label).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=1)
+                row_frame = ttk.Frame(group_body)
+                row_frame.grid(row=row_index, column=0, sticky="", pady=2)
+                self._grid_help_label(
+                    row_frame,
+                    row=0,
+                    column=0,
+                    text=label,
+                    help_title=label,
+                    help_details=self._config_field_help_details(key),
+                    sticky="e",
+                    padx=(0, 8),
+                    pady=1,
+                )
+                widget_width = self._config_widget_width(key, value_type, choices)
 
                 if value_type is bool:
                     variable = tk.BooleanVar(value=False)
@@ -2049,13 +2428,19 @@ class BumbleBoxV2GUI(tk.Tk):
                         textvariable=variable,
                         values=choices,
                         state="readonly",
-                        width=28,
+                        width=widget_width,
                     )
-                    widget.grid(row=0, column=1, sticky="ew", pady=1)
+                    widget.grid(row=0, column=1, sticky="w", pady=1)
                 else:
                     variable = tk.StringVar(value="")
-                    widget = ttk.Entry(row_frame, textvariable=variable, width=34)
-                    widget.grid(row=0, column=1, sticky="ew", pady=1)
+                    widget = ttk.Entry(row_frame, textvariable=variable, width=widget_width)
+                    widget.grid(row=0, column=1, sticky="w", pady=1)
+                    if key in {"system.data_root", "camera.tuning_file"}:
+                        self._bind_expandable_entry(
+                            widget,
+                            compact_width=widget_width,
+                            expanded_width=56,
+                        )
 
                 if key == "camera.tuning_file":
                     ttk.Button(row_frame, text="Browse", command=self._browse_tuning_file).grid(
@@ -2063,16 +2448,17 @@ class BumbleBoxV2GUI(tk.Tk):
                     )
 
                 self.config_fields[key] = (variable, value_type)
+                self._config_field_widgets[key] = widget
                 self._config_field_rows[key] = row_frame
                 self._config_field_roles[key] = set(roles) if roles else None
                 row_index += 1
 
             if group_id == "basic":
                 ttk.Label(
-                    group_frame,
+                    group_body,
                     text="Unit prefix controls generated timer/service names (for example: bumblebox-v2-record.timer).",
                     justify=tk.LEFT,
-                    wraplength=760,
+                    wraplength=620,
                 ).grid(row=row_index, column=0, sticky="w", pady=(8, 0))
                 row_index += 1
 
@@ -2080,7 +2466,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 self._camera_max_status_var = tk.StringVar(
                     value="Tip: reads connected camera modes first, then falls back to camera model defaults."
                 )
-                actions = ttk.Frame(group_frame)
+                actions = ttk.Frame(group_body)
                 actions.grid(row=row_index, column=0, sticky="w", pady=(8, 0))
                 ttk.Button(
                     actions,
@@ -2093,14 +2479,15 @@ class BumbleBoxV2GUI(tk.Tk):
             if group_id == "pipeline":
                 self._pipeline_tracking_hint_var = tk.StringVar(value="")
                 ttk.Label(
-                    group_frame,
+                    group_body,
                     textvariable=self._pipeline_tracking_hint_var,
                     justify=tk.LEFT,
-                    wraplength=760,
+                    wraplength=620,
                 ).grid(row=row_index, column=0, sticky="w", pady=(8, 0))
                 row_index += 1
 
         self.config_form_frame.columnconfigure(0, weight=1)
+        self.config_form_frame.grid_anchor("n")
 
         role_binding = getattr(self, "_config_role_trace_bound", False)
         role_field = self.config_fields.get("fleet.role")
@@ -2342,17 +2729,38 @@ class BumbleBoxV2GUI(tk.Tk):
 
         report_frame = ttk.LabelFrame(top, text="Single Video FPS Report", padding=8)
         report_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        ttk.Label(report_frame, text="Video path").grid(row=0, column=0, sticky="w")
+        self._grid_help_label(
+            report_frame,
+            row=0,
+            column=0,
+            text="Video path",
+            help_title="Video Path",
+            help_details="Path to recorded video file to analyze real framerate and timing drift.",
+        )
         ttk.Entry(report_frame, textvariable=self.video_path_var, width=58).grid(
             row=0, column=1, sticky="ew", padx=8, pady=4
         )
 
-        ttk.Label(report_frame, text="Timestamps path (optional)").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            report_frame,
+            row=1,
+            column=0,
+            text="Timestamps path (optional)",
+            help_title="Timestamp Sidecar",
+            help_details="Optional frame timestamp file saved during recording for more accurate FPS diagnostics.",
+        )
         ttk.Entry(report_frame, textvariable=self.timestamps_path_var, width=58).grid(
             row=1, column=1, sticky="ew", padx=8, pady=4
         )
 
-        ttk.Label(report_frame, text="Expected seconds (optional)").grid(row=2, column=0, sticky="w")
+        self._grid_help_label(
+            report_frame,
+            row=2,
+            column=0,
+            text="Expected seconds (optional)",
+            help_title="Expected Duration",
+            help_details="If provided, compares actual video duration against expected recording duration.",
+        )
         ttk.Entry(report_frame, textvariable=self.recording_seconds_var, width=20).grid(
             row=2, column=1, sticky="w", padx=8, pady=4
         )
@@ -2374,41 +2782,95 @@ class BumbleBoxV2GUI(tk.Tk):
             wraplength=420,
             justify=tk.LEFT,
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
-        ttk.Label(sweep_frame, text="Start").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            sweep_frame,
+            row=1,
+            column=0,
+            text="Start",
+            help_title="Sweep Start FPS",
+            help_details="Starting FPS value for capacity sweep.",
+        )
         ttk.Entry(sweep_frame, textvariable=self.fps_sweep_start_var, width=8).grid(
             row=1, column=1, sticky="w", padx=8, pady=3
         )
-        ttk.Label(sweep_frame, text="Stop").grid(row=1, column=2, sticky="w")
+        self._grid_help_label(
+            sweep_frame,
+            row=1,
+            column=2,
+            text="Stop",
+            help_title="Sweep Stop FPS",
+            help_details="Maximum FPS value tested in sweep.",
+        )
         ttk.Entry(sweep_frame, textvariable=self.fps_sweep_stop_var, width=8).grid(
             row=1, column=3, sticky="w", padx=8, pady=3
         )
-        ttk.Label(sweep_frame, text="Step").grid(row=2, column=0, sticky="w")
+        self._grid_help_label(
+            sweep_frame,
+            row=2,
+            column=0,
+            text="Step",
+            help_title="Sweep Step",
+            help_details="Increment between tested FPS values.",
+        )
         ttk.Entry(sweep_frame, textvariable=self.fps_sweep_step_var, width=8).grid(
             row=2, column=1, sticky="w", padx=8, pady=3
         )
-        ttk.Label(sweep_frame, text="Probe seconds").grid(row=2, column=2, sticky="w")
+        self._grid_help_label(
+            sweep_frame,
+            row=2,
+            column=2,
+            text="Probe seconds",
+            help_title="Probe Duration",
+            help_details="Recording length used for each FPS probe point in the sweep.",
+        )
         ttk.Entry(sweep_frame, textvariable=self.fps_sweep_probe_seconds_var, width=8).grid(
             row=2, column=3, sticky="w", padx=8, pady=3
         )
 
         advanced = ttk.LabelFrame(sweep_frame, text="Advanced Sweep Options", padding=6)
         advanced.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
-        ttk.Label(advanced, text="FPS list (optional csv)").grid(row=0, column=0, sticky="w")
+        self._grid_help_label(
+            advanced,
+            row=0,
+            column=0,
+            text="FPS list (optional csv)",
+            help_title="Custom FPS List",
+            help_details="Comma-separated explicit FPS values. If set, this overrides start/stop/step generation.",
+        )
         ttk.Entry(advanced, textvariable=self.fps_sweep_values_var, width=22).grid(
             row=0, column=1, sticky="w", padx=8, pady=3
         )
-        ttk.Label(advanced, text="Assume RAM GiB (optional)").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            advanced,
+            row=1,
+            column=0,
+            text="Assume RAM GiB (optional)",
+            help_title="Assumed RAM",
+            help_details="Simulate capacity on a target machine (for example Pi) when running sweep elsewhere.",
+        )
         ttk.Entry(advanced, textvariable=self.fps_sweep_assume_ram_var, width=8).grid(
             row=1, column=1, sticky="w", padx=8, pady=3
         )
         options = ttk.Frame(advanced)
         options.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Checkbutton(options, text="Use mock camera", variable=self.fps_sweep_mock_var).pack(side=tk.LEFT)
+        self._make_help_button(
+            options,
+            title="Use Mock Camera",
+            details="Uses simulated frames to estimate scheduling behavior when camera hardware is unavailable.",
+        ).pack(side=tk.LEFT, padx=(4, 10))
         ttk.Checkbutton(
             options,
             text="Use tracking from current app session only",
             variable=self.fps_sweep_session_only_var,
         ).pack(side=tk.LEFT, padx=10)
+        self._make_help_button(
+            options,
+            title="Session-only Tracking Estimate",
+            details=(
+                "When enabled, tracking-time estimates use measurements from tracking runs in this GUI session only."
+            ),
+        ).pack(side=tk.LEFT, padx=(4, 0))
         advanced.columnconfigure(1, weight=1)
         self._register_advanced_widget(advanced)
 
@@ -2458,11 +2920,32 @@ class BumbleBoxV2GUI(tk.Tk):
             wraplength=380,
             justify=tk.LEFT,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        ttk.Label(manual, text="Point A (x,y)").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            manual,
+            row=1,
+            column=0,
+            text="Point A (x,y)",
+            help_title="Point A",
+            help_details="First pixel coordinate on the same plane as Point B.",
+        )
         ttk.Entry(manual, textvariable=self.manual_point_a).grid(row=1, column=1, sticky="ew", padx=8, pady=3)
-        ttk.Label(manual, text="Point B (x,y)").grid(row=2, column=0, sticky="w")
+        self._grid_help_label(
+            manual,
+            row=2,
+            column=0,
+            text="Point B (x,y)",
+            help_title="Point B",
+            help_details="Second pixel coordinate used with Point A to estimate pixel-to-cm scale.",
+        )
         ttk.Entry(manual, textvariable=self.manual_point_b).grid(row=2, column=1, sticky="ew", padx=8, pady=3)
-        ttk.Label(manual, text="Real distance (cm)").grid(row=3, column=0, sticky="w")
+        self._grid_help_label(
+            manual,
+            row=3,
+            column=0,
+            text="Real distance (cm)",
+            help_title="Real Distance",
+            help_details="Measured real-world distance between A and B in centimeters.",
+        )
         ttk.Entry(manual, textvariable=self.manual_distance_cm).grid(row=3, column=1, sticky="ew", padx=8, pady=3)
         ttk.Button(manual, text="Calibrate from Points", command=self._calibrate_manual).grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(8, 0)
@@ -2480,13 +2963,41 @@ class BumbleBoxV2GUI(tk.Tk):
             wraplength=380,
             justify=tk.LEFT,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        ttk.Label(aruco, text="Image path").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            aruco,
+            row=1,
+            column=0,
+            text="Image path",
+            help_title="Calibration Image",
+            help_details="Path to an image containing a clearly visible known-size ArUco marker.",
+        )
         ttk.Entry(aruco, textvariable=self.aruco_image).grid(row=1, column=1, sticky="ew", padx=8, pady=3)
-        ttk.Label(aruco, text="Marker size (mm)").grid(row=2, column=0, sticky="w")
+        self._grid_help_label(
+            aruco,
+            row=2,
+            column=0,
+            text="Marker size (mm)",
+            help_title="Marker Size",
+            help_details="Physical printed marker edge size in millimeters.",
+        )
         ttk.Entry(aruco, textvariable=self.aruco_marker_size_mm).grid(row=2, column=1, sticky="ew", padx=8, pady=3)
-        ttk.Label(aruco, text="Dictionary").grid(row=3, column=0, sticky="w")
+        self._grid_help_label(
+            aruco,
+            row=3,
+            column=0,
+            text="Dictionary",
+            help_title="ArUco Dictionary",
+            help_details="Dictionary used by your printed marker (for example 4X4_50 or 4X4_100).",
+        )
         ttk.Entry(aruco, textvariable=self.aruco_dictionary).grid(row=3, column=1, sticky="ew", padx=8, pady=3)
-        ttk.Label(aruco, text="Marker ID (optional)").grid(row=4, column=0, sticky="w")
+        self._grid_help_label(
+            aruco,
+            row=4,
+            column=0,
+            text="Marker ID (optional)",
+            help_title="Marker ID",
+            help_details="Optional specific marker ID to target when multiple markers are visible.",
+        )
         ttk.Entry(aruco, textvariable=self.aruco_marker_id).grid(row=4, column=1, sticky="ew", padx=8, pady=3)
         ttk.Button(aruco, text="Calibrate from ArUco", command=self._calibrate_aruco).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(8, 0)
@@ -2612,10 +3123,24 @@ class BumbleBoxV2GUI(tk.Tk):
         self.opt_status_var = tk.StringVar(value="Idle")
         self._optimize_top_k = 5
 
-        ttk.Label(top, text="Input path (video or image folder)").grid(row=0, column=0, sticky="w")
+        self._grid_help_label(
+            top,
+            row=0,
+            column=0,
+            text="Input path (video or image folder)",
+            help_title="Optimization Input",
+            help_details="Path to representative video (or image folder) used to test ArUco parameter sweeps.",
+        )
         ttk.Entry(top, textvariable=self.opt_input_path_var, width=90).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
 
-        ttk.Label(top, text="Profile").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            top,
+            row=1,
+            column=0,
+            text="Profile",
+            help_title="Optimization Profile",
+            help_details="Quick tests fewer combinations; Deep explores more combinations and takes longer.",
+        )
         ttk.Combobox(
             top,
             textvariable=self.opt_profile_var,
@@ -2624,13 +3149,37 @@ class BumbleBoxV2GUI(tk.Tk):
             width=20,
         ).grid(row=1, column=1, sticky="w", padx=8, pady=4)
 
-        ttk.Label(top, text="Tag size (mm)").grid(row=2, column=0, sticky="w")
+        self._grid_help_label(
+            top,
+            row=2,
+            column=0,
+            text="Tag size (mm)",
+            help_title="Tag Size",
+            help_details="Physical marker size in millimeters; used to shape parameter heuristics.",
+        )
         ttk.Entry(top, textvariable=self.opt_tag_size_mm_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
 
-        ttk.Label(top, text="Sample frames").grid(row=3, column=0, sticky="w")
+        self._grid_help_label(
+            top,
+            row=3,
+            column=0,
+            text="Sample frames",
+            help_title="Sample Frames",
+            help_details="Number of frames sampled for scoring. More frames improve robustness but increase runtime.",
+        )
         ttk.Entry(top, textvariable=self.opt_sample_frames_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=4)
 
-        ttk.Label(top, text="Execution target").grid(row=4, column=0, sticky="w")
+        self._grid_help_label(
+            top,
+            row=4,
+            column=0,
+            text="Execution target",
+            help_title="Execution Target",
+            help_details=(
+                "Pi-safe limits worker usage for reliability on Raspberry Pi. "
+                "Desktop mode can use more cores for faster sweeps."
+            ),
+        )
         execution_frame = ttk.Frame(top)
         execution_frame.grid(row=4, column=1, sticky="w", padx=8, pady=4)
         ttk.Radiobutton(
@@ -2653,22 +3202,76 @@ class BumbleBoxV2GUI(tk.Tk):
             text="Apply best params to current config",
             variable=self.opt_apply_best_var,
         ).pack(side=tk.LEFT)
+        self._make_help_button(
+            options,
+            title="Apply Best Params",
+            details="If enabled, writes the winning ArUco parameter set into current config after optimization.",
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
         advanced = ttk.LabelFrame(top, text="Advanced Optimization Options", padding=6)
         advanced.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Label(advanced, text="Output root (optional)").grid(row=0, column=0, sticky="w")
+        self._grid_help_label(
+            advanced,
+            row=0,
+            column=0,
+            text="Output root (optional)",
+            help_title="Output Root",
+            help_details="Optional output directory for optimizer reports and preview artifacts.",
+        )
         ttk.Entry(advanced, textvariable=self.opt_output_dir_var, width=70).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Label(advanced, text="Dictionary override").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            advanced,
+            row=1,
+            column=0,
+            text="Dictionary override",
+            help_title="Dictionary Override",
+            help_details="Force a specific ArUco dictionary when config default is not correct for this test.",
+        )
         ttk.Entry(advanced, textvariable=self.opt_dictionary_var, width=22).grid(row=1, column=1, sticky="w", padx=8, pady=4)
-        ttk.Label(advanced, text="Workers (optional override)").grid(row=2, column=0, sticky="w")
+        self._grid_help_label(
+            advanced,
+            row=2,
+            column=0,
+            text="Workers (optional override)",
+            help_title="Workers",
+            help_details="Manual worker count override. Leave blank to let optimizer choose based on target mode.",
+        )
         ttk.Entry(advanced, textvariable=self.opt_workers_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
-        ttk.Label(advanced, text="Expected tags/frame (optional)").grid(row=3, column=0, sticky="w")
+        self._grid_help_label(
+            advanced,
+            row=3,
+            column=0,
+            text="Expected tags/frame (optional)",
+            help_title="Expected Tags",
+            help_details="Expected detections per frame. Used to penalize over-read false positives.",
+        )
         ttk.Entry(advanced, textvariable=self.opt_expected_tags_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=4)
-        ttk.Label(advanced, text="Early stop patience").grid(row=4, column=0, sticky="w")
+        self._grid_help_label(
+            advanced,
+            row=4,
+            column=0,
+            text="Early stop patience",
+            help_title="Early Stop Patience",
+            help_details="Number of non-improving checks before optimizer stops a search branch.",
+        )
         ttk.Entry(advanced, textvariable=self.opt_early_stop_patience_var, width=10).grid(row=4, column=1, sticky="w", padx=8, pady=4)
-        ttk.Label(advanced, text="Early stop min improvement").grid(row=5, column=0, sticky="w")
+        self._grid_help_label(
+            advanced,
+            row=5,
+            column=0,
+            text="Early stop min improvement",
+            help_title="Minimum Improvement",
+            help_details="Minimum score gain considered meaningful for continuing search.",
+        )
         ttk.Entry(advanced, textvariable=self.opt_early_stop_min_improvement_var, width=10).grid(row=5, column=1, sticky="w", padx=8, pady=4)
-        ttk.Label(advanced, text="Top results to show").grid(row=6, column=0, sticky="w")
+        self._grid_help_label(
+            advanced,
+            row=6,
+            column=0,
+            text="Top results to show",
+            help_title="Top Results",
+            help_details="Number of best parameter candidates shown in optimizer output.",
+        )
         ttk.Entry(advanced, textvariable=self.opt_top_k_var, width=10).grid(row=6, column=1, sticky="w", padx=8, pady=4)
         preview_options = ttk.Frame(advanced)
         preview_options.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
@@ -2677,8 +3280,18 @@ class BumbleBoxV2GUI(tk.Tk):
             text="Write preview video",
             variable=self.opt_preview_var,
         ).pack(side=tk.LEFT, padx=12)
+        self._make_help_button(
+            preview_options,
+            title="Write Preview Video",
+            details="Writes an annotated short output clip using selected candidate parameters for visual inspection.",
+        ).pack(side=tk.LEFT, padx=(4, 10))
         ttk.Label(preview_options, text="Preview frames").pack(side=tk.LEFT, padx=(6, 2))
         ttk.Entry(preview_options, textvariable=self.opt_preview_frames_var, width=8).pack(side=tk.LEFT)
+        self._make_help_button(
+            preview_options,
+            title="Preview Frames",
+            details="Maximum number of frames rendered in preview output.",
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
         sweep_frame = ttk.LabelFrame(
             advanced,
@@ -2686,25 +3299,53 @@ class BumbleBoxV2GUI(tk.Tk):
             padding=6,
         )
         sweep_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Label(sweep_frame, text="minMarkerPerimeterRate").grid(row=0, column=0, sticky="w")
+        self._grid_help_label(
+            sweep_frame,
+            row=0,
+            column=0,
+            text="minMarkerPerimeterRate",
+            help_title="minMarkerPerimeterRate",
+            help_details="Minimum marker perimeter ratio. Raise to filter tiny false positives.",
+        )
         ttk.Entry(
             sweep_frame,
             textvariable=self.opt_sweep_min_marker_perimeter_rate_var,
             width=28,
         ).grid(row=0, column=1, sticky="ew", padx=8, pady=2)
-        ttk.Label(sweep_frame, text="adaptiveThreshWinSizeMin").grid(row=1, column=0, sticky="w")
+        self._grid_help_label(
+            sweep_frame,
+            row=1,
+            column=0,
+            text="adaptiveThreshWinSizeMin",
+            help_title="adaptiveThreshWinSizeMin",
+            help_details="Lower bound of adaptive threshold window size.",
+        )
         ttk.Entry(
             sweep_frame,
             textvariable=self.opt_sweep_adaptive_thresh_win_size_min_var,
             width=28,
         ).grid(row=1, column=1, sticky="ew", padx=8, pady=2)
-        ttk.Label(sweep_frame, text="adaptiveThreshWinSizeMax").grid(row=2, column=0, sticky="w")
+        self._grid_help_label(
+            sweep_frame,
+            row=2,
+            column=0,
+            text="adaptiveThreshWinSizeMax",
+            help_title="adaptiveThreshWinSizeMax",
+            help_details="Upper bound of adaptive threshold window size.",
+        )
         ttk.Entry(
             sweep_frame,
             textvariable=self.opt_sweep_adaptive_thresh_win_size_max_var,
             width=28,
         ).grid(row=2, column=1, sticky="ew", padx=8, pady=2)
-        ttk.Label(sweep_frame, text="adaptiveThreshWinSizeStep").grid(row=3, column=0, sticky="w")
+        self._grid_help_label(
+            sweep_frame,
+            row=3,
+            column=0,
+            text="adaptiveThreshWinSizeStep",
+            help_title="adaptiveThreshWinSizeStep",
+            help_details="Step size between min and max adaptive threshold windows.",
+        )
         ttk.Entry(
             sweep_frame,
             textvariable=self.opt_sweep_adaptive_thresh_win_size_step_var,
