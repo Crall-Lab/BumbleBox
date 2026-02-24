@@ -1175,19 +1175,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
         mode_row = ttk.Frame(frame)
         mode_row.grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self._pack_help_label(
-            mode_row,
-            text="View mode:",
-            help_title="Basic vs Advanced",
-            help_details=(
-                "Basic mode hides less-common tuning controls so setup is simpler for first-time use.\n\n"
-                "Advanced mode shows all controls, including deeper optimization/sweep options. "
-                "Use Advanced when you need manual tuning.\n\n"
-                "Basic hides rarely used tuning controls; core setup, scheduling, recording, and tracking "
-                "workflows remain available."
-            ),
-            padx=(0, 4),
-        )
+        ttk.Label(mode_row, text="View mode:").pack(side=tk.LEFT)
         ttk.Radiobutton(
             mode_row,
             text="Basic",
@@ -1202,6 +1190,17 @@ class BumbleBoxV2GUI(tk.Tk):
             variable=self.ui_mode_var,
             command=self._set_ui_mode,
         ).pack(side=tk.LEFT, padx=(2, 8))
+        self._make_help_button(
+            mode_row,
+            title="Basic vs Advanced",
+            details=(
+                "Basic mode hides less-common tuning controls so setup is simpler for first-time use.\n\n"
+                "Advanced mode shows all controls, including deeper optimization/sweep options. "
+                "Use Advanced when you need manual tuning.\n\n"
+                "Basic hides rarely used tuning controls; core setup, scheduling, recording, and tracking "
+                "workflows remain available."
+            ),
+        ).pack(side=tk.LEFT, padx=(0, 2))
         ttk.Label(frame, text="Basic hides rarely used controls.").grid(row=2, column=0, sticky="w", pady=(2, 0))
         frame.columnconfigure(0, weight=1)
 
@@ -1992,7 +1991,7 @@ class BumbleBoxV2GUI(tk.Tk):
         return ttk.Button(
             parent,
             text="?",
-            width=2,
+            width=1,
             command=lambda t=title, d=details: self._show_help_dialog(t, d),
         )
 
@@ -2028,7 +2027,12 @@ class BumbleBoxV2GUI(tk.Tk):
         frame = ttk.Frame(parent)
         frame.grid(row=row, column=column, sticky=sticky, padx=padx, pady=pady, columnspan=columnspan)
         ttk.Label(frame, text=text).pack(side=tk.LEFT)
-        self._make_help_button(frame, title=help_title, details=help_details).pack(side=tk.LEFT, padx=(4, 0))
+        help_column = column + max(2, int(columnspan) + 1)
+        self._make_help_button(
+            parent,
+            title=help_title,
+            details=help_details,
+        ).grid(row=row, column=help_column, sticky="e", padx=(8, 0), pady=pady)
         return frame
 
     def _render_roadmap_steps(self, items: list[tuple[str, str]]) -> None:
@@ -2098,7 +2102,7 @@ class BumbleBoxV2GUI(tk.Tk):
             ttk.Button(
                 row,
                 text="?",
-                width=2,
+                width=1,
                 command=lambda s=normalized_state, t=text: self._show_roadmap_step_help(s, t),
             ).grid(row=0, column=2, sticky="ne", padx=(8, 0))
 
@@ -2785,40 +2789,40 @@ class BumbleBoxV2GUI(tk.Tk):
         )
         self._grid_help_label(
             sweep_frame,
-            row=1,
-            column=2,
+            row=2,
+            column=0,
             text="Stop",
             help_title="Sweep Stop FPS",
             help_details="Maximum FPS value tested in sweep.",
         )
         ttk.Entry(sweep_frame, textvariable=self.fps_sweep_stop_var, width=8).grid(
-            row=1, column=3, sticky="w", padx=8, pady=3
+            row=2, column=1, sticky="w", padx=8, pady=3
         )
         self._grid_help_label(
             sweep_frame,
-            row=2,
+            row=3,
             column=0,
             text="Step",
             help_title="Sweep Step",
             help_details="Increment between tested FPS values.",
         )
         ttk.Entry(sweep_frame, textvariable=self.fps_sweep_step_var, width=8).grid(
-            row=2, column=1, sticky="w", padx=8, pady=3
+            row=3, column=1, sticky="w", padx=8, pady=3
         )
         self._grid_help_label(
             sweep_frame,
-            row=2,
-            column=2,
+            row=4,
+            column=0,
             text="Probe seconds",
             help_title="Probe Duration",
             help_details="Recording length used for each FPS probe point in the sweep.",
         )
         ttk.Entry(sweep_frame, textvariable=self.fps_sweep_probe_seconds_var, width=8).grid(
-            row=2, column=3, sticky="w", padx=8, pady=3
+            row=4, column=1, sticky="w", padx=8, pady=3
         )
 
         advanced = ttk.LabelFrame(sweep_frame, text="Advanced Sweep Options", padding=6)
-        advanced.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        advanced.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         self._grid_help_label(
             advanced,
             row=0,
