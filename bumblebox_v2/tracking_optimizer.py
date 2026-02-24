@@ -22,6 +22,12 @@ DEFAULT_EXECUTION_TARGET = "pi_safe"
 DEFAULT_TAG_SIZE_MM = 2.5
 DEFAULT_EARLY_STOP_PATIENCE = 40
 DEFAULT_EARLY_STOP_MIN_IMPROVEMENT = 0.002
+VALID_SWEEP_OVERRIDE_KEYS = {
+    "minMarkerPerimeterRate",
+    "adaptiveThreshWinSizeMin",
+    "adaptiveThreshWinSizeMax",
+    "adaptiveThreshWinSizeStep",
+}
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mjpeg", ".avi", ".mov", ".mkv"}
@@ -89,6 +95,7 @@ class TrackingOptimizationResult:
     early_stop_patience: int
     early_stop_min_improvement: float
     early_stopped: bool
+    sweep_overrides: dict[str, list[float | int]]
     output_dir: str
     summary_json_path: str
     candidates_csv_path: str
@@ -167,6 +174,7 @@ def build_parameter_grid(
     tag_size_mm: float,
     frame_width: int,
     frame_height: int,
+    sweep_overrides: Optional[dict[str, Sequence[float | int]]] = None,
 ) -> list[dict[str, float | int]]:
     profile_key = str(profile).strip().lower()
     if profile_key not in VALID_PROFILES:
@@ -181,6 +189,35 @@ def build_parameter_grid(
         frame_width=frame_width,
         frame_height=frame_height,
     )
+    if sweep_overrides:
+        for key, values in sweep_overrides.items():
+            if key not in VALID_SWEEP_OVERRIDE_KEYS:
+                raise ValueError(
+                    "sweep override key must be one of "
+                    f"{sorted(VALID_SWEEP_OVERRIDE_KEYS)}, got: {key}"
+                )
+            if not values:
+                raise ValueError(f"sweep override list for '{key}' cannot be empty")
+
+            if key == "minMarkerPerimeterRate":
+                parsed = []
+                for value in values:
+                    parsed_value = float(value)
+                    if parsed_value <= 0:
+                        raise ValueError(f"{key} override values must be > 0")
+                    parsed.append(round(parsed_value, 6))
+                space[key] = sorted(set(parsed))
+            else:
+                parsed = []
+                for value in values:
+                    parsed_float = float(value)
+                    if not parsed_float.is_integer():
+                        raise ValueError(f"{key} override values must be whole numbers")
+                    parsed_value = int(parsed_float)
+                    if parsed_value <= 0:
+                        raise ValueError(f"{key} override values must be >= 1")
+                    parsed.append(parsed_value)
+                space[key] = sorted(set(parsed))
     keys = list(space.keys())
     combinations = []
     for values in itertools.product(*(space[key] for key in keys)):
@@ -503,6 +540,7 @@ def optimize_tracking(
     sample_frames: int = 80,
     dictionary_name: str = DEFAULT_DICTIONARY,
     tag_size_mm: float = DEFAULT_TAG_SIZE_MM,
+    sweep_overrides: Optional[dict[str, Sequence[float | int]]] = None,
     execution_target: str = DEFAULT_EXECUTION_TARGET,
     workers: Optional[int] = None,
     expected_tags: Optional[float] = None,
@@ -547,6 +585,7 @@ def optimize_tracking(
         tag_size_mm=tag_size_mm,
         frame_width=frame_width,
         frame_height=frame_height,
+        sweep_overrides=sweep_overrides,
     )
     resolved_workers = recommended_worker_count(target_key, workers)
 
@@ -643,6 +682,10 @@ def optimize_tracking(
         early_stop_patience=early_stop_patience,
         early_stop_min_improvement=early_stop_min_improvement,
         early_stopped=early_stopped,
+        sweep_overrides={
+            key: list(values)
+            for key, values in (sweep_overrides or {}).items()
+        },
         output_dir=str(run_dir),
         summary_json_path=str(run_dir / "optimization_summary.json"),
         candidates_csv_path=str(csv_path),
@@ -685,6 +728,11 @@ def format_optimization_report(result: TrackingOptimizationResult, top_k: int = 
                 f"(patience={result.early_stop_patience}, min_improvement={result.early_stop_min_improvement:.6f})"
             )
         ),
+        (
+            "Sweep overrides: none"
+            if not result.sweep_overrides
+            else f"Sweep overrides: {json.dumps(result.sweep_overrides, sort_keys=True)}"
+        ),
         f"Best score: {result.best_score:.4f}",
         f"Best mean detections/frame: {result.best_mean_detected:.3f}",
         f"Best params: {json.dumps(result.best_params, sort_keys=True)}",
@@ -718,6 +766,26 @@ def apply_best_params_to_config(config: dict, best_params: dict[str, float | int
 def legacy_entrypoint(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
 
+    def _parse_csv_values(raw: str, label: str, value_type: str) -> list[float | int]:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        tokens = [token.strip() for token in text.split(",") if token.strip()]
+        if not tokens:
+            raise ValueError(f"{label} is empty.")
+        out: list[float | int] = []
+        for token in tokens:
+            if value_type == "float":
+                out.append(float(token))
+            elif value_type == "int":
+                value_float = float(token)
+                if not value_float.is_integer():
+                    raise ValueError(f"{label} requires whole numbers, got: {token}")
+                out.append(int(value_float))
+            else:
+                raise ValueError(f"Unsupported parse type: {value_type}")
+        return out
+
     parser = argparse.ArgumentParser(
         description=(
             "Deprecated entry point. Use 'python3 bbx.py optimize-tracking' instead."
@@ -733,6 +801,26 @@ def legacy_entrypoint(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--sample-frames", type=int, default=80, help="Number of frames/images to sample.")
     parser.add_argument("--dictionary", default=DEFAULT_DICTIONARY, help="ArUco dictionary (for example 4X4_50).")
     parser.add_argument("--tag-size-mm", type=float, default=DEFAULT_TAG_SIZE_MM, help="Physical tag size in mm.")
+    parser.add_argument(
+        "--sweep-min-marker-perimeter-rate",
+        default="",
+        help="Optional comma-separated minMarkerPerimeterRate override values.",
+    )
+    parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-min",
+        default="",
+        help="Optional comma-separated adaptiveThreshWinSizeMin override values.",
+    )
+    parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-max",
+        default="",
+        help="Optional comma-separated adaptiveThreshWinSizeMax override values.",
+    )
+    parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-step",
+        default="",
+        help="Optional comma-separated adaptiveThreshWinSizeStep override values.",
+    )
     parser.add_argument(
         "--execution-target",
         choices=sorted(VALID_EXECUTION_TARGETS),
@@ -764,12 +852,46 @@ def legacy_entrypoint(argv: Optional[Sequence[str]] = None) -> int:
         "Use 'python3 bbx.py optimize-tracking ...' instead."
     )
     try:
+        sweep_overrides = {}
+        min_perimeter = _parse_csv_values(
+            args.sweep_min_marker_perimeter_rate,
+            "--sweep-min-marker-perimeter-rate",
+            "float",
+        )
+        if min_perimeter:
+            sweep_overrides["minMarkerPerimeterRate"] = min_perimeter
+
+        win_min = _parse_csv_values(
+            args.sweep_adaptive_thresh_win_size_min,
+            "--sweep-adaptive-thresh-win-size-min",
+            "int",
+        )
+        if win_min:
+            sweep_overrides["adaptiveThreshWinSizeMin"] = win_min
+
+        win_max = _parse_csv_values(
+            args.sweep_adaptive_thresh_win_size_max,
+            "--sweep-adaptive-thresh-win-size-max",
+            "int",
+        )
+        if win_max:
+            sweep_overrides["adaptiveThreshWinSizeMax"] = win_max
+
+        win_step = _parse_csv_values(
+            args.sweep_adaptive_thresh_win_size_step,
+            "--sweep-adaptive-thresh-win-size-step",
+            "int",
+        )
+        if win_step:
+            sweep_overrides["adaptiveThreshWinSizeStep"] = win_step
+
         result = optimize_tracking(
             input_path=args.input,
             profile=args.profile,
             sample_frames=args.sample_frames,
             dictionary_name=args.dictionary,
             tag_size_mm=args.tag_size_mm,
+            sweep_overrides=sweep_overrides or None,
             execution_target=args.execution_target,
             workers=args.workers,
             expected_tags=args.expected_tags,

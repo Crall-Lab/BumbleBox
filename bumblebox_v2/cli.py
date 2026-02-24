@@ -122,6 +122,43 @@ def _coerce_float(value: object, fallback: float) -> float:
         return float(fallback)
 
 
+def _parse_comma_numeric_values(raw: str, *, label: str, value_type: str) -> list[float | int]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    tokens = [token.strip() for token in text.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError(f"{label} is empty.")
+
+    out: list[float | int] = []
+    for token in tokens:
+        if value_type == "float":
+            try:
+                value = float(token)
+            except Exception as exc:
+                raise ValueError(f"{label} has invalid float value: {token}") from exc
+            out.append(value)
+            continue
+
+        if value_type == "int":
+            try:
+                value_float = float(token)
+            except Exception as exc:
+                raise ValueError(f"{label} has invalid integer value: {token}") from exc
+            if not value_float.is_integer():
+                raise ValueError(f"{label} requires whole numbers, got: {token}")
+            out.append(int(value_float))
+            continue
+
+        raise ValueError(f"Unsupported numeric parser type: {value_type}")
+
+    unique = []
+    for value in out:
+        if value not in unique:
+            unique.append(value)
+    return unique
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     try:
@@ -946,12 +983,46 @@ def _cmd_optimize_tracking(args: argparse.Namespace) -> int:
     )
 
     try:
+        sweep_overrides = {}
+        min_perimeter = _parse_comma_numeric_values(
+            args.sweep_min_marker_perimeter_rate,
+            label="--sweep-min-marker-perimeter-rate",
+            value_type="float",
+        )
+        if min_perimeter:
+            sweep_overrides["minMarkerPerimeterRate"] = min_perimeter
+
+        win_min = _parse_comma_numeric_values(
+            args.sweep_adaptive_thresh_win_size_min,
+            label="--sweep-adaptive-thresh-win-size-min",
+            value_type="int",
+        )
+        if win_min:
+            sweep_overrides["adaptiveThreshWinSizeMin"] = win_min
+
+        win_max = _parse_comma_numeric_values(
+            args.sweep_adaptive_thresh_win_size_max,
+            label="--sweep-adaptive-thresh-win-size-max",
+            value_type="int",
+        )
+        if win_max:
+            sweep_overrides["adaptiveThreshWinSizeMax"] = win_max
+
+        win_step = _parse_comma_numeric_values(
+            args.sweep_adaptive_thresh_win_size_step,
+            label="--sweep-adaptive-thresh-win-size-step",
+            value_type="int",
+        )
+        if win_step:
+            sweep_overrides["adaptiveThreshWinSizeStep"] = win_step
+
         result = optimize_tracking(
             input_path=args.input,
             profile=args.profile,
             sample_frames=args.sample_frames,
             dictionary_name=args.dictionary,
             tag_size_mm=args.tag_size_mm,
+            sweep_overrides=sweep_overrides or None,
             execution_target=args.execution_target,
             workers=args.workers,
             expected_tags=args.expected_tags,
@@ -1682,6 +1753,38 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=2.5,
         help="Physical ArUco tag size in millimeters (default 2.5).",
+    )
+    optimize_parser.add_argument(
+        "--sweep-min-marker-perimeter-rate",
+        default="",
+        help=(
+            "Optional comma-separated override values for minMarkerPerimeterRate "
+            "(for example 0.008,0.012,0.02)."
+        ),
+    )
+    optimize_parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-min",
+        default="",
+        help=(
+            "Optional comma-separated override values for adaptiveThreshWinSizeMin "
+            "(for example 3,5,7)."
+        ),
+    )
+    optimize_parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-max",
+        default="",
+        help=(
+            "Optional comma-separated override values for adaptiveThreshWinSizeMax "
+            "(for example 21,31,41)."
+        ),
+    )
+    optimize_parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-step",
+        default="",
+        help=(
+            "Optional comma-separated override values for adaptiveThreshWinSizeStep "
+            "(for example 2,4)."
+        ),
     )
     optimize_parser.add_argument(
         "--execution-target",

@@ -458,7 +458,7 @@ class BumbleBoxV2GUI(tk.Tk):
             (
                 "setup",
                 "BumbleBox Setup",
-                "Bring up hardware and configuration: roadmap, diagnostics, camera setup, tracking test, FPS checks, and calibration.",
+                "Bring up hardware and configuration: roadmap, diagnostics, camera setup, tracking optimization, FPS checks, and calibration.",
             ),
             (
                 "schedule_run",
@@ -546,8 +546,7 @@ class BumbleBoxV2GUI(tk.Tk):
         title_row = ttk.Frame(frame)
         title_row.grid(row=0, column=0, columnspan=2, sticky="ew")
         ttk.Label(title_row, text="BumbleBox V2", font=self._header_title_font).pack(side=tk.LEFT)
-        ttk.Label(title_row, text="Workflow:").pack(side=tk.LEFT, padx=(14, 4))
-        ttk.Label(title_row, textvariable=self._workflow_label_var).pack(side=tk.LEFT)
+        ttk.Label(title_row, textvariable=self._workflow_label_var).pack(side=tk.LEFT, padx=(14, 4))
         self.home_button = ttk.Button(title_row, text="Back to Home", command=self._show_intro)
         self.home_button.pack(side=tk.RIGHT)
 
@@ -584,7 +583,6 @@ class BumbleBoxV2GUI(tk.Tk):
         self.calibration_tab = ttk.Frame(self.notebook, padding=12)
         self.schedule_check_tab = ttk.Frame(self.notebook, padding=12)
         self.optimize_tracking_tab = ttk.Frame(self.notebook, padding=12)
-        self.test_tracking_tab = ttk.Frame(self.notebook, padding=12)
         self.config_tab = ttk.Frame(self.notebook, padding=12)
         self.nest_label_tab = ttk.Frame(self.notebook, padding=12)
         self.fleet_tab = ttk.Frame(self.notebook, padding=12)
@@ -598,7 +596,6 @@ class BumbleBoxV2GUI(tk.Tk):
         self._build_calibration_tab()
         self._build_schedule_check_tab()
         self._build_optimize_tracking_tab()
-        self._build_test_tracking_tab()
         self._build_nest_label_tab()
         self._build_fleet_tab()
         self._build_run_tab()
@@ -611,7 +608,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "fps": self.fps_tab,
             "calibration": self.calibration_tab,
             "schedule_check": self.schedule_check_tab,
-            "test_tracking": self.test_tracking_tab,
+            "tracking_optimization": self.optimize_tracking_tab,
             "nest_labeling": self.nest_label_tab,
             "fleet": self.fleet_tab,
             "run": self.run_tab,
@@ -621,7 +618,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "doctor": "Doctor",
             "config": "Config Editor",
             "camera_setup": "Camera Setup",
-            "test_tracking": "Test Tracking",
+            "tracking_optimization": "Tracking Optimization",
             "fps": "FPS Report",
             "calibration": "Calibration",
             "schedule_check": "Schedule Check",
@@ -630,7 +627,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "fleet": "Fleet Setup",
         }
         self._workflow_tabs = {
-            "setup": ["roadmap", "doctor", "config", "camera_setup", "test_tracking", "fps", "calibration"],
+            "setup": ["roadmap", "doctor", "config", "camera_setup", "tracking_optimization", "fps", "calibration"],
             "schedule_run": ["schedule_check", "run"],
             "nest_labeling": ["nest_labeling"],
             "fleet": ["fleet"],
@@ -985,6 +982,15 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Review drift and limits before long runs.",
             ]
             done_check = "FPS results are visible and acceptable for your plan."
+        elif "aruco" in lower or "tracking optimization" in lower:
+            where = "BumbleBox Setup -> Tracking Optimization"
+            steps = [
+                "Set input path and profile.",
+                "Set execution target for Pi-safe or desktop mode.",
+                "Run optimization and review top candidates.",
+                "Apply best parameters to config if needed.",
+            ]
+            done_check = "Optimization results are saved and best params are available."
         elif "schedule check" in lower or "timing margins" in lower:
             where = "Schedule and Run -> Schedule Check"
             steps = [
@@ -1618,20 +1624,6 @@ class BumbleBoxV2GUI(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Schedule check failed", str(exc))
 
-    def _build_test_tracking_tab(self) -> None:
-        intro = ttk.LabelFrame(self.test_tracking_tab, text="Test Tracking", padding=10)
-        intro.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(
-            intro,
-            text=(
-                "This tab is reserved for the next test-tracking workflow revision.\n\n"
-                "Current status: placeholder only.\n"
-                "In the meantime, use Camera Setup -> Run Live Tracking Test for quick validation."
-            ),
-            wraplength=860,
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W)
-
     def _build_optimize_tracking_tab(self) -> None:
         top = ttk.Frame(self.optimize_tracking_tab)
         top.pack(fill=tk.X)
@@ -1651,6 +1643,10 @@ class BumbleBoxV2GUI(tk.Tk):
         self.opt_preview_frames_var = tk.StringVar(value="240")
         self.opt_apply_best_var = tk.BooleanVar(value=True)
         self.opt_top_k_var = tk.StringVar(value="5")
+        self.opt_sweep_min_marker_perimeter_rate_var = tk.StringVar(value="")
+        self.opt_sweep_adaptive_thresh_win_size_min_var = tk.StringVar(value="")
+        self.opt_sweep_adaptive_thresh_win_size_max_var = tk.StringVar(value="")
+        self.opt_sweep_adaptive_thresh_win_size_step_var = tk.StringVar(value="")
         self.opt_status_var = tk.StringVar(value="Idle")
         self._optimize_top_k = 5
 
@@ -1721,6 +1717,43 @@ class BumbleBoxV2GUI(tk.Tk):
         ).pack(side=tk.LEFT, padx=12)
         ttk.Label(preview_options, text="Preview frames").pack(side=tk.LEFT, padx=(6, 2))
         ttk.Entry(preview_options, textvariable=self.opt_preview_frames_var, width=8).pack(side=tk.LEFT)
+
+        sweep_frame = ttk.LabelFrame(
+            advanced,
+            text="Custom Sweep Overrides (optional, comma-separated)",
+            padding=6,
+        )
+        sweep_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(sweep_frame, text="minMarkerPerimeterRate").grid(row=0, column=0, sticky="w")
+        ttk.Entry(
+            sweep_frame,
+            textvariable=self.opt_sweep_min_marker_perimeter_rate_var,
+            width=28,
+        ).grid(row=0, column=1, sticky="ew", padx=8, pady=2)
+        ttk.Label(sweep_frame, text="adaptiveThreshWinSizeMin").grid(row=1, column=0, sticky="w")
+        ttk.Entry(
+            sweep_frame,
+            textvariable=self.opt_sweep_adaptive_thresh_win_size_min_var,
+            width=28,
+        ).grid(row=1, column=1, sticky="ew", padx=8, pady=2)
+        ttk.Label(sweep_frame, text="adaptiveThreshWinSizeMax").grid(row=2, column=0, sticky="w")
+        ttk.Entry(
+            sweep_frame,
+            textvariable=self.opt_sweep_adaptive_thresh_win_size_max_var,
+            width=28,
+        ).grid(row=2, column=1, sticky="ew", padx=8, pady=2)
+        ttk.Label(sweep_frame, text="adaptiveThreshWinSizeStep").grid(row=3, column=0, sticky="w")
+        ttk.Entry(
+            sweep_frame,
+            textvariable=self.opt_sweep_adaptive_thresh_win_size_step_var,
+            width=28,
+        ).grid(row=3, column=1, sticky="ew", padx=8, pady=2)
+        ttk.Label(
+            sweep_frame,
+            text="Leave blank to use profile defaults for any field.",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        sweep_frame.columnconfigure(1, weight=1)
+
         advanced.columnconfigure(1, weight=1)
         self._register_advanced_widget(advanced)
 
@@ -1743,6 +1776,41 @@ class BumbleBoxV2GUI(tk.Tk):
             default_visible=False,
             auto_hide_when_empty=True,
         )
+
+    def _parse_csv_numeric_values(self, raw: str, *, label: str, value_type: str) -> list[float | int]:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        tokens = [token.strip() for token in text.split(",") if token.strip()]
+        if not tokens:
+            raise ValueError(f"{label} is empty.")
+
+        out: list[float | int] = []
+        for token in tokens:
+            if value_type == "float":
+                try:
+                    out.append(float(token))
+                except Exception as exc:
+                    raise ValueError(f"{label} has invalid float value: {token}") from exc
+                continue
+
+            if value_type == "int":
+                try:
+                    as_float = float(token)
+                except Exception as exc:
+                    raise ValueError(f"{label} has invalid integer value: {token}") from exc
+                if not as_float.is_integer():
+                    raise ValueError(f"{label} requires whole numbers, got: {token}")
+                out.append(int(as_float))
+                continue
+
+            raise ValueError(f"Unsupported parse type: {value_type}")
+
+        unique = []
+        for value in out:
+            if value not in unique:
+                unique.append(value)
+        return unique
 
     def _start_optimize_tracking(self) -> None:
         if self._optimize_thread and self._optimize_thread.is_alive():
@@ -1788,6 +1856,39 @@ class BumbleBoxV2GUI(tk.Tk):
             top_k = int(self.opt_top_k_var.get().strip())
             if top_k <= 0:
                 raise ValueError("top results must be >= 1")
+
+            sweep_overrides = {}
+            min_perimeter = self._parse_csv_numeric_values(
+                self.opt_sweep_min_marker_perimeter_rate_var.get(),
+                label="minMarkerPerimeterRate sweep",
+                value_type="float",
+            )
+            if min_perimeter:
+                sweep_overrides["minMarkerPerimeterRate"] = min_perimeter
+
+            win_min = self._parse_csv_numeric_values(
+                self.opt_sweep_adaptive_thresh_win_size_min_var.get(),
+                label="adaptiveThreshWinSizeMin sweep",
+                value_type="int",
+            )
+            if win_min:
+                sweep_overrides["adaptiveThreshWinSizeMin"] = win_min
+
+            win_max = self._parse_csv_numeric_values(
+                self.opt_sweep_adaptive_thresh_win_size_max_var.get(),
+                label="adaptiveThreshWinSizeMax sweep",
+                value_type="int",
+            )
+            if win_max:
+                sweep_overrides["adaptiveThreshWinSizeMax"] = win_max
+
+            win_step = self._parse_csv_numeric_values(
+                self.opt_sweep_adaptive_thresh_win_size_step_var.get(),
+                label="adaptiveThreshWinSizeStep sweep",
+                value_type="int",
+            )
+            if win_step:
+                sweep_overrides["adaptiveThreshWinSizeStep"] = win_step
         except Exception as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
@@ -1810,6 +1911,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "sample_frames": sample_frames,
             "dictionary_name": self.opt_dictionary_var.get().strip() or "4X4_50",
             "tag_size_mm": tag_size_mm,
+            "sweep_overrides": sweep_overrides or None,
             "execution_target": self.opt_execution_target_var.get().strip(),
             "workers": workers,
             "expected_tags": expected_tags,
