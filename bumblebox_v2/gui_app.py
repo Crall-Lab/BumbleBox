@@ -250,17 +250,27 @@ class BumbleBoxV2GUI(tk.Tk):
         style.configure(
             "RoadmapStateDone.TLabel",
             background=colors["entry_bg"],
-            foreground=colors["text_light"],
+            foreground="#63D47C",
         )
         style.configure(
             "RoadmapStateTodo.TLabel",
             background=colors["entry_bg"],
-            foreground=colors["text_light"],
+            foreground="#EACB63",
         )
         style.configure(
             "RoadmapStateOptional.TLabel",
             background=colors["entry_bg"],
             foreground=colors["text_muted"],
+        )
+        style.configure(
+            "RoadmapStateOptionalDone.TLabel",
+            background=colors["entry_bg"],
+            foreground="#63D47C",
+        )
+        style.configure(
+            "RoadmapStateOptionalTodo.TLabel",
+            background=colors["entry_bg"],
+            foreground="#EACB63",
         )
 
     def _setup_responsive_typography(self) -> None:
@@ -844,39 +854,38 @@ class BumbleBoxV2GUI(tk.Tk):
         paging.pack(fill=tk.X, pady=(0, 6))
         self.roadmap_prev_btn = ttk.Button(
             paging,
-            text="Previous Remaining Set",
-            command=lambda: self._change_roadmap_remaining_page(-1),
+            text="Previous Set",
+            command=lambda: self._change_roadmap_page(-1),
         )
         self.roadmap_prev_btn.pack(side=tk.LEFT)
         self.roadmap_next_btn = ttk.Button(
             paging,
-            text="Next Remaining Set",
-            command=lambda: self._change_roadmap_remaining_page(1),
+            text="Next Set",
+            command=lambda: self._change_roadmap_page(1),
         )
         self.roadmap_next_btn.pack(side=tk.LEFT, padx=(6, 0))
-        self.roadmap_page_var = tk.StringVar(value="Remaining set 1/1")
+        self.roadmap_page_var = tk.StringVar(value="Set 1/1")
         ttk.Label(paging, textvariable=self.roadmap_page_var).pack(side=tk.LEFT, padx=(10, 0))
 
         self.roadmap_steps_frame = ttk.Frame(self.roadmap_tab)
         self.roadmap_steps_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
         self._roadmap_items: list[tuple[str, str]] = []
-        self._roadmap_remaining_page = 0
-        self._roadmap_remaining_page_count = 1
-        self._roadmap_remaining_total = 0
+        self._roadmap_page = 0
+        self._roadmap_page_count = 1
         self._roadmap_step_labels: list[ttk.Label] = []
         self._refresh_roadmap(select_tab=False)
 
-    def _change_roadmap_remaining_page(self, delta: int) -> None:
+    def _change_roadmap_page(self, delta: int) -> None:
         if not getattr(self, "_roadmap_items", None):
             return
-        page_count = max(1, int(getattr(self, "_roadmap_remaining_page_count", 1)))
+        page_count = max(1, int(getattr(self, "_roadmap_page_count", 1)))
         if page_count <= 1:
             return
-        current = int(getattr(self, "_roadmap_remaining_page", 0))
+        current = int(getattr(self, "_roadmap_page", 0))
         new_page = min(page_count - 1, max(0, current + delta))
         if new_page == current:
             return
-        self._roadmap_remaining_page = new_page
+        self._roadmap_page = new_page
         self._render_roadmap_steps(self._roadmap_items)
 
     def _roadmap_wraplength(self) -> int:
@@ -916,12 +925,12 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Click 'Save Config' if needed.",
             ]
             done_check = "Config is present and validation reports success."
-        elif "camera bring-up" in lower or "camera-preview" in lower:
+        elif "check camera" in lower or "camera setup" in lower:
             where = "BumbleBox Setup -> Camera Setup"
             steps = [
-                "Run 'Run Camera Preview'.",
+                "Click 'Run Camera Preview'.",
                 "Check focus/framing in the preview window.",
-                "Run 'Run Live Tracking Test'.",
+                "Click 'Run Live Tracking Test'.",
             ]
             done_check = "Both preview and tracking test complete without errors."
         elif "calibration" in lower or "px/cm" in lower:
@@ -949,6 +958,15 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Save and validate config.",
             ]
             done_check = "Deferred tracking setting is saved as intended."
+        elif "mp4" in lower or "mjpeg" in lower:
+            where = "BumbleBox Setup -> Config Editor"
+            steps = [
+                "Find 'MP4 codec' in camera settings.",
+                "Keep an MP4 codec selected.",
+                "Find 'FPS report each recording' in runtime settings and keep it enabled.",
+                "Save and validate config.",
+            ]
+            done_check = "MP4 and FPS reporting settings are saved."
         elif "fps" in lower:
             where = "BumbleBox Setup -> FPS Report"
             steps = [
@@ -957,7 +975,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Review drift and limits before long runs.",
             ]
             done_check = "FPS results are visible and acceptable for your plan."
-        elif "schedule-check" in lower or "timing margins" in lower:
+        elif "schedule check" in lower or "timing margins" in lower:
             where = "Schedule and Run -> Schedule Check"
             steps = [
                 "Set benchmark input (optional but recommended).",
@@ -986,8 +1004,8 @@ class BumbleBoxV2GUI(tk.Tk):
             where = "Schedule and Run -> Schedule and Run"
             steps = [
                 "Generate systemd units.",
-                "Run 'Systemd Install' and 'Systemd Enable'.",
-                "Run 'Systemd Status' to verify.",
+                "Use 'Systemd Install' and 'Systemd Enable'.",
+                "Use 'Systemd Status' to verify.",
             ]
             done_check = "Systemd status reports active/expected timers."
         elif "export-bundle" in lower or "bundle" in lower:
@@ -1002,6 +1020,8 @@ class BumbleBoxV2GUI(tk.Tk):
         status_line = {
             "DONE": "Status: completed based on current config/environment checks.",
             "TODO": "Status: not completed yet.",
+            "OPTIONAL_DONE": "Status: completed optional step.",
+            "OPTIONAL_TODO": "Status: optional step not completed yet.",
             "OPTIONAL": "Status: optional step.",
             "INFO": "Status: optional informational step.",
         }.get(state.upper(), f"Status: {state}")
@@ -1061,9 +1081,9 @@ class BumbleBoxV2GUI(tk.Tk):
         dialog.grab_set()
         dialog.focus_set()
 
-    def _show_roadmap_step_help(self, index: int, state: str, text: str) -> None:
+    def _show_roadmap_step_help(self, state: str, text: str) -> None:
         details = self._roadmap_help_details(state, text)
-        self._open_roadmap_help_dialog(f"Roadmap Step {index}", details)
+        self._open_roadmap_help_dialog("Roadmap Task", details)
 
     def _render_roadmap_steps(self, items: list[tuple[str, str]]) -> None:
         self._roadmap_items = list(items)
@@ -1071,54 +1091,54 @@ class BumbleBoxV2GUI(tk.Tk):
             child.destroy()
         self._roadmap_step_labels = []
 
-        indexed_items: list[tuple[int, str, str]] = []
-        for idx, (state, text) in enumerate(items, start=1):
+        indexed_items: list[tuple[str, str]] = []
+        for state, text in items:
             normalized_state = state.upper().strip()
-            indexed_items.append((idx, normalized_state, text))
+            indexed_items.append((normalized_state, text))
 
-        done_items = [item for item in indexed_items if item[1] == "DONE"]
-        remaining_items = [item for item in indexed_items if item[1] != "DONE"]
-
-        if len(remaining_items) > 1:
-            page_count = 2
+        if len(indexed_items) <= 1:
+            pages = [indexed_items]
         else:
-            page_count = 1
-        self._roadmap_remaining_page_count = page_count
-        self._roadmap_remaining_total = len(remaining_items)
-        self._roadmap_remaining_page = min(
-            page_count - 1,
-            max(0, int(getattr(self, "_roadmap_remaining_page", 0))),
+            split = (len(indexed_items) + 1) // 2
+            pages = [indexed_items[:split], indexed_items[split:]]
+
+        self._roadmap_page_count = max(1, len(pages))
+        self._roadmap_page = min(
+            self._roadmap_page_count - 1,
+            max(0, int(getattr(self, "_roadmap_page", 0))),
         )
+        current_page_items = pages[self._roadmap_page] if pages else []
 
-        remaining_subset: list[tuple[int, str, str]] = remaining_items
-        if page_count > 1:
-            split = (len(remaining_items) + 1) // 2
-            start = self._roadmap_remaining_page * split
-            end = start + split
-            remaining_subset = remaining_items[start:end]
+        def _is_done_state(state: str) -> bool:
+            return state in {"DONE", "OPTIONAL_DONE"}
 
-        display_items = done_items + remaining_subset
+        page_done = [item for item in current_page_items if _is_done_state(item[0])]
+        page_not_done = [item for item in current_page_items if not _is_done_state(item[0])]
+        display_items = page_done + page_not_done
 
-        for idx, normalized_state, text in display_items:
+        for normalized_state, text in display_items:
             row = ttk.Frame(self.roadmap_steps_frame, style="RoadmapCard.TFrame", padding=(8, 8))
             row.pack(fill=tk.X, pady=(0, 7))
             row.columnconfigure(1, weight=1)
 
-            if normalized_state == "DONE":
-                state_label = "☑ DONE"
-                state_style = "RoadmapStateDone.TLabel"
-            elif normalized_state in {"OPTIONAL", "INFO"}:
-                state_label = f"[{normalized_state}]"
-                state_style = "RoadmapStateOptional.TLabel"
-            else:
-                state_label = "☐ TODO"
-                state_style = "RoadmapStateTodo.TLabel"
+            state_block = ttk.Frame(row, style="RoadmapCard.TFrame")
+            state_block.grid(row=0, column=0, sticky="nw", padx=(0, 10))
 
-            ttk.Label(row, text=state_label, style=state_style).grid(row=0, column=0, sticky="nw", padx=(0, 10))
+            is_optional = normalized_state.startswith("OPTIONAL") or normalized_state == "INFO"
+            is_done = _is_done_state(normalized_state)
+            if is_done:
+                state_label = "☑ DONE"
+                state_style = "RoadmapStateDone.TLabel" if not is_optional else "RoadmapStateOptionalDone.TLabel"
+            else:
+                state_label = "☐ TO DO"
+                state_style = "RoadmapStateTodo.TLabel" if not is_optional else "RoadmapStateOptionalTodo.TLabel"
+            ttk.Label(state_block, text=state_label, style=state_style).pack(anchor=tk.W)
+            if is_optional:
+                ttk.Label(state_block, text="[optional]", style="RoadmapStateOptional.TLabel").pack(anchor=tk.W)
 
             text_label = ttk.Label(
                 row,
-                text=f"{idx}. {text}",
+                text=text,
                 style="RoadmapCardText.TLabel",
                 justify=tk.LEFT,
                 wraplength=self._roadmap_wraplength(),
@@ -1129,30 +1149,25 @@ class BumbleBoxV2GUI(tk.Tk):
                 row,
                 text="?",
                 width=2,
-                command=lambda i=idx, s=normalized_state, t=text: self._show_roadmap_step_help(i, s, t),
+                command=lambda s=normalized_state, t=text: self._show_roadmap_step_help(s, t),
             ).grid(row=0, column=2, sticky="ne", padx=(8, 0))
 
         total = len(items)
-        done_count = len(done_items)
-        optional_count = sum(1 for _idx, state, _text in indexed_items if state in {"OPTIONAL", "INFO"})
-        actionable_remaining = sum(1 for _idx, state, _text in indexed_items if state == "TODO")
+        done_count = sum(1 for state, _text in indexed_items if _is_done_state(state))
+        optional_count = sum(1 for state, _text in indexed_items if state.startswith("OPTIONAL") or state == "INFO")
+        actionable_remaining = sum(1 for state, _text in indexed_items if state == "TODO")
         self.roadmap_summary_var.set(
             f"Completed: {done_count}/{total}   Remaining actionable: {actionable_remaining}   Optional: {optional_count}"
         )
-        if self._roadmap_remaining_total == 0:
-            self.roadmap_page_var.set("No remaining tasks.")
-        elif self._roadmap_remaining_page_count == 1:
-            self.roadmap_page_var.set("Remaining set 1/1")
-        else:
-            current_page = self._roadmap_remaining_page + 1
-            self.roadmap_page_var.set(f"Remaining set {current_page}/{self._roadmap_remaining_page_count}")
+        current_page = self._roadmap_page + 1
+        self.roadmap_page_var.set(f"Set {current_page}/{self._roadmap_page_count}")
         self.roadmap_prev_btn.configure(
-            state=(tk.NORMAL if self._roadmap_remaining_page_count > 1 and self._roadmap_remaining_page > 0 else tk.DISABLED)
+            state=(tk.NORMAL if self._roadmap_page_count > 1 and self._roadmap_page > 0 else tk.DISABLED)
         )
         self.roadmap_next_btn.configure(
             state=(
                 tk.NORMAL
-                if self._roadmap_remaining_page_count > 1 and self._roadmap_remaining_page < self._roadmap_remaining_page_count - 1
+                if self._roadmap_page_count > 1 and self._roadmap_page < self._roadmap_page_count - 1
                 else tk.DISABLED
             )
         )
@@ -1234,6 +1249,7 @@ class BumbleBoxV2GUI(tk.Tk):
             ("FPS target", "camera.fps_target", float, None),
             ("Shutter (us)", "camera.shutter_us", int, None),
             ("Preview window", "camera.preview_window", str, ["QTGL", "QT", "DRM"]),
+            ("MP4 codec", "camera.mp4_codec", str, None),
             ("Tuning file", "camera.tuning_file", str, None),
             ("Pipeline mode", "pipeline.mode", str, ["record_only", "track_only", "record_and_track", "mixed_schedule"]),
             ("Tracking source", "pipeline.tracking_source", str, ["ram", "video"]),
