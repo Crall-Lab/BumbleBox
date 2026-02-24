@@ -75,6 +75,7 @@ runtime:
   save_frame_timestamps: true
   fps_report_on_each_recording: true
   save_mp4_sidecar_fps_txt: true
+  ui_theme_mode: "dark"
 
 scheduling:
   backend: "systemd"

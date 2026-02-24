@@ -98,6 +98,20 @@ OCEAN_SLATE_PALETTE = {
     "output_text": "#DCE8F2",
 }
 
+LAVENDER_LIGHT_PALETTE = {
+    "app_bg": "#EFE7FA",
+    "panel_bg": "#E3D8F3",
+    "tab_btn_bg": "#C8B7E8",
+    "tab_btn_active": "#B7A2DE",
+    "tab_selected": "#A38AD1",
+    "text_light": "#1A1428",
+    "text_muted": "#4F4563",
+    "entry_bg": "#FFFFFF",
+    "entry_fg": "#111111",
+    "output_bg": "#FFFFFF",
+    "output_text": "#111111",
+}
+
 
 class BumbleBoxV2GUI(tk.Tk):
     def __init__(self) -> None:
@@ -107,6 +121,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self.minsize(920, 620)
 
         self.config_path_var = tk.StringVar(value=str(DEFAULT_USER_CONFIG_PATH))
+        self.theme_mode_var = tk.StringVar(value=self._read_theme_mode_from_config())
         self.ui_mode_var = tk.StringVar(value="basic")
         self.config_fields: dict[str, tuple[tk.Variable, type]] = {}
         self._tab_lookup: dict[str, ttk.Frame] = {}
@@ -126,7 +141,9 @@ class BumbleBoxV2GUI(tk.Tk):
         self._fps_sweep_progress_q: queue.Queue[tuple[int, int, float]] = queue.Queue()
         self._config_form_canvas: tk.Canvas | None = None
         self._config_form_window: int | None = None
-        self._palette = dict(OCEAN_SLATE_PALETTE)
+        self._theme_knob: ttk.Scale | None = None
+        self._suppress_theme_knob_callback = False
+        self._palette = self._palette_for_theme_mode(self.theme_mode_var.get())
         self._results_sections: dict[tk.Text, dict[str, object]] = {}
         self._tab_titles: dict[str, str] = {}
         self._workflow_tabs: dict[str, list[str]] = {}
@@ -299,6 +316,210 @@ class BumbleBoxV2GUI(tk.Tk):
             foreground="#EACB63",
         )
 
+    def _palette_for_theme_mode(self, mode: str) -> dict[str, str]:
+        key = str(mode or "").strip().lower()
+        if key == "light":
+            return dict(LAVENDER_LIGHT_PALETTE)
+        return dict(OCEAN_SLATE_PALETTE)
+
+    def _read_theme_mode_from_config(self) -> str:
+        try:
+            config_path = Path(self.config_path_var.get()).expanduser()
+            if config_path.exists():
+                config = load_config(config_path)
+            else:
+                config = load_defaults()
+            raw = str(config.get("runtime", {}).get("ui_theme_mode", "dark")).strip().lower()
+            return "light" if raw == "light" else "dark"
+        except Exception:
+            return "dark"
+
+    def _persist_theme_mode_to_config(self) -> None:
+        try:
+            config_path = Path(self.config_path_var.get()).expanduser()
+            if config_path.exists():
+                config = load_config(config_path)
+            else:
+                config = load_defaults()
+            config.setdefault("runtime", {})
+            config["runtime"]["ui_theme_mode"] = (
+                "light" if str(self.theme_mode_var.get()).strip().lower() == "light" else "dark"
+            )
+            save_config(config_path, config)
+        except Exception:
+            # Best-effort persistence; GUI should still function if config write fails.
+            pass
+
+    def _set_theme_mode(
+        self,
+        mode: str,
+        *,
+        sync_knob: bool = True,
+        persist_preference: bool = True,
+    ) -> None:
+        normalized = "light" if str(mode or "").strip().lower() == "light" else "dark"
+        previous = str(self.theme_mode_var.get() or "dark").strip().lower()
+        if normalized == previous and self._palette == self._palette_for_theme_mode(normalized):
+            if persist_preference:
+                self._persist_theme_mode_to_config()
+            if sync_knob:
+                self._sync_theme_knob_position()
+            return
+
+        self.theme_mode_var.set(normalized)
+        self._palette = self._palette_for_theme_mode(normalized)
+        self._apply_ocean_slate_theme()
+
+        if self._config_form_canvas is not None:
+            try:
+                self._config_form_canvas.configure(bg=self._palette["panel_bg"])
+            except Exception:
+                pass
+
+        for widget in list(self._results_sections.keys()):
+            try:
+                self._style_output_text(widget)
+            except Exception:
+                continue
+
+        self._refresh_intro_theme_widgets()
+
+        if persist_preference:
+            self._persist_theme_mode_to_config()
+
+        if sync_knob:
+            self._sync_theme_knob_position()
+
+    def _on_theme_knob_changed(self, value: str) -> None:
+        if bool(getattr(self, "_suppress_theme_knob_callback", False)):
+            return
+        try:
+            numeric = float(value)
+        except Exception:
+            return
+        desired = "light" if numeric >= 0.5 else "dark"
+        self._set_theme_mode(desired, sync_knob=False, persist_preference=True)
+
+    def _on_theme_knob_released(self, _event=None) -> None:
+        self._sync_theme_knob_position()
+
+    def _sync_theme_knob_position(self) -> None:
+        knob = getattr(self, "_theme_knob", None)
+        if knob is None:
+            return
+        try:
+            if not knob.winfo_exists():
+                return
+        except Exception:
+            return
+        target = 1.0 if str(self.theme_mode_var.get()).strip().lower() == "light" else 0.0
+        self._suppress_theme_knob_callback = True
+        try:
+            knob.set(target)
+        finally:
+            self._suppress_theme_knob_callback = False
+
+    def _refresh_intro_theme_widgets(self) -> None:
+        colors = self._palette
+        hero = getattr(self, "_intro_hero_frame", None)
+        if hero is not None:
+            try:
+                hero.configure(bg=colors["entry_bg"], highlightbackground=colors["tab_selected"])
+            except Exception:
+                pass
+
+        for frame in getattr(self, "_intro_card_frames", []):
+            try:
+                frame.configure(bg=colors["entry_bg"], highlightbackground=colors["tab_btn_active"])
+            except Exception:
+                continue
+
+        for frame in getattr(self, "_intro_card_header_frames", []):
+            try:
+                frame.configure(bg=colors["entry_bg"])
+            except Exception:
+                continue
+
+        for label in getattr(self, "_intro_card_title_labels", []):
+            try:
+                label.configure(bg=colors["entry_bg"], fg=colors["text_light"])
+            except Exception:
+                continue
+
+        for label in getattr(self, "_intro_badge_labels", []):
+            try:
+                label.configure(bg=colors["tab_selected"], fg=colors["text_light"])
+            except Exception:
+                continue
+
+        for label in getattr(self, "_intro_desc_labels", []):
+            try:
+                label.configure(bg=colors["entry_bg"], fg=colors["text_muted"])
+            except Exception:
+                continue
+
+        hero_title = getattr(self, "_intro_hero_title", None)
+        if hero_title is not None:
+            try:
+                hero_title.configure(bg=colors["entry_bg"], fg=colors["text_light"])
+            except Exception:
+                pass
+
+        hero_subtitle = getattr(self, "_intro_hero_subtitle", None)
+        if hero_subtitle is not None:
+            try:
+                hero_subtitle.configure(bg=colors["entry_bg"], fg=colors["text_muted"])
+            except Exception:
+                pass
+
+        footer = getattr(self, "_intro_theme_footer", None)
+        if footer is not None:
+            try:
+                footer.configure(bg=colors["panel_bg"])
+            except Exception:
+                pass
+
+        panel = getattr(self, "_intro_theme_panel", None)
+        if panel is not None:
+            try:
+                panel.configure(bg=colors["entry_bg"], highlightbackground=colors["tab_btn_active"])
+            except Exception:
+                pass
+
+        title_label = getattr(self, "_intro_theme_title_label", None)
+        if title_label is not None:
+            try:
+                title_label.configure(bg=colors["entry_bg"], fg=colors["text_light"])
+            except Exception:
+                pass
+
+        mode = str(self.theme_mode_var.get() or "dark").strip().lower()
+        dark_label = getattr(self, "_intro_theme_dark_label", None)
+        if dark_label is not None:
+            try:
+                dark_label.configure(
+                    bg=colors["entry_bg"],
+                    fg=(colors["text_light"] if mode == "dark" else colors["text_muted"]),
+                )
+            except Exception:
+                pass
+        light_label = getattr(self, "_intro_theme_light_label", None)
+        if light_label is not None:
+            try:
+                light_label.configure(
+                    bg=colors["entry_bg"],
+                    fg=(colors["text_light"] if mode == "light" else colors["text_muted"]),
+                )
+            except Exception:
+                pass
+
+        hint_label = getattr(self, "_intro_theme_hint_label", None)
+        if hint_label is not None:
+            try:
+                hint_label.configure(bg=colors["entry_bg"], fg=colors["text_muted"])
+            except Exception:
+                pass
+
     def _setup_responsive_typography(self) -> None:
         self._base_window_width = 980
         self._base_window_height = 680
@@ -378,7 +599,10 @@ class BumbleBoxV2GUI(tk.Tk):
         text_height: int = 9,
         default_visible: bool = False,
         auto_hide_when_empty: bool = True,
-        show_status: bool = True,
+        show_status: bool = False,
+        auto_height: bool = False,
+        min_text_lines: int = 3,
+        max_text_lines: int = 14,
         fill: str = tk.BOTH,
         expand: bool = True,
         pady: tuple[int, int] = (10, 0),
@@ -409,6 +633,9 @@ class BumbleBoxV2GUI(tk.Tk):
             "fill": fill,
             "expand": expand,
             "auto_hide_when_empty": auto_hide_when_empty,
+            "auto_height": auto_height,
+            "min_text_lines": max(1, int(min_text_lines)),
+            "max_text_lines": max(1, int(max_text_lines)),
         }
         toggle_btn.configure(command=lambda widget=text_widget: self._toggle_results_section(widget))
         text_widget.bind("<<Modified>>", self._on_results_text_modified, add="+")
@@ -461,6 +688,8 @@ class BumbleBoxV2GUI(tk.Tk):
         if isinstance(status_var, tk.StringVar):
             status_var.set("Output available" if content else "No output")
 
+        self._auto_size_results_text(text_widget, content)
+
         if content:
             self._set_results_section_visible(text_widget, True)
         elif bool(meta.get("auto_hide_when_empty", True)):
@@ -468,9 +697,29 @@ class BumbleBoxV2GUI(tk.Tk):
 
         text_widget.edit_modified(False)
 
+    def _auto_size_results_text(self, text_widget: tk.Text, content: str) -> None:
+        meta = self._results_sections.get(text_widget)
+        if not meta or not bool(meta.get("auto_height", False)):
+            return
+
+        min_lines = max(1, int(meta.get("min_text_lines", 3)))
+        max_lines = max(min_lines, int(meta.get("max_text_lines", 14)))
+        line_count = max(1, len((content or "").splitlines()))
+        target_lines = min(max_lines, max(min_lines, line_count + 1))
+        try:
+            text_widget.configure(height=target_lines)
+        except Exception:
+            return
+
     def _build_intro_page(self) -> None:
         colors = self._palette
         self.intro_frame = ttk.Frame(self.main_content, padding=12)
+
+        self._intro_card_frames: list[tk.Frame] = []
+        self._intro_card_header_frames: list[tk.Frame] = []
+        self._intro_card_title_labels: list[tk.Label] = []
+        self._intro_badge_labels: list[tk.Label] = []
+        self._intro_desc_labels: list[tk.Label] = []
 
         hero = tk.Frame(
             self.intro_frame,
@@ -480,8 +729,9 @@ class BumbleBoxV2GUI(tk.Tk):
             padx=18,
             pady=14,
         )
+        self._intro_hero_frame = hero
         hero.pack(fill=tk.X, pady=(0, 14))
-        tk.Label(
+        self._intro_hero_title = tk.Label(
             hero,
             text="BumbleBox Control Center",
             bg=colors["entry_bg"],
@@ -489,7 +739,8 @@ class BumbleBoxV2GUI(tk.Tk):
             font=self._hero_title_font,
             anchor="w",
             justify=tk.LEFT,
-        ).pack(fill=tk.X, anchor="w")
+        )
+        self._intro_hero_title.pack(fill=tk.X, anchor="w")
         self._intro_hero_subtitle = tk.Label(
             hero,
             text=(
@@ -506,7 +757,6 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._intro_cards_frame = ttk.Frame(self.intro_frame)
         self._intro_cards_frame.pack(fill=tk.BOTH, expand=True)
-        self._intro_desc_labels: list[tk.Label] = []
 
         workflows = [
             (
@@ -546,19 +796,23 @@ class BumbleBoxV2GUI(tk.Tk):
                 padx=14,
                 pady=12,
             )
+            self._intro_card_frames.append(card)
             card.grid(row=row, column=col, sticky="nsew", padx=7, pady=7)
 
             header = tk.Frame(card, bg=colors["entry_bg"])
+            self._intro_card_header_frames.append(header)
             header.pack(fill=tk.X)
-            tk.Label(
+            title_label = tk.Label(
                 header,
                 text=label,
                 bg=colors["entry_bg"],
                 fg=colors["text_light"],
                 font=self._intro_card_title_font,
                 anchor="w",
-            ).pack(side=tk.LEFT, anchor="w")
-            tk.Label(
+            )
+            self._intro_card_title_labels.append(title_label)
+            title_label.pack(side=tk.LEFT, anchor="w")
+            badge_label = tk.Label(
                 header,
                 text=badge,
                 bg=colors["tab_selected"],
@@ -566,7 +820,9 @@ class BumbleBoxV2GUI(tk.Tk):
                 font=self._intro_badge_font,
                 padx=8,
                 pady=2,
-            ).pack(side=tk.RIGHT, anchor="e")
+            )
+            self._intro_badge_labels.append(badge_label)
+            badge_label.pack(side=tk.RIGHT, anchor="e")
 
             desc_label = tk.Label(
                 card,
@@ -590,6 +846,62 @@ class BumbleBoxV2GUI(tk.Tk):
         self._intro_cards_frame.columnconfigure(1, weight=1)
         self._intro_cards_frame.rowconfigure(0, weight=1)
         self._intro_cards_frame.rowconfigure(1, weight=1)
+
+        self._intro_theme_footer = tk.Frame(self.intro_frame, bg=colors["panel_bg"])
+        self._intro_theme_footer.pack(fill=tk.X, pady=(10, 0))
+
+        self._intro_theme_panel = tk.Frame(
+            self._intro_theme_footer,
+            bg=colors["entry_bg"],
+            highlightthickness=1,
+            highlightbackground=colors["tab_btn_active"],
+            padx=12,
+            pady=8,
+        )
+        self._intro_theme_panel.pack(side=tk.RIGHT)
+
+        self._intro_theme_title_label = tk.Label(
+            self._intro_theme_panel,
+            text="Appearance",
+            bg=colors["entry_bg"],
+            fg=colors["text_light"],
+            font=self._intro_card_title_font,
+        )
+        self._intro_theme_title_label.pack(side=tk.LEFT, padx=(0, 8))
+        self._intro_theme_dark_label = tk.Label(
+            self._intro_theme_panel,
+            text="Dark",
+            bg=colors["entry_bg"],
+            fg=colors["text_light"],
+        )
+        self._intro_theme_dark_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._theme_knob = ttk.Scale(
+            self._intro_theme_panel,
+            from_=0.0,
+            to=1.0,
+            orient=tk.HORIZONTAL,
+            length=120,
+            command=self._on_theme_knob_changed,
+        )
+        self._theme_knob.pack(side=tk.LEFT)
+        self._theme_knob.bind("<ButtonRelease-1>", self._on_theme_knob_released)
+        self._intro_theme_light_label = tk.Label(
+            self._intro_theme_panel,
+            text="Light",
+            bg=colors["entry_bg"],
+            fg=colors["text_light"],
+        )
+        self._intro_theme_light_label.pack(side=tk.LEFT, padx=(6, 0))
+
+        self._intro_theme_hint_label = tk.Label(
+            self._intro_theme_panel,
+            text="(home only)",
+            bg=colors["entry_bg"],
+            fg=colors["text_muted"],
+        )
+        self._intro_theme_hint_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        self._sync_theme_knob_position()
         self._refresh_intro_wraplength()
 
     def _refresh_intro_wraplength(self) -> None:
@@ -620,11 +932,12 @@ class BumbleBoxV2GUI(tk.Tk):
     def _show_intro(self) -> None:
         self._workflow_label_var.set("Home")
         if hasattr(self, "home_button"):
-            self.home_button.config(state=tk.DISABLED)
+            self.home_button.pack_forget()
         if hasattr(self, "notebook") and self.notebook.winfo_manager() == "pack":
             self.notebook.pack_forget()
         if self.intro_frame.winfo_manager() != "pack":
             self.intro_frame.pack(fill=tk.BOTH, expand=True)
+        self._sync_theme_knob_position()
         self._refresh_intro_wraplength()
 
     def _open_workflow(self, workflow_key: str) -> None:
@@ -637,7 +950,8 @@ class BumbleBoxV2GUI(tk.Tk):
         if self.notebook.winfo_manager() != "pack":
             self.notebook.pack(fill=tk.BOTH, expand=True)
         if hasattr(self, "home_button"):
-            self.home_button.config(state=tk.NORMAL)
+            if self.home_button.winfo_manager() != "pack":
+                self.home_button.pack(side=tk.RIGHT)
 
         self._workflow_label_var.set(
             {
@@ -840,69 +1154,77 @@ class BumbleBoxV2GUI(tk.Tk):
             default_visible=False,
             auto_hide_when_empty=True,
             show_status=False,
+            auto_height=True,
+            min_text_lines=6,
+            max_text_lines=18,
         )
 
     def _build_storage_tab(self) -> None:
         top = ttk.Frame(self.storage_tab)
-        top.pack(fill=tk.X)
+        top.pack(fill=tk.BOTH, expand=False)
 
         self.storage_mount_point_var = tk.StringVar(value="/mnt/bumblebox/data")
         self.storage_device_var = tk.StringVar(value="Auto (recommended)")
         self._storage_device_display_to_path: dict[str, str] = {}
 
-        ttk.Label(top, text="Mount point").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.storage_mount_point_var, width=42).grid(
-            row=0, column=1, sticky="ew", padx=8, pady=3
+        settings = ttk.LabelFrame(top, text="Storage Configuration", padding=10)
+        settings.pack(fill=tk.X)
+
+        ttk.Label(settings, text="Mount point").grid(row=0, column=0, sticky="w")
+        ttk.Entry(settings, textvariable=self.storage_mount_point_var, width=48).grid(
+            row=0, column=1, sticky="ew", padx=10, pady=4
         )
-        row_buttons = ttk.Frame(top)
-        row_buttons.grid(row=0, column=2, sticky="w")
         ttk.Button(
-            row_buttons,
+            settings,
             text="Save Mount Point To Config",
             command=self._save_storage_mount_point_to_config,
-        ).pack(side=tk.LEFT)
-        ttk.Button(
-            row_buttons,
-            text="Refresh Storage Status",
-            command=self._refresh_storage_status,
-        ).pack(side=tk.LEFT, padx=6)
-        ttk.Button(
-            row_buttons,
-            text="Setup Storage Auto-Mount",
-            command=self._setup_storage_auto_mount,
-        ).pack(side=tk.LEFT)
+        ).grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
 
-        ttk.Label(top, text="Storage device").grid(row=1, column=0, sticky="w")
+        ttk.Label(settings, text="Storage device").grid(row=1, column=0, sticky="w")
         self.storage_device_combo = ttk.Combobox(
-            top,
+            settings,
             textvariable=self.storage_device_var,
             state="readonly",
-            width=55,
+            width=60,
         )
-        self.storage_device_combo.grid(row=1, column=1, sticky="ew", padx=8, pady=3)
-        device_buttons = ttk.Frame(top)
-        device_buttons.grid(row=1, column=2, sticky="w")
+        self.storage_device_combo.grid(row=1, column=1, sticky="ew", padx=10, pady=4)
         ttk.Button(
-            device_buttons,
+            settings,
             text="Refresh Devices",
             command=self._refresh_storage_device_choices,
+        ).grid(row=1, column=2, sticky="w", pady=4)
+
+        actions = ttk.Frame(settings)
+        actions.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 2))
+        ttk.Button(
+            actions,
+            text="Refresh Storage Status",
+            command=self._refresh_storage_status,
         ).pack(side=tk.LEFT)
+        ttk.Button(
+            actions,
+            text="Setup Storage Auto-Mount",
+            command=self._setup_storage_auto_mount,
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         info = (
             "Select Auto to let BumbleBox choose the best detected partition, or select a specific /dev/... device "
             "to force setup on that partition."
         )
-        ttk.Label(top, text=info, wraplength=860, justify=tk.LEFT).grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(6, 4)
+        ttk.Label(settings, text=info, wraplength=860, justify=tk.LEFT).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(8, 2)
         )
-        top.columnconfigure(1, weight=1)
+        settings.columnconfigure(1, weight=1)
 
         self.storage_output = self._create_results_section(
             self.storage_tab,
             title="Storage Results",
-            text_height=11,
+            text_height=4,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=3,
+            max_text_lines=9,
         )
         self._load_storage_mount_point_from_config()
         self._refresh_storage_device_choices()
@@ -1004,6 +1326,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=11,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=4,
+            max_text_lines=14,
         )
 
     def _build_roadmap_tab(self) -> None:
@@ -1407,6 +1732,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=7,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=3,
+            max_text_lines=10,
             fill=tk.X,
             expand=False,
         )
@@ -1460,6 +1788,7 @@ class BumbleBoxV2GUI(tk.Tk):
             ("Queen media max videos", "fleet.queen_media_schedule.max_videos_total", int, None, {"queen"}),
             ("Queen media cooldown (min)", "fleet.queen_media_schedule.cooldown_minutes", int, None, {"queen"}),
             ("Use mock camera", "runtime.use_mock_camera", bool, None, None),
+            ("UI theme mode", "runtime.ui_theme_mode", str, ["dark", "light"], None),
             ("Save frame timestamps", "runtime.save_frame_timestamps", bool, None, None),
             ("FPS report each recording", "runtime.fps_report_on_each_recording", bool, None, None),
         ]
@@ -1636,6 +1965,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=11,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=4,
+            max_text_lines=16,
         )
 
     def _build_calibration_tab(self) -> None:
@@ -1707,6 +2039,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=11,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=4,
+            max_text_lines=14,
         )
 
     def _build_schedule_check_tab(self) -> None:
@@ -1753,6 +2088,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=11,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=4,
+            max_text_lines=16,
         )
 
     def _run_schedule_check(self) -> None:
@@ -1935,6 +2273,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=11,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=4,
+            max_text_lines=16,
         )
 
     def _parse_csv_numeric_values(self, raw: str, *, label: str, value_type: str) -> list[float | int]:
@@ -2208,6 +2549,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=11,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=4,
+            max_text_lines=14,
         )
 
     def _run_nest_label_check(self) -> None:
@@ -2496,6 +2840,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=7,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=3,
+            max_text_lines=10,
             fill=tk.BOTH,
             expand=False,
             pady=(6, 0),
@@ -2512,6 +2859,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=11,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=4,
+            max_text_lines=16,
         )
 
     def _fleet_init_queen(self) -> None:
@@ -2922,6 +3272,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=9,
             default_visible=False,
             auto_hide_when_empty=True,
+            auto_height=True,
+            min_text_lines=3,
+            max_text_lines=12,
             fill=tk.X,
             expand=False,
         )
@@ -2935,6 +3288,9 @@ class BumbleBoxV2GUI(tk.Tk):
             text_height=5,
             default_visible=True,
             auto_hide_when_empty=False,
+            auto_height=True,
+            min_text_lines=3,
+            max_text_lines=8,
             fill=tk.X,
             expand=False,
             pady=(6, 0),
@@ -3037,6 +3393,11 @@ class BumbleBoxV2GUI(tk.Tk):
         selected_path = Path(selected).expanduser()
         self.config_path_var.set(str(selected_path))
         self._refresh_config_path_controls()
+        self._set_theme_mode(
+            self._read_theme_mode_from_config(),
+            sync_knob=True,
+            persist_preference=False,
+        )
         self._load_config_into_editor()
         self.config_output.delete("1.0", tk.END)
         self.config_output.insert(tk.END, f"Switched to config:\n{selected_path}")
@@ -3044,6 +3405,11 @@ class BumbleBoxV2GUI(tk.Tk):
     def _load_config_into_editor(self) -> None:
         try:
             config, _ = self._load_config_or_defaults()
+            self._set_theme_mode(
+                str(config.get("runtime", {}).get("ui_theme_mode", "dark")),
+                sync_knob=True,
+                persist_preference=False,
+            )
             for key, (variable, value_type) in self.config_fields.items():
                 raw = self._get_nested(config, key)
                 if value_type is bool:
@@ -3092,6 +3458,11 @@ class BumbleBoxV2GUI(tk.Tk):
             validate_config(config)
             _, config_path = self._load_config_or_defaults()
             save_config(config_path, config)
+            self._set_theme_mode(
+                str(config.get("runtime", {}).get("ui_theme_mode", "dark")),
+                sync_knob=True,
+                persist_preference=False,
+            )
             self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(tk.END, f"Saved config to {config_path}")
@@ -3101,6 +3472,7 @@ class BumbleBoxV2GUI(tk.Tk):
     def _create_config(self) -> None:
         try:
             path = write_default_config(self.config_path_var.get(), force=False)
+            self._persist_theme_mode_to_config()
             self._load_config_into_editor()
             self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)

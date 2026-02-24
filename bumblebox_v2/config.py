@@ -36,6 +36,7 @@ VALID_CAMERA_MODELS = {
 }
 VALID_PREVIEW_WINDOWS = {"QTGL", "QT", "DRM"}
 VALID_CAMERA_CODECS = {"mp4", "mjpeg"}
+VALID_UI_THEME_MODES = {"dark", "light"}
 
 
 class ConfigError(ValueError):
@@ -288,6 +289,12 @@ def validate_config(config: Dict[str, Any]) -> None:
     warmup = float(config["runtime"].get("camera_warmup_seconds", 0))
     if warmup < 0:
         raise ConfigError("runtime.camera_warmup_seconds must be >= 0")
+
+    ui_theme_mode = str(config["runtime"].get("ui_theme_mode", "dark")).strip().lower()
+    if ui_theme_mode not in VALID_UI_THEME_MODES:
+        raise ConfigError(
+            f"runtime.ui_theme_mode must be one of {sorted(VALID_UI_THEME_MODES)}, got: {ui_theme_mode}"
+        )
 
 
 def load_defaults() -> Dict[str, Any]:
