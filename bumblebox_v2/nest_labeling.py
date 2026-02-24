@@ -239,3 +239,43 @@ def launch_nest_labeling(
         cwd=str(repo_root()),
         start_new_session=True,
     )
+
+
+def build_labelme_command(
+    image_path: str,
+    python_executable: Optional[str] = None,
+) -> list[str]:
+    target = Path(image_path).expanduser().resolve()
+    if not target.exists():
+        raise FileNotFoundError(f"Image path not found: {target}")
+
+    resolved_python, _ = resolve_nest_label_python(python_executable)
+    if not _is_executable_file(resolved_python):
+        raise RuntimeError(f"Selected Python is not executable: {resolved_python}")
+
+    labelme_cli_path = _labelme_cli_for_python(resolved_python)
+    if labelme_cli_path:
+        return [labelme_cli_path, str(target)]
+
+    if _python_can_import(resolved_python, "labelme"):
+        return [str(resolved_python), "-m", "labelme", str(target)]
+
+    raise RuntimeError(
+        f"LabelMe not found in selected labeling environment: {resolved_python}. "
+        "Run setup_venv.sh to prepare the dedicated label environment."
+    )
+
+
+def launch_labelme(
+    image_path: str,
+    python_executable: Optional[str] = None,
+) -> subprocess.Popen:
+    command = build_labelme_command(
+        image_path=image_path,
+        python_executable=python_executable,
+    )
+    return subprocess.Popen(
+        command,
+        cwd=str(repo_root()),
+        start_new_session=True,
+    )

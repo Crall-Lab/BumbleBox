@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from math import hypot
 from pathlib import Path
+import time
 from typing import Any, Dict, Optional, Tuple
 
 try:
@@ -164,3 +166,131 @@ def format_calibration(calibration: CalibrationResult, pixel_contact_distance: f
     if calibration.notes:
         lines.append(f"Notes: {calibration.notes}")
     return "\n".join(lines)
+
+
+def capture_calibration_image(
+    config: Dict[str, Any],
+    *,
+    output_dir: str | Path,
+    filename_prefix: str = "calibration_capture",
+) -> Path:
+    try:
+        from picamera2 import Picamera2
+        from libcamera import controls
+    except Exception as exc:
+        raise RuntimeError(
+            "picamera2/libcamera is required to capture calibration images on Pi."
+        ) from exc
+
+    from .tuning import resolve_camera_tuning_file
+
+    camera_cfg = config.get("camera", {})
+    runtime_cfg = config.get("runtime", {})
+    width = int(camera_cfg.get("width", 4056))
+    height = int(camera_cfg.get("height", 3040))
+    shutter_us = int(camera_cfg.get("shutter_us", 2500))
+    noise_reduction = str(camera_cfg.get("noise_reduction", "Auto"))
+    digital_zoom = camera_cfg.get("digital_zoom")
+    warmup_s = float(runtime_cfg.get("camera_warmup_seconds", 2.0))
+
+    out_dir = Path(output_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = out_dir / f"{filename_prefix}_{stamp}.png"
+
+    tuning_file = resolve_camera_tuning_file(config)
+    if tuning_file:
+        tuning = Picamera2.load_tuning_file(str(tuning_file))
+        picam2 = Picamera2(tuning=tuning)
+    else:
+        picam2 = Picamera2()
+
+    started = False
+    try:
+        still = picam2.create_still_configuration(
+            main={"size": (width, height), "format": "RGB888"}
+        )
+        picam2.align_configuration(still)
+        picam2.configure(still)
+        picam2.set_controls({"ExposureTime": shutter_us})
+
+        if noise_reduction != "Auto":
+            try:
+                mode = getattr(controls.draft.NoiseReductionModeEnum, noise_reduction)
+                picam2.set_controls({"NoiseReductionMode": mode})
+            except Exception:
+                pass
+
+        if isinstance(digital_zoom, (list, tuple)) and len(digital_zoom) == 4:
+            try:
+                picam2.set_controls({"ScalerCrop": tuple(digital_zoom)})
+            except Exception:
+                pass
+
+        picam2.start()
+        started = True
+        time.sleep(max(0.0, warmup_s))
+        picam2.capture_file(str(output_path))
+    finally:
+        if started:
+            try:
+                picam2.stop()
+            except Exception:
+                pass
+        try:
+            picam2.close()
+        except Exception:
+            pass
+
+    return output_path
+
+
+def extract_points_from_labelme_json(
+    json_path: str | Path,
+) -> tuple[Tuple[float, float], Tuple[float, float], str]:
+    path = Path(json_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"LabelMe JSON not found: {path}")
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Could not read LabelMe JSON: {path}") from exc
+
+    shapes = payload.get("shapes")
+    if not isinstance(shapes, list) or not shapes:
+        raise RuntimeError("LabelMe JSON has no shapes. Add two point annotations and save.")
+
+    explicit_points: list[tuple[float, float]] = []
+    fallback_points: list[tuple[float, float]] = []
+
+    for shape in shapes:
+        if not isinstance(shape, dict):
+            continue
+        shape_points = shape.get("points")
+        if not isinstance(shape_points, list):
+            continue
+
+        shape_type = str(shape.get("shape_type", "")).strip().lower()
+        if shape_type == "point" and len(shape_points) >= 1:
+            point = shape_points[0]
+            if isinstance(point, list) and len(point) >= 2:
+                explicit_points.append((float(point[0]), float(point[1])))
+
+        for point in shape_points:
+            if isinstance(point, list) and len(point) >= 2:
+                fallback_points.append((float(point[0]), float(point[1])))
+
+    if len(explicit_points) >= 2:
+        point_a, point_b = explicit_points[0], explicit_points[1]
+        return point_a, point_b, "Loaded first two LabelMe point annotations."
+
+    if len(fallback_points) >= 2:
+        point_a, point_b = fallback_points[0], fallback_points[1]
+        return (
+            point_a,
+            point_b,
+            "Loaded first two points from saved shapes (no explicit point annotations found).",
+        )
+
+    raise RuntimeError("Could not find at least two points in LabelMe JSON.")

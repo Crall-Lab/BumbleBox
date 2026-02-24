@@ -17,6 +17,8 @@ from .calibration import (
     apply_scale_to_config,
     calibrate_from_aruco_image,
     calibrate_from_points,
+    capture_calibration_image,
+    extract_points_from_labelme_json,
     format_calibration,
     parse_point,
 )
@@ -57,10 +59,12 @@ from .fleet import (
 )
 from .gui_launcher import format_gui_shortcut_result, install_gui_shortcut
 from .nest_labeling import (
+    build_labelme_command,
     build_nest_labeling_command,
     check_nest_labeling_environment,
     default_script_path,
     format_nest_labeling_environment,
+    launch_labelme,
     launch_nest_labeling,
 )
 from .roadmap import build_roadmap
@@ -129,6 +133,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._advanced_widget_ids: set[str] = set()
         self._run_history_paths: dict[str, str] = {}
         self._nest_label_pid: int | None = None
+        self._calibration_label_pid: int | None = None
         self._optimize_thread: threading.Thread | None = None
         self._optimize_error: str | None = None
         self._optimize_warning: str | None = None
@@ -2897,6 +2902,8 @@ class BumbleBoxV2GUI(tk.Tk):
         self.manual_point_a = tk.StringVar(value="0,0")
         self.manual_point_b = tk.StringVar(value="500,0")
         self.manual_distance_cm = tk.StringVar(value="10.0")
+        self.calibration_labelme_image_path_var = tk.StringVar(value="")
+        self.calibration_labelme_json_path_var = tk.StringVar(value="")
 
         self.aruco_image = tk.StringVar()
         self.aruco_marker_size_mm = tk.StringVar(value="5.0")
@@ -2944,6 +2951,61 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Button(manual, text="Calibrate from Points", command=self._calibrate_manual).grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
+        picker = ttk.LabelFrame(manual, text="Camera Point Picker (LabelMe)", padding=8)
+        picker.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(
+            picker,
+            text=(
+                "Capture a fresh image from the camera and open LabelMe directly. "
+                "Place two point annotations on the known-distance endpoints, save, then load points."
+            ),
+            wraplength=380,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Button(
+            picker,
+            text="Capture Image + Open LabelMe",
+            command=self._capture_and_open_calibration_labelme,
+        ).grid(row=1, column=0, columnspan=2, sticky="w")
+        self._grid_help_label(
+            picker,
+            row=2,
+            column=0,
+            text="Captured image",
+            help_title="Captured Calibration Image",
+            help_details="Latest calibration image captured from the Pi camera and opened in LabelMe.",
+        )
+        ttk.Entry(
+            picker,
+            textvariable=self.calibration_labelme_image_path_var,
+            state="readonly",
+        ).grid(row=2, column=1, sticky="ew", padx=8, pady=3)
+        self._grid_help_label(
+            picker,
+            row=3,
+            column=0,
+            text="LabelMe JSON path",
+            help_title="LabelMe JSON",
+            help_details=(
+                "JSON saved by LabelMe containing your point annotations. "
+                "Defaults to the captured image path with .json extension."
+            ),
+        )
+        ttk.Entry(
+            picker,
+            textvariable=self.calibration_labelme_json_path_var,
+        ).grid(row=3, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Button(
+            picker,
+            text="Load LabelMe Points -> Point A/B",
+            command=self._load_calibration_points_from_labelme,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(
+            picker,
+            text="Load + Calibrate from LabelMe Points",
+            command=self._load_and_calibrate_from_labelme,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        picker.columnconfigure(1, weight=1)
         manual.columnconfigure(1, weight=1)
 
         aruco = ttk.LabelFrame(top, text="ArUco Marker (Optional Advanced)", padding=8)
@@ -5169,6 +5231,145 @@ class BumbleBoxV2GUI(tk.Tk):
         self.fps_output.insert(tk.END, format_fps_sweep_report(self._fps_sweep_report))
         if self._fps_sweep_report.has_errors:
             messagebox.showwarning("FPS sweep", "One or more FPS probes failed. Review the output for details.")
+
+    def _capture_and_open_calibration_labelme(self) -> None:
+        try:
+            config, _ = self._load_config_or_defaults()
+            data_root = str(config.get("system", {}).get("data_root", "")).strip()
+            if not data_root:
+                raise ValueError("system.data_root is empty in config.")
+            capture_dir = Path(data_root).expanduser().resolve() / "calibration"
+
+            image_path = capture_calibration_image(
+                config,
+                output_dir=capture_dir,
+                filename_prefix="calibration_capture",
+            )
+            json_path = image_path.with_suffix(".json")
+            self.calibration_labelme_image_path_var.set(str(image_path))
+            self.calibration_labelme_json_path_var.set(str(json_path))
+
+            python_override = None
+            nest_python_var = getattr(self, "nest_python_var", None)
+            if nest_python_var is not None:
+                text = str(nest_python_var.get()).strip()
+                if text:
+                    python_override = text
+
+            process = launch_labelme(
+                image_path=str(image_path),
+                python_executable=python_override,
+            )
+            self._calibration_label_pid = process.pid
+            command = build_labelme_command(
+                image_path=str(image_path),
+                python_executable=python_override,
+            )
+            self.calibration_output.delete("1.0", tk.END)
+            self.calibration_output.insert(
+                tk.END,
+                (
+                    f"Captured calibration image: {image_path}\n"
+                    f"Launched LabelMe (pid {process.pid}).\n"
+                    f"Command: {' '.join(shlex.quote(part) for part in command)}\n\n"
+                    "In LabelMe, place two point annotations on the known-distance endpoints and save.\n"
+                    "Then click 'Load LabelMe Points -> Point A/B'."
+                ),
+            )
+        except Exception as exc:
+            messagebox.showerror("LabelMe calibration launch failed", str(exc))
+
+    def _load_calibration_points_from_labelme(self) -> None:
+        try:
+            json_text, note = self._populate_manual_points_from_labelme_json()
+            self.calibration_output.delete("1.0", tk.END)
+            self.calibration_output.insert(
+                tk.END,
+                (
+                    f"Loaded points from: {json_text}\n"
+                    f"Point A: {self.manual_point_a.get()}\n"
+                    f"Point B: {self.manual_point_b.get()}\n"
+                    f"{note}\n\n"
+                    "Set the real distance in cm if needed, then click 'Calibrate from Points'."
+                ),
+            )
+        except Exception as exc:
+            messagebox.showerror("Load LabelMe points failed", str(exc))
+
+    def _populate_manual_points_from_labelme_json(self) -> tuple[str, str]:
+        try:
+            json_text = self.calibration_labelme_json_path_var.get().strip()
+            if not json_text:
+                image_text = self.calibration_labelme_image_path_var.get().strip()
+                if image_text:
+                    json_text = str(Path(image_text).with_suffix(".json"))
+                    self.calibration_labelme_json_path_var.set(json_text)
+
+            if not json_text:
+                raise ValueError(
+                    "No LabelMe JSON path is set. Capture/open an image first, label it, save, then retry."
+                )
+
+            point_a, point_b, note = extract_points_from_labelme_json(json_text)
+            self.manual_point_a.set(f"{point_a[0]:.3f},{point_a[1]:.3f}")
+            self.manual_point_b.set(f"{point_b[0]:.3f},{point_b[1]:.3f}")
+            return json_text, note
+        except Exception:
+            raise
+
+    def _load_and_calibrate_from_labelme(self) -> None:
+        try:
+            json_text, note = self._populate_manual_points_from_labelme_json()
+            config, config_path = self._load_config_or_defaults()
+            result = calibrate_from_points(
+                parse_point(self.manual_point_a.get().strip()),
+                parse_point(self.manual_point_b.get().strip()),
+                float(self.manual_distance_cm.get().strip()),
+            )
+            confirmed = messagebox.askyesno(
+                "Confirm calibration save",
+                (
+                    "Load + Calibrate will update and save calibration values in your active config file.\n\n"
+                    f"Config file: {config_path}\n"
+                    f"Point A: {self.manual_point_a.get()}\n"
+                    f"Point B: {self.manual_point_b.get()}\n"
+                    f"Real distance (cm): {self.manual_distance_cm.get().strip()}\n"
+                    f"Computed pixels/cm: {result.pixels_per_cm:.6f}\n\n"
+                    "Save these values now?"
+                ),
+            )
+            if not confirmed:
+                self.calibration_output.delete("1.0", tk.END)
+                self.calibration_output.insert(
+                    tk.END,
+                    (
+                        "Calibration save cancelled by user.\n"
+                        f"Loaded points from: {json_text}\n"
+                        f"Point A: {self.manual_point_a.get()}\n"
+                        f"Point B: {self.manual_point_b.get()}\n"
+                        "No config changes were written."
+                    ),
+                )
+                return
+            updated = apply_scale_to_config(config, result)
+            save_config(config_path, updated)
+            calibration_text = format_calibration(
+                result,
+                pixel_contact_distance=updated.get("metrics", {}).get("pixel_contact_distance"),
+            )
+            self.calibration_output.delete("1.0", tk.END)
+            self.calibration_output.insert(
+                tk.END,
+                (
+                    f"Loaded points from: {json_text}\n"
+                    f"Point A: {self.manual_point_a.get()}\n"
+                    f"Point B: {self.manual_point_b.get()}\n"
+                    f"{note}\n\n"
+                    f"{calibration_text}"
+                ),
+            )
+        except Exception as exc:
+            messagebox.showerror("Load + calibrate failed", str(exc))
 
     def _calibrate_manual(self) -> None:
         try:
