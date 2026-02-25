@@ -162,6 +162,84 @@ class BumbleBoxV2GUI(tk.Tk):
         self._build_notebook()
         self._show_intro()
 
+    @staticmethod
+    def _needs_scrollable_dialog(message_text: str) -> bool:
+        if len(message_text) >= 280:
+            return True
+        if message_text.count("\n") >= 6:
+            return True
+        return False
+
+    def _show_scrollable_dialog(self, title: str, message: str, level: str = "info") -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.transient(self)
+        dialog.resizable(True, True)
+        dialog.minsize(560, 320)
+        dialog.geometry("860x520")
+
+        outer = ttk.Frame(dialog, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        level_text = {"error": "Error details", "warning": "Warning details", "info": "Details"}.get(level, "Details")
+        ttk.Label(outer, text=level_text).pack(anchor="w")
+        ttk.Label(outer, text="Scroll to view the full message.").pack(anchor="w", pady=(0, 6))
+
+        text_frame = ttk.Frame(outer)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+        text_widget = tk.Text(text_frame, wrap=tk.NONE)
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        self._style_output_text(text_widget)
+        y_scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text_widget.yview)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll = ttk.Scrollbar(text_frame, orient=tk.HORIZONTAL, command=text_widget.xview)
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        text_widget.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+
+        text_widget.insert("1.0", message)
+        text_widget.configure(state=tk.DISABLED)
+
+        button_row = ttk.Frame(outer)
+        button_row.pack(fill=tk.X, pady=(8, 0))
+
+        def copy_details() -> None:
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(message)
+            except Exception:
+                pass
+
+        ttk.Button(button_row, text="Copy Details", command=copy_details).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
+
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.grab_set()
+        dialog.focus_force()
+        self.wait_window(dialog)
+
+    def _show_message(self, level: str, title: str, message: str) -> None:
+        text = str(message)
+        if self._needs_scrollable_dialog(text):
+            self._show_scrollable_dialog(title=title, message=text, level=level)
+            return
+        if level == "error":
+            messagebox.showerror(title, text, parent=self)
+        elif level == "warning":
+            messagebox.showwarning(title, text, parent=self)
+        else:
+            messagebox.showinfo(title, text, parent=self)
+
+    def _show_error(self, title: str, message: str) -> None:
+        self._show_message("error", title, message)
+
+    def _show_warning(self, title: str, message: str) -> None:
+        self._show_message("warning", title, message)
+
+    def _show_info(self, title: str, message: str) -> None:
+        self._show_message("info", title, message)
+
     def _apply_ocean_slate_theme(self) -> None:
         colors = self._palette
         style = ttk.Style(self)
@@ -2633,7 +2711,7 @@ class BumbleBoxV2GUI(tk.Tk):
             message = "Could not detect max resolution. Connect a camera or select a specific camera model."
             if hasattr(self, "_camera_max_status_var"):
                 self._camera_max_status_var.set(message)
-            messagebox.showerror("Camera resolution detection failed", message)
+            self._show_error("Camera resolution detection failed", message)
             return
 
         width, height = detected
@@ -3134,12 +3212,12 @@ class BumbleBoxV2GUI(tk.Tk):
             self.schedule_check_output.insert(tk.END, format_schedule_check_report(report))
             self.notebook.select(self.schedule_check_tab)
             if report.has_failures:
-                messagebox.showwarning(
+                self._show_warning(
                     "Schedule check",
                     "Schedule check found failures. Review suggestions in the output panel.",
                 )
         except Exception as exc:
-            messagebox.showerror("Schedule check failed", str(exc))
+            self._show_error("Schedule check failed", str(exc))
 
     def _build_optimize_tracking_tab(self) -> None:
         top = ttk.Frame(self.optimize_tracking_tab)
@@ -3464,12 +3542,12 @@ class BumbleBoxV2GUI(tk.Tk):
 
     def _start_optimize_tracking(self) -> None:
         if self._optimize_thread and self._optimize_thread.is_alive():
-            messagebox.showinfo("Optimization running", "Tracking optimization is already running.")
+            self._show_info("Optimization running", "Tracking optimization is already running.")
             return
 
         input_path = self.opt_input_path_var.get().strip()
         if not input_path:
-            messagebox.showerror("Missing input", "Set an input video or image folder path.")
+            self._show_error("Missing input", "Set an input video or image folder path.")
             return
 
         try:
@@ -3540,7 +3618,7 @@ class BumbleBoxV2GUI(tk.Tk):
             if win_step:
                 sweep_overrides["adaptiveThreshWinSizeStep"] = win_step
         except Exception as exc:
-            messagebox.showerror("Invalid settings", str(exc))
+            self._show_error("Invalid settings", str(exc))
             return
 
         while not self._optimize_progress_q.empty():
@@ -3640,7 +3718,7 @@ class BumbleBoxV2GUI(tk.Tk):
         if self._optimize_error:
             self.opt_status_var.set("Failed")
             self.optimize_output.insert(tk.END, f"\nError: {self._optimize_error}\n")
-            messagebox.showerror("optimize-tracking failed", self._optimize_error)
+            self._show_error("optimize-tracking failed", self._optimize_error)
             return
 
         if self._optimize_result is None:
@@ -3718,12 +3796,12 @@ class BumbleBoxV2GUI(tk.Tk):
             self.nest_label_output.delete("1.0", tk.END)
             self.nest_label_output.insert(tk.END, format_nest_labeling_environment(env))
         except Exception as exc:
-            messagebox.showerror("Nest labeling check failed", str(exc))
+            self._show_error("Nest labeling check failed", str(exc))
 
     def _launch_nest_labeling(self) -> None:
         folder = self.nest_folder_var.get().strip()
         if not folder:
-            messagebox.showerror("Missing folder", "Set the image folder first.")
+            self._show_error("Missing folder", "Set the image folder first.")
             return
 
         try:
@@ -3754,7 +3832,7 @@ class BumbleBoxV2GUI(tk.Tk):
             )
             self.notebook.select(self.nest_label_tab)
         except Exception as exc:
-            messagebox.showerror("Launch failed", str(exc))
+            self._show_error("Launch failed", str(exc))
 
     def _build_fleet_tab(self) -> None:
         top = ttk.Frame(self.fleet_tab)
@@ -4063,19 +4141,19 @@ class BumbleBoxV2GUI(tk.Tk):
             )
             self.notebook.select(self.fleet_tab)
         except Exception as exc:
-            messagebox.showerror("Fleet init failed", str(exc))
+            self._show_error("Fleet init failed", str(exc))
 
     def _fleet_enroll_worker(self) -> None:
         host = self.fleet_worker_host_var.get().strip()
         if not host:
-            messagebox.showerror("Missing host", "Set worker host/IP first.")
+            self._show_error("Missing host", "Set worker host/IP first.")
             return
         try:
             port = int(self.fleet_worker_port_var.get().strip())
             if port <= 0:
                 raise ValueError("Port must be > 0")
         except Exception as exc:
-            messagebox.showerror("Invalid port", str(exc))
+            self._show_error("Invalid port", str(exc))
             return
 
         try:
@@ -4099,7 +4177,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fleet_output.insert(tk.END, f"\n\nSaved config: {config_path}")
             self.notebook.select(self.fleet_tab)
         except Exception as exc:
-            messagebox.showerror("Fleet enroll failed", str(exc))
+            self._show_error("Fleet enroll failed", str(exc))
 
     def _fleet_run_status(self) -> None:
         try:
@@ -4114,9 +4192,9 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fleet_output.insert(tk.END, format_fleet_status_report(report))
             self.notebook.select(self.fleet_tab)
             if report.fail_count > 0:
-                messagebox.showwarning("Fleet status", "Fleet status found one or more FAIL workers.")
+                self._show_warning("Fleet status", "Fleet status found one or more FAIL workers.")
         except Exception as exc:
-            messagebox.showerror("Fleet status failed", str(exc))
+            self._show_error("Fleet status failed", str(exc))
 
     def _fleet_set_media_capacity_from_workers(self) -> None:
         try:
@@ -4135,7 +4213,7 @@ class BumbleBoxV2GUI(tk.Tk):
             )
             self.notebook.select(self.fleet_tab)
         except Exception as exc:
-            messagebox.showerror("Capacity update failed", str(exc))
+            self._show_error("Capacity update failed", str(exc))
 
     def _fleet_refresh_latest_status(self) -> None:
         try:
@@ -4155,12 +4233,12 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fleet_output.insert(tk.END, format_queen_latest_status_report(report))
             self.notebook.select(self.fleet_tab)
             if report.offline_count > 0:
-                messagebox.showwarning(
+                self._show_warning(
                     "Worker offline warning",
                     f"{report.offline_count} configured worker(s) appear offline.",
                 )
         except Exception as exc:
-            messagebox.showerror("Latest status failed", str(exc))
+            self._show_error("Latest status failed", str(exc))
 
     def _populate_fleet_latest_tree(self, report) -> None:
         for iid in self.fleet_latest_tree.get_children():
@@ -4196,12 +4274,12 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fleet_output.insert(tk.END, format_fleet_discovery_report(report))
             self.notebook.select(self.fleet_tab)
             if report.configured_workers_offline > 0:
-                messagebox.showwarning(
+                self._show_warning(
                     "Worker offline warning",
                     f"{report.configured_workers_offline} configured worker(s) are not reachable.",
                 )
         except Exception as exc:
-            messagebox.showerror("Fleet discovery failed", str(exc))
+            self._show_error("Fleet discovery failed", str(exc))
 
     def _parse_fleet_media_settings(self) -> dict[str, object]:
         try:
@@ -4219,7 +4297,7 @@ class BumbleBoxV2GUI(tk.Tk):
             if cooldown_minutes < 0:
                 raise ValueError("Cooldown must be >= 0.")
         except Exception as exc:
-            messagebox.showerror("Invalid fleet media settings", str(exc))
+            self._show_error("Invalid fleet media settings", str(exc))
             return {}
 
         return {
@@ -4274,7 +4352,7 @@ class BumbleBoxV2GUI(tk.Tk):
             )
             self.notebook.select(self.fleet_tab)
         except Exception as exc:
-            messagebox.showerror("Save schedule failed", str(exc))
+            self._show_error("Save schedule failed", str(exc))
 
     def _fleet_queen_pull_latest(self) -> None:
         settings = self._parse_fleet_media_settings()
@@ -4296,12 +4374,12 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fleet_output.insert(tk.END, format_queen_track_report(report))
             self.notebook.select(self.fleet_tab)
             if report.videos_failed > 0:
-                messagebox.showwarning(
+                self._show_warning(
                     "Queen pull latest",
                     "Queen pull latest completed with failures. Review output for details.",
                 )
         except Exception as exc:
-            messagebox.showerror("Queen pull latest failed", str(exc))
+            self._show_error("Queen pull latest failed", str(exc))
 
     def _fleet_queen_track_latest(self) -> None:
         settings = self._parse_fleet_media_settings()
@@ -4327,12 +4405,12 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fleet_output.insert(tk.END, format_queen_track_report(report))
             self.notebook.select(self.fleet_tab)
             if report.videos_failed > 0:
-                messagebox.showwarning(
+                self._show_warning(
                     "Queen track latest",
                     "Queen track latest completed with failures. Review output for details.",
                 )
         except Exception as exc:
-            messagebox.showerror("Queen track latest failed", str(exc))
+            self._show_error("Queen track latest failed", str(exc))
 
     def _fleet_queen_pull_track(self) -> None:
         settings = self._parse_fleet_media_settings()
@@ -4360,12 +4438,12 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fleet_output.insert(tk.END, format_queen_track_report(report))
             self.notebook.select(self.fleet_tab)
             if report.videos_failed > 0:
-                messagebox.showwarning(
+                self._show_warning(
                     "Queen pull-track",
                     "Queen pull-track completed with failures. Review output for details.",
                 )
         except Exception as exc:
-            messagebox.showerror("Queen pull-track failed", str(exc))
+            self._show_error("Queen pull-track failed", str(exc))
 
     def _build_run_tab(self) -> None:
         top = ttk.Frame(self.run_tab)
@@ -4572,7 +4650,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(tk.END, "Loaded configuration into editor.")
         except Exception as exc:
-            messagebox.showerror("Load config failed", str(exc))
+            self._show_error("Load config failed", str(exc))
 
     def _build_editor_config(self):
         config, _ = self._load_config_or_defaults()
@@ -4603,7 +4681,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(tk.END, "Config is valid.")
         except Exception as exc:
-            messagebox.showerror("Validation failed", str(exc))
+            self._show_error("Validation failed", str(exc))
 
     def _save_editor_config(self) -> None:
         try:
@@ -4620,7 +4698,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(tk.END, f"Saved config to {config_path}")
         except Exception as exc:
-            messagebox.showerror("Save failed", str(exc))
+            self._show_error("Save failed", str(exc))
 
     def _create_config(self) -> None:
         try:
@@ -4637,7 +4715,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     "The file has been loaded into the editor."
                 ),
             )
-            messagebox.showinfo("Config created", f"Created default config at:\n{path}")
+            self._show_info("Config created", f"Created default config at:\n{path}")
         except FileExistsError:
             self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)
@@ -4645,9 +4723,9 @@ class BumbleBoxV2GUI(tk.Tk):
                 tk.END,
                 "Config file already exists at the selected path; no overwrite was performed.",
             )
-            messagebox.showinfo("Config exists", "Config already exists. Keeping current file.")
+            self._show_info("Config exists", "Config already exists. Keeping current file.")
         except Exception as exc:
-            messagebox.showerror("Error", str(exc))
+            self._show_error("Error", str(exc))
 
     def _selected_storage_device_path(self) -> str | None:
         selected = self.storage_device_var.get().strip()
@@ -4702,7 +4780,7 @@ class BumbleBoxV2GUI(tk.Tk):
     def _save_storage_mount_point_to_config(self) -> None:
         mount_point = self.storage_mount_point_var.get().strip()
         if not mount_point:
-            messagebox.showerror("Invalid mount point", "Mount point cannot be empty.")
+            self._show_error("Invalid mount point", "Mount point cannot be empty.")
             return
         try:
             config, config_path = self._load_config_or_defaults()
@@ -4717,7 +4795,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self._refresh_storage_device_choices()
             self._refresh_storage_status()
         except Exception as exc:
-            messagebox.showerror("Save mount point failed", str(exc))
+            self._show_error("Save mount point failed", str(exc))
 
     def _refresh_storage_status(self) -> None:
         try:
@@ -4781,7 +4859,7 @@ class BumbleBoxV2GUI(tk.Tk):
     def _setup_storage_auto_mount(self) -> None:
         mount_point = self.storage_mount_point_var.get().strip()
         if not mount_point:
-            messagebox.showerror("Invalid mount point", "Mount point cannot be empty.")
+            self._show_error("Invalid mount point", "Mount point cannot be empty.")
             return
 
         try:
@@ -4827,7 +4905,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     ),
                 )
         except Exception as exc:
-            messagebox.showerror("Storage setup failed", str(exc))
+            self._show_error("Storage setup failed", str(exc))
 
     def _run_doctor(self) -> None:
         try:
@@ -4836,7 +4914,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self._render_doctor_report(results)
             self._refresh_storage_status()
         except Exception as exc:
-            messagebox.showerror("Doctor failed", str(exc))
+            self._show_error("Doctor failed", str(exc))
 
     def _render_doctor_report(self, results) -> None:
         text = format_doctor_report(results)
@@ -4937,12 +5015,12 @@ class BumbleBoxV2GUI(tk.Tk):
                     f"Linked {len(existing)} system path(s)."
                 ),
             )
-            messagebox.showinfo(
+            self._show_info(
                 "Venv package visibility fixed",
                 "Linked system Python package paths into this venv. Re-run Doctor to verify dependencies.",
             )
         except Exception as exc:
-            messagebox.showerror("Fix failed", str(exc))
+            self._show_error("Fix failed", str(exc))
 
     def _run_camera_preview_setup(self) -> None:
         try:
@@ -4977,7 +5055,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.camera_setup_output.insert(tk.END, preview_text)
             self.notebook.select(self.camera_setup_tab)
         except Exception as exc:
-            messagebox.showerror("Camera preview failed", str(exc))
+            self._show_error("Camera preview failed", str(exc))
 
     def _run_camera_tracking_test_setup(self) -> None:
         try:
@@ -5013,7 +5091,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.camera_setup_output.insert(tk.END, format_tracking_test_result(result))
             self.notebook.select(self.camera_setup_tab)
         except Exception as exc:
-            messagebox.showerror("Live tracking test failed", str(exc))
+            self._show_error("Live tracking test failed", str(exc))
 
     def _run_full_camera_setup_check(self) -> None:
         try:
@@ -5078,7 +5156,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.camera_setup_output.insert(tk.END, format_tracking_test_result(tracking_result))
             self.notebook.select(self.camera_setup_tab)
         except Exception as exc:
-            messagebox.showerror("Full camera setup check failed", str(exc))
+            self._show_error("Full camera setup check failed", str(exc))
 
     def _run_camera_preview_subprocess(
         self,
@@ -5149,7 +5227,7 @@ class BumbleBoxV2GUI(tk.Tk):
             if select_tab and str(self.roadmap_tab) in self.notebook.tabs():
                 self.notebook.select(self.roadmap_tab)
         except Exception as exc:
-            messagebox.showerror("Roadmap failed", str(exc))
+            self._show_error("Roadmap failed", str(exc))
 
     def _run_fps_report(self) -> None:
         try:
@@ -5164,11 +5242,11 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fps_output.delete("1.0", tk.END)
             self.fps_output.insert(tk.END, format_fps_report(report))
         except Exception as exc:
-            messagebox.showerror("FPS report failed", str(exc))
+            self._show_error("FPS report failed", str(exc))
 
     def _start_fps_sweep(self) -> None:
         if self._fps_sweep_thread and self._fps_sweep_thread.is_alive():
-            messagebox.showinfo("FPS sweep running", "An FPS sweep is already running.")
+            self._show_info("FPS sweep running", "An FPS sweep is already running.")
             return
 
         try:
@@ -5192,7 +5270,7 @@ class BumbleBoxV2GUI(tk.Tk):
             if assume_ram_gb is not None and assume_ram_gb <= 0:
                 raise ValueError("Assumed RAM must be > 0")
         except Exception as exc:
-            messagebox.showerror("Invalid FPS sweep settings", str(exc))
+            self._show_error("Invalid FPS sweep settings", str(exc))
             return
 
         while not self._fps_sweep_progress_q.empty():
@@ -5271,7 +5349,7 @@ class BumbleBoxV2GUI(tk.Tk):
         if self._fps_sweep_error:
             self.fps_sweep_status_var.set("Failed")
             self.fps_output.insert(tk.END, f"\nError: {self._fps_sweep_error}\n")
-            messagebox.showerror("FPS sweep failed", self._fps_sweep_error)
+            self._show_error("FPS sweep failed", self._fps_sweep_error)
             return
 
         if self._fps_sweep_report is None:
@@ -5283,7 +5361,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self.fps_output.delete("1.0", tk.END)
         self.fps_output.insert(tk.END, format_fps_sweep_report(self._fps_sweep_report))
         if self._fps_sweep_report.has_errors:
-            messagebox.showwarning("FPS sweep", "One or more FPS probes failed. Review the output for details.")
+            self._show_warning("FPS sweep", "One or more FPS probes failed. Review the output for details.")
 
     def _capture_and_open_calibration_labelme(self) -> None:
         try:
@@ -5332,7 +5410,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 ),
             )
         except Exception as exc:
-            messagebox.showerror("LabelMe calibration launch failed", str(exc))
+            self._show_error("LabelMe calibration launch failed", str(exc))
 
     def _load_calibration_points_from_labelme(self) -> None:
         try:
@@ -5349,7 +5427,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 ),
             )
         except Exception as exc:
-            messagebox.showerror("Load LabelMe points failed", str(exc))
+            self._show_error("Load LabelMe points failed", str(exc))
 
     def _populate_manual_points_from_labelme_json(self) -> tuple[str, str]:
         try:
@@ -5431,7 +5509,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 ),
             )
         except Exception as exc:
-            messagebox.showerror("Load + calibrate failed", str(exc))
+            self._show_error("Load + calibrate failed", str(exc))
 
     def _calibrate_manual(self) -> None:
         try:
@@ -5453,7 +5531,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 ),
             )
         except Exception as exc:
-            messagebox.showerror("Manual calibration failed", str(exc))
+            self._show_error("Manual calibration failed", str(exc))
 
     def _calibrate_aruco(self) -> None:
         try:
@@ -5479,7 +5557,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 ),
             )
         except Exception as exc:
-            messagebox.showerror("ArUco calibration failed", str(exc))
+            self._show_error("ArUco calibration failed", str(exc))
 
     def _run_once_now(self) -> None:
         try:
@@ -5495,7 +5573,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self._refresh_run_history()
             self.notebook.select(self.run_tab)
         except Exception as exc:
-            messagebox.showerror("Run failed", str(exc))
+            self._show_error("Run failed", str(exc))
 
     def _generate_systemd_units(self) -> None:
         try:
@@ -5509,7 +5587,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.run_output.insert(tk.END, format_systemd_result(result))
             self.notebook.select(self.run_tab)
         except Exception as exc:
-            messagebox.showerror("Systemd generation failed", str(exc))
+            self._show_error("Systemd generation failed", str(exc))
 
     def _systemd_action(self, action: str) -> None:
         try:
@@ -5524,7 +5602,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.run_output.insert(tk.END, format_systemd_action_result(result))
             self.notebook.select(self.run_tab)
         except Exception as exc:
-            messagebox.showerror(f"Systemd {action} failed", str(exc))
+            self._show_error(f"Systemd {action} failed", str(exc))
 
     def _install_gui_shortcut(self) -> None:
         try:
@@ -5532,12 +5610,12 @@ class BumbleBoxV2GUI(tk.Tk):
             self.run_output.delete("1.0", tk.END)
             self.run_output.insert(tk.END, format_gui_shortcut_result(result))
             self.notebook.select(self.run_tab)
-            messagebox.showinfo(
+            self._show_info(
                 "GUI Desktop Icon",
                 f"Desktop launcher created:\n{result.desktop_entry_path}",
             )
         except Exception as exc:
-            messagebox.showerror("GUI shortcut install failed", str(exc))
+            self._show_error("GUI shortcut install failed", str(exc))
 
     def _refresh_runtime_alerts(self) -> None:
         try:
@@ -5580,7 +5658,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self._set_run_history_detail_text("")
             self._refresh_runtime_alerts()
         except Exception as exc:
-            messagebox.showerror("Run history failed", str(exc))
+            self._show_error("Run history failed", str(exc))
 
     def _set_run_history_detail_text(self, text: str) -> None:
         self.run_history_detail.delete("1.0", tk.END)
@@ -5606,18 +5684,18 @@ class BumbleBoxV2GUI(tk.Tk):
             payload = load_run_summary(path)
             self._set_run_history_detail_text(json.dumps(payload, indent=2))
         except Exception as exc:
-            messagebox.showerror("Load summary failed", str(exc))
+            self._show_error("Load summary failed", str(exc))
 
     def _export_selected_run_bundle(self) -> None:
         selected = self.run_history_tree.selection()
         if not selected:
-            messagebox.showerror("No run selected", "Select a run from Recent Runs first.")
+            self._show_error("No run selected", "Select a run from Recent Runs first.")
             return
 
         iid = selected[0]
         summary_path = self._run_history_paths.get(iid)
         if not summary_path:
-            messagebox.showerror("Missing run path", "Could not resolve selected run summary path.")
+            self._show_error("Missing run path", "Could not resolve selected run summary path.")
             return
 
         try:
@@ -5633,9 +5711,9 @@ class BumbleBoxV2GUI(tk.Tk):
             )
             text = format_bundle_export_result(result)
             self._set_run_history_detail_text(text)
-            messagebox.showinfo("Export complete", text)
+            self._show_info("Export complete", text)
         except Exception as exc:
-            messagebox.showerror("Bundle export failed", str(exc))
+            self._show_error("Bundle export failed", str(exc))
 
 
 def launch() -> None:
