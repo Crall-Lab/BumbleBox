@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import gc
 import json
 import socket
 import time
@@ -37,6 +38,19 @@ class RunSummary:
     warnings: List[str]
     errors: List[str]
     success: bool
+
+
+@dataclass
+class LiveRecordingResult:
+    session_name: str
+    session_dir: str
+    video_codec: str
+    video_path: str
+    timestamp_path: Optional[str]
+    recording_preview_png_path: Optional[str]
+    frames_captured: int
+    actual_fps: float
+    requested_recording_seconds: float
 
 
 def _now_iso() -> str:
@@ -171,53 +185,67 @@ def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[fl
 
     resolved_tuning_file = resolve_camera_tuning_file(config)
     picam2 = _construct_picamera2(resolved_tuning_file)
+    started = False
     try:
-        preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
-        picam2.align_configuration(preview)
-        picam2.configure(preview)
-    except IndexError as exc:
-        raise RuntimeError(
-            "Camera opened but failed to configure capture stream (IndexError). "
-            "This usually means libcamera could not enumerate valid sensor modes."
-        ) from exc
-    except Exception as exc:
-        raise RuntimeError(f"Failed to configure capture stream: {exc}") from exc
-    picam2.set_controls({"ExposureTime": shutter_us})
-
-    if noise_reduction != "Auto":
         try:
-            mode = getattr(controls.draft.NoiseReductionModeEnum, str(noise_reduction))
-            picam2.set_controls({"NoiseReductionMode": mode})
+            preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
+            picam2.align_configuration(preview)
+            picam2.configure(preview)
+        except IndexError as exc:
+            raise RuntimeError(
+                "Camera opened but failed to configure capture stream (IndexError). "
+                "This usually means libcamera could not enumerate valid sensor modes."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"Failed to configure capture stream: {exc}") from exc
+        picam2.set_controls({"ExposureTime": shutter_us})
+
+        if noise_reduction != "Auto":
+            try:
+                mode = getattr(controls.draft.NoiseReductionModeEnum, str(noise_reduction))
+                picam2.set_controls({"NoiseReductionMode": mode})
+            except Exception:
+                pass
+
+        if isinstance(digital_zoom, (list, tuple)) and len(digital_zoom) == 4:
+            picam2.set_controls({"ScalerCrop": tuple(digital_zoom)})
+
+        warmup_s = float(config["runtime"].get("camera_warmup_seconds", 2.0))
+        picam2.start()
+        started = True
+        time.sleep(max(0.0, warmup_s))
+
+        frames: List[Any] = []
+        timestamps: List[float] = []
+
+        start = time.perf_counter()
+        frame_index = 0
+        target_interval = 1.0 / fps
+        while (time.perf_counter() - start) < duration:
+            now = time.perf_counter()
+            expected = start + frame_index * target_interval
+            if now >= expected:
+                yuv420 = picam2.capture_array()
+                frames.append(yuv420)
+                timestamps.append(now - start)
+                frame_index += 1
+
+        elapsed = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else duration
+        actual_fps = (len(timestamps) - 1) / elapsed if elapsed > 0 and len(timestamps) > 1 else float(len(frames)) / max(duration, 1e-6)
+        return frames, timestamps, actual_fps
+    finally:
+        if started:
+            try:
+                picam2.stop()
+            except Exception:
+                pass
+        try:
+            picam2.close()
         except Exception:
             pass
-
-    if isinstance(digital_zoom, (list, tuple)) and len(digital_zoom) == 4:
-        picam2.set_controls({"ScalerCrop": tuple(digital_zoom)})
-
-    warmup_s = float(config["runtime"].get("camera_warmup_seconds", 2.0))
-    picam2.start()
-    time.sleep(max(0.0, warmup_s))
-
-    frames: List[Any] = []
-    timestamps: List[float] = []
-
-    start = time.perf_counter()
-    frame_index = 0
-    target_interval = 1.0 / fps
-    while (time.perf_counter() - start) < duration:
-        now = time.perf_counter()
-        expected = start + frame_index * target_interval
-        if now >= expected:
-            yuv420 = picam2.capture_array()
-            frames.append(yuv420)
-            timestamps.append(now - start)
-            frame_index += 1
-
-    picam2.stop()
-
-    elapsed = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else duration
-    actual_fps = (len(timestamps) - 1) / elapsed if elapsed > 0 and len(timestamps) > 1 else float(len(frames)) / max(duration, 1e-6)
-    return frames, timestamps, actual_fps
+        picam2 = None
+        gc.collect()
+        time.sleep(0.35)
 
 
 def _capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float]:
@@ -251,6 +279,65 @@ def capture_probe(
     frame_count = len(frames)
     del frames
     return frame_count, float(actual_fps), float(elapsed)
+
+
+def record_live_test_clip(
+    config: Dict[str, Any],
+    *,
+    recording_seconds: Optional[float] = None,
+) -> LiveRecordingResult:
+    test_config = deepcopy(config)
+    test_config.setdefault("capture", {})
+
+    if recording_seconds is not None:
+        test_config["capture"]["recording_seconds"] = float(recording_seconds)
+
+    requested_recording_seconds = float(test_config["capture"]["recording_seconds"])
+    session_name, session_dir = _make_session_paths(test_config)
+    session_name = f"{session_name}_fps_test"
+
+    frames, timestamps, actual_fps = _capture_frames(test_config)
+    timestamp_path: Optional[Path] = None
+    recording_preview_png_path: Optional[Path] = None
+
+    if timestamps:
+        timestamp_path = _write_timestamps(timestamps, session_dir, session_name)
+
+    video_codec = _normalize_recording_codec(test_config)
+    video_path = _write_recording_video(
+        frames,
+        session_dir,
+        session_name,
+        fps=float(test_config["camera"]["fps_target"]),
+        width=int(test_config["camera"]["width"]),
+        height=int(test_config["camera"]["height"]),
+        recording_codec=video_codec,
+        mp4_codec=str(test_config["camera"].get("mp4_codec", "mp4v")),
+    )
+
+    if video_codec == "mjpeg":
+        recording_preview_png_path = _write_midpoint_preview_png(frames, session_dir, session_name)
+
+    if video_codec == "mp4":
+        sidecar = session_dir / f"{session_name}_actual_fps.txt"
+        sidecar.write_text(f"{actual_fps:.6f}\n")
+
+    frame_count = len(frames)
+    del frames
+
+    return LiveRecordingResult(
+        session_name=session_name,
+        session_dir=str(session_dir),
+        video_codec=video_codec,
+        video_path=str(video_path),
+        timestamp_path=str(timestamp_path) if timestamp_path else None,
+        recording_preview_png_path=(
+            str(recording_preview_png_path) if recording_preview_png_path else None
+        ),
+        frames_captured=frame_count,
+        actual_fps=round(actual_fps, 6),
+        requested_recording_seconds=requested_recording_seconds,
+    )
 
 
 def _write_recording_video(

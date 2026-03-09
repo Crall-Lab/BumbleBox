@@ -70,7 +70,7 @@ from .nest_labeling import (
 from .roadmap import build_roadmap
 from .runtime_alerts import build_runtime_alerts, format_runtime_alerts
 from .run_bundle import export_run_bundle, format_bundle_export_result
-from .run_engine import format_run_summary, run_once
+from .run_engine import format_run_summary, record_live_test_clip, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
 from .storage_manager import (
     build_storage_setup_sudo_command,
@@ -144,6 +144,10 @@ class BumbleBoxV2GUI(tk.Tk):
         self._fps_sweep_error: str | None = None
         self._fps_sweep_report = None
         self._fps_sweep_progress_q: queue.Queue[tuple[int, int, float]] = queue.Queue()
+        self._fps_live_thread: threading.Thread | None = None
+        self._fps_live_error: str | None = None
+        self._fps_live_report: dict | None = None
+        self._fps_live_capture = None
         self._config_form_canvas: tk.Canvas | None = None
         self._config_form_window: int | None = None
         self._theme_knob: tk.Scale | None = None
@@ -2784,6 +2788,8 @@ class BumbleBoxV2GUI(tk.Tk):
         self.video_path_var = tk.StringVar()
         self.timestamps_path_var = tk.StringVar()
         self.recording_seconds_var = tk.StringVar()
+        self.fps_live_seconds_var = tk.StringVar(value="10.0")
+        self.fps_live_status_var = tk.StringVar(value="Idle")
         self.fps_sweep_values_var = tk.StringVar(value="")
         self.fps_sweep_start_var = tk.StringVar(value="2.0")
         self.fps_sweep_stop_var = tk.StringVar(value="20.0")
@@ -2835,6 +2841,41 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Button(report_frame, text="Run FPS Report", command=self._run_fps_report).grid(
             row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
+        live_frame = ttk.LabelFrame(report_frame, text="Live FPS Test Capture", padding=6)
+        live_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(
+            live_frame,
+            text=(
+                "Record a short test clip now using the current config, then run the standard FPS report on it. "
+                "Useful when you do not already have a video."
+            ),
+            wraplength=420,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        self._grid_help_label(
+            live_frame,
+            row=1,
+            column=0,
+            text="Live test seconds",
+            help_title="Live Test Seconds",
+            help_details=(
+                "Length of the temporary recording created for FPS analysis. "
+                "Uses current codec, resolution, shutter, and target FPS from Config Editor."
+            ),
+        )
+        ttk.Entry(live_frame, textvariable=self.fps_live_seconds_var, width=10).grid(
+            row=1, column=1, sticky="w", padx=8, pady=3
+        )
+        self.fps_live_run_btn = ttk.Button(
+            live_frame,
+            text="Capture Live Test + Run Report",
+            command=self._start_live_fps_report,
+        )
+        self.fps_live_run_btn.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(live_frame, textvariable=self.fps_live_status_var).grid(
+            row=2, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(8, 0)
+        )
+        live_frame.columnconfigure(2, weight=1)
         report_frame.columnconfigure(1, weight=1)
 
         sweep_frame = ttk.LabelFrame(top, text="FPS Sweep Capacity Test", padding=8)
@@ -5257,6 +5298,99 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fps_output.insert(tk.END, format_fps_report(report))
         except Exception as exc:
             self._show_error("FPS report failed", str(exc))
+
+    def _start_live_fps_report(self) -> None:
+        if self._fps_live_thread and self._fps_live_thread.is_alive():
+            self._show_info("Live FPS test running", "A live FPS capture is already running.")
+            return
+
+        try:
+            config, _ = self._load_config_or_defaults()
+            live_seconds_text = self.fps_live_seconds_var.get().strip()
+            live_seconds = (
+                float(live_seconds_text)
+                if live_seconds_text
+                else float(config.get("capture", {}).get("recording_seconds", 10.0))
+            )
+            if live_seconds <= 0:
+                raise ValueError("Live test seconds must be > 0")
+        except Exception as exc:
+            self._show_error("Invalid live FPS settings", str(exc))
+            return
+
+        self._fps_live_error = None
+        self._fps_live_report = None
+        self._fps_live_capture = None
+        self.fps_live_status_var.set("Recording test clip...")
+        self.fps_live_run_btn.config(state=tk.DISABLED)
+        self.fps_output.delete("1.0", tk.END)
+        self.fps_output.insert(
+            tk.END,
+            (
+                "Recording live FPS test clip...\n"
+                f"Requested seconds: {live_seconds:.2f}\n"
+                "Using current camera config from BumbleBox.\n"
+            ),
+        )
+
+        self._fps_live_thread = threading.Thread(
+            target=self._run_live_fps_report_worker,
+            args=(config, live_seconds),
+            daemon=True,
+        )
+        self._fps_live_thread.start()
+        self.after(200, self._poll_live_fps_report)
+
+    def _run_live_fps_report_worker(self, config: dict, live_seconds: float) -> None:
+        try:
+            capture_result = record_live_test_clip(config, recording_seconds=live_seconds)
+            report = build_fps_report(
+                capture_result.video_path,
+                timestamps_path=capture_result.timestamp_path,
+                recording_seconds=live_seconds,
+            )
+            self._fps_live_capture = capture_result
+            self._fps_live_report = report
+        except Exception as exc:
+            self._fps_live_error = str(exc)
+
+    def _poll_live_fps_report(self) -> None:
+        if self._fps_live_thread and self._fps_live_thread.is_alive():
+            self.after(200, self._poll_live_fps_report)
+            return
+
+        self.fps_live_run_btn.config(state=tk.NORMAL)
+        if self._fps_live_error:
+            self.fps_live_status_var.set("Failed")
+            self.fps_output.insert(tk.END, f"\nError: {self._fps_live_error}\n")
+            self._show_error("Live FPS test failed", self._fps_live_error)
+            return
+
+        capture_result = self._fps_live_capture
+        report = self._fps_live_report
+        if capture_result is None or report is None:
+            self.fps_live_status_var.set("No result")
+            self.fps_output.insert(tk.END, "\nLive FPS test ended without a report.\n")
+            return
+
+        self.fps_live_status_var.set("Completed")
+        self.video_path_var.set(str(capture_result.video_path))
+        self.timestamps_path_var.set(str(capture_result.timestamp_path or ""))
+        self.recording_seconds_var.set(f"{float(capture_result.requested_recording_seconds):.3f}")
+
+        lines = [
+            "Live FPS test capture complete.",
+            f"Video path: {capture_result.video_path}",
+            f"Timestamps path: {capture_result.timestamp_path or '(none)'}",
+            f"Session dir: {capture_result.session_dir}",
+            f"Codec: {capture_result.video_codec}",
+            f"Frames captured: {capture_result.frames_captured}",
+            f"Capture-estimated FPS: {capture_result.actual_fps}",
+            "",
+            format_fps_report(report),
+        ]
+        self.fps_output.delete("1.0", tk.END)
+        self.fps_output.insert(tk.END, "\n".join(lines))
 
     def _start_fps_sweep(self) -> None:
         if self._fps_sweep_thread and self._fps_sweep_thread.is_alive():
