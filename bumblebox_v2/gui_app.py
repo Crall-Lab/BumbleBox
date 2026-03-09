@@ -5329,7 +5329,7 @@ class BumbleBoxV2GUI(tk.Tk):
             (
                 "Recording live FPS test clip...\n"
                 f"Requested seconds: {live_seconds:.2f}\n"
-                "Using current camera config from BumbleBox.\n"
+                f"Using current camera config from BumbleBox => {float(config.get('camera', {}).get('fps_target', 0.0)):.1f} FPS\n"
             ),
         )
 
@@ -5380,7 +5380,9 @@ class BumbleBoxV2GUI(tk.Tk):
 
         lines = [
             "Live FPS test capture complete.",
+            f"Configured FPS target: {float(capture_result.configured_fps_target):.1f}",
             f"Video path: {capture_result.video_path}",
+            f"Video size (bytes): {capture_result.video_size_bytes}",
             f"Timestamps path: {capture_result.timestamp_path or '(none)'}",
             f"Session dir: {capture_result.session_dir}",
             f"Codec: {capture_result.video_codec}",

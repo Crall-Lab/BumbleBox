@@ -46,10 +46,12 @@ class LiveRecordingResult:
     session_dir: str
     video_codec: str
     video_path: str
+    video_size_bytes: int
     timestamp_path: Optional[str]
     recording_preview_png_path: Optional[str]
     frames_captured: int
     actual_fps: float
+    configured_fps_target: float
     requested_recording_seconds: float
 
 
@@ -323,6 +325,11 @@ def record_live_test_clip(
         sidecar.write_text(f"{actual_fps:.6f}\n")
 
     frame_count = len(frames)
+    if frame_count == 0:
+        del frames
+        raise RuntimeError(
+            "Live FPS test captured zero frames. The camera started, but no frames were returned before the test window ended."
+        )
     del frames
 
     return LiveRecordingResult(
@@ -330,12 +337,14 @@ def record_live_test_clip(
         session_dir=str(session_dir),
         video_codec=video_codec,
         video_path=str(video_path),
+        video_size_bytes=int(video_path.stat().st_size) if video_path.exists() else 0,
         timestamp_path=str(timestamp_path) if timestamp_path else None,
         recording_preview_png_path=(
             str(recording_preview_png_path) if recording_preview_png_path else None
         ),
         frames_captured=frame_count,
         actual_fps=round(actual_fps, 6),
+        configured_fps_target=float(test_config["camera"]["fps_target"]),
         requested_recording_seconds=requested_recording_seconds,
     )
 

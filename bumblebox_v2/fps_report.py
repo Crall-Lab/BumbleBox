@@ -63,25 +63,41 @@ def build_fps_report(
     if not video_path.exists():
         raise FileNotFoundError(f"Video file does not exist: {video_path}")
 
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Unable to open video: {video_path}")
-
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    metadata_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
-    capture.release()
-
-    metadata_duration_s = None
-    if metadata_fps > 0 and frame_count > 0:
-        metadata_duration_s = frame_count / metadata_fps
-
     report: Dict[str, Any] = {
         "video": str(video_path),
-        "frame_count": frame_count,
-        "metadata_fps": _safe_round(metadata_fps),
-        "metadata_duration_s": _safe_round(metadata_duration_s),
+        "video_size_bytes": int(video_path.stat().st_size) if video_path.exists() else None,
+        "frame_count": None,
+        "metadata_fps": None,
+        "metadata_duration_s": None,
         "requested_recording_seconds": recording_seconds,
     }
+
+    capture = cv2.VideoCapture(str(video_path))
+    if capture.isOpened():
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        metadata_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        capture.release()
+
+        metadata_duration_s = None
+        if metadata_fps > 0 and frame_count > 0:
+            metadata_duration_s = frame_count / metadata_fps
+
+        report.update(
+            {
+                "frame_count": frame_count,
+                "metadata_fps": _safe_round(metadata_fps),
+                "metadata_duration_s": _safe_round(metadata_duration_s),
+            }
+        )
+    else:
+        capture.release()
+        report["video_open_warning"] = f"Unable to open video with OpenCV: {video_path}"
+
+    if report.get("video_size_bytes") is not None and int(report["video_size_bytes"]) < 1024:
+        report["video_size_warning"] = (
+            f"Video file is unusually small ({report['video_size_bytes']} bytes). "
+            "Encoding may have failed or no frames were written."
+        )
 
     ts_path = Path(timestamps_path) if timestamps_path else None
     if ts_path is None:
@@ -110,8 +126,9 @@ def build_fps_report(
                 }
             )
 
-            if metadata_fps > 0 and actual_fps:
-                drift_pct = ((actual_fps - metadata_fps) / metadata_fps) * 100.0
+            metadata_fps_value = report.get("metadata_fps")
+            if metadata_fps_value and actual_fps:
+                drift_pct = ((actual_fps - float(metadata_fps_value)) / float(metadata_fps_value)) * 100.0
                 report["actual_vs_metadata_drift_pct"] = _safe_round(drift_pct, 3)
         else:
             report["timestamp_file"] = str(ts_path)
@@ -127,10 +144,18 @@ def build_fps_report(
             }
         )
 
-    if recording_seconds and frame_count > 0:
-        expected_frames = recording_seconds * (metadata_fps if metadata_fps > 0 else 0)
+    frame_count_value = report.get("frame_count")
+    metadata_fps_value = report.get("metadata_fps")
+    if recording_seconds and frame_count_value:
+        expected_frames = recording_seconds * (float(metadata_fps_value) if metadata_fps_value and float(metadata_fps_value) > 0 else 0)
         if expected_frames > 0:
-            report["frames_vs_expected_pct"] = _safe_round((frame_count / expected_frames) * 100.0, 3)
+            report["frames_vs_expected_pct"] = _safe_round((float(frame_count_value) / expected_frames) * 100.0, 3)
+    elif recording_seconds and report.get("captured_frames_from_timestamps"):
+        actual_frames = float(report["captured_frames_from_timestamps"])
+        actual_fps_value = report.get("actual_fps_from_timestamps") or report.get("actual_fps_from_sidecar_txt")
+        expected_frames = recording_seconds * (float(actual_fps_value) if actual_fps_value else 0.0)
+        if expected_frames > 0:
+            report["frames_vs_expected_pct"] = _safe_round((actual_frames / expected_frames) * 100.0, 3)
 
     return report
 
@@ -145,6 +170,8 @@ def write_report_json(report: Dict[str, Any], output_path: str | Path) -> Path:
 def format_report(report: Dict[str, Any]) -> str:
     lines: List[str] = []
     lines.append(f"Video: {report['video']}")
+    if report.get("video_size_bytes") is not None:
+        lines.append(f"Video size (bytes): {report.get('video_size_bytes')}")
     lines.append(f"Frame count: {report.get('frame_count')}")
     lines.append(f"Metadata FPS: {report.get('metadata_fps')}")
     lines.append(f"Metadata duration (s): {report.get('metadata_duration_s')}")
@@ -165,6 +192,9 @@ def format_report(report: Dict[str, Any]) -> str:
 
     if report.get("timestamp_warning"):
         lines.append(f"Warning: {report['timestamp_warning']}")
+    if report.get("video_open_warning"):
+        lines.append(f"Warning: {report['video_open_warning']}")
+    if report.get("video_size_warning"):
+        lines.append(f"Warning: {report['video_size_warning']}")
 
     return "\n".join(lines)
-
