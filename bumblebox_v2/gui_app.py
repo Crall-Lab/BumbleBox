@@ -36,6 +36,7 @@ from .fps_sweep import (
     parse_fps_values,
     run_fps_sweep,
 )
+from .qt_env import build_qt_safe_env
 from .fleet import (
     apply_queen_media_schedule_defaults,
     enroll_worker_config,
@@ -4837,7 +4838,13 @@ class BumbleBoxV2GUI(tk.Tk):
         if device_path:
             command.extend(["--device", device_path])
 
-        proc = subprocess.run(command, capture_output=True, text=True, check=False)
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=build_qt_safe_env(),
+        )
         self.storage_output.delete("1.0", tk.END)
         if proc.returncode == 0:
             text = (proc.stdout or "").strip() or "Storage setup completed with pkexec."
@@ -5200,7 +5207,13 @@ class BumbleBoxV2GUI(tk.Tk):
         if height is not None:
             command.extend(["--height", str(int(height))])
 
-        proc = subprocess.run(command, capture_output=True, text=True, check=False)
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=build_qt_safe_env(),
+        )
         stdout = (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
         backend_failed = looks_like_backend_failure(stdout, stderr)

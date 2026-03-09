@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .qt_env import build_qt_safe_env
+
 
 DEFAULT_SCRIPT_NAME = "LabelNests_GUI.1.16.py"
 DEFAULT_LABEL_ENV_RELATIVE = Path(".venvs") / "bbx-label"
@@ -239,6 +241,7 @@ def launch_nest_labeling(
         command,
         cwd=str(repo_root()),
         start_new_session=True,
+        env=build_qt_safe_env(),
     )
 
 
@@ -279,6 +282,7 @@ def launch_labelme(
         command,
         cwd=str(repo_root()),
         start_new_session=True,
+        env=build_qt_safe_env(),
     )
     # Detect immediate startup failures (for example missing Qt plugin) and raise a clear error.
     time.sleep(0.8)
@@ -290,6 +294,7 @@ def launch_labelme(
             capture_output=True,
             text=True,
             check=False,
+            env=build_qt_safe_env(),
         )
         stdout = (probe.stdout or "").strip()
         stderr = (probe.stderr or "").strip()

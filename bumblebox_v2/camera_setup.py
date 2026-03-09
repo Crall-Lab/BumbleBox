@@ -7,6 +7,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Optional
 
+from .qt_env import sanitize_current_qt_env
 from .tuning import resolve_camera_tuning_file
 
 
@@ -198,6 +199,9 @@ def run_camera_preview(
 ) -> CameraPreviewResult:
     if preview_seconds <= 0:
         raise ValueError("preview_seconds must be > 0")
+
+    # pip OpenCV can overwrite Qt plugin env vars at import time; clear those before Preview.QT starts.
+    sanitize_current_qt_env()
 
     camera_cfg = config.get("camera", {})
     width = int(width if width is not None else camera_cfg.get("width", 4056))
