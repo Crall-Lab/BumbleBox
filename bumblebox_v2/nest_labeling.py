@@ -48,6 +48,10 @@ def default_label_python_path() -> Path:
     return repo_root() / DEFAULT_LABEL_ENV_RELATIVE / "bin" / "python"
 
 
+def default_calibration_labelmerc_path() -> Path:
+    return repo_root() / "labelmerc_calibration"
+
+
 def _is_executable_file(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
@@ -248,6 +252,7 @@ def launch_nest_labeling(
 def build_labelme_command(
     image_path: str,
     python_executable: Optional[str] = None,
+    labelmerc_override: Optional[str] = None,
 ) -> list[str]:
     target = Path(image_path).expanduser().resolve()
     if not target.exists():
@@ -257,12 +262,24 @@ def build_labelme_command(
     if not _is_executable_file(resolved_python):
         raise RuntimeError(f"Selected Python is not executable: {resolved_python}")
 
+    labelmerc_path = resolve_labelmerc_path(
+        labelmerc_override=labelmerc_override,
+        image_folder=str(target.parent),
+    )
     labelme_cli_path = _labelme_cli_for_python(resolved_python)
     if labelme_cli_path:
-        return [labelme_cli_path, str(target)]
+        command = [labelme_cli_path]
+        if labelmerc_path:
+            command.extend(["--config", str(labelmerc_path)])
+        command.append(str(target))
+        return command
 
     if _python_can_import(resolved_python, "labelme"):
-        return [str(resolved_python), "-m", "labelme", str(target)]
+        command = [str(resolved_python), "-m", "labelme"]
+        if labelmerc_path:
+            command.extend(["--config", str(labelmerc_path)])
+        command.append(str(target))
+        return command
 
     raise RuntimeError(
         f"LabelMe not found in selected labeling environment: {resolved_python}. "
@@ -273,10 +290,12 @@ def build_labelme_command(
 def launch_labelme(
     image_path: str,
     python_executable: Optional[str] = None,
+    labelmerc_override: Optional[str] = None,
 ) -> subprocess.Popen:
     command = build_labelme_command(
         image_path=image_path,
         python_executable=python_executable,
+        labelmerc_override=labelmerc_override,
     )
     process = subprocess.Popen(
         command,

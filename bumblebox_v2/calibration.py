@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import gc
 import json
 from math import hypot
 from pathlib import Path
@@ -277,6 +278,9 @@ def capture_calibration_image(
             picam2.close()
         except Exception:
             pass
+        picam2 = None
+        gc.collect()
+        time.sleep(0.35)
 
     return output_path
 
@@ -295,8 +299,10 @@ def extract_points_from_labelme_json(
 
     shapes = payload.get("shapes")
     if not isinstance(shapes, list) or not shapes:
-        raise RuntimeError("LabelMe JSON has no shapes. Add two point annotations and save.")
+        raise RuntimeError("LabelMe JSON has no shapes. Draw one line or add two points, then save.")
 
+    preferred_lines: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    generic_lines: list[tuple[tuple[float, float], tuple[float, float]]] = []
     explicit_points: list[tuple[float, float]] = []
     fallback_points: list[tuple[float, float]] = []
 
@@ -307,7 +313,26 @@ def extract_points_from_labelme_json(
         if not isinstance(shape_points, list):
             continue
 
+        label_text = str(shape.get("label", "")).strip().lower()
         shape_type = str(shape.get("shape_type", "")).strip().lower()
+        if shape_type == "line" and len(shape_points) >= 2:
+            point_a = shape_points[0]
+            point_b = shape_points[1]
+            if (
+                isinstance(point_a, list)
+                and len(point_a) >= 2
+                and isinstance(point_b, list)
+                and len(point_b) >= 2
+            ):
+                line = (
+                    (float(point_a[0]), float(point_a[1])),
+                    (float(point_b[0]), float(point_b[1])),
+                )
+                if any(token in label_text for token in ("calibration", "a->b", "a-b", "a_b")):
+                    preferred_lines.append(line)
+                else:
+                    generic_lines.append(line)
+
         if shape_type == "point" and len(shape_points) >= 1:
             point = shape_points[0]
             if isinstance(point, list) and len(point) >= 2:
@@ -316,6 +341,22 @@ def extract_points_from_labelme_json(
         for point in shape_points:
             if isinstance(point, list) and len(point) >= 2:
                 fallback_points.append((float(point[0]), float(point[1])))
+
+    if preferred_lines:
+        point_a, point_b = preferred_lines[0]
+        return (
+            point_a,
+            point_b,
+            "Loaded endpoints from a saved calibration line. Point A is the first click and Point B is the second click.",
+        )
+
+    if generic_lines:
+        point_a, point_b = generic_lines[0]
+        return (
+            point_a,
+            point_b,
+            "Loaded endpoints from the first saved line. Point A is the first click and Point B is the second click.",
+        )
 
     if len(explicit_points) >= 2:
         point_a, point_b = explicit_points[0], explicit_points[1]

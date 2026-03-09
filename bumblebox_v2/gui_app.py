@@ -61,6 +61,7 @@ from .nest_labeling import (
     build_labelme_command,
     build_nest_labeling_command,
     check_nest_labeling_environment,
+    default_calibration_labelmerc_path,
     default_script_path,
     format_nest_labeling_environment,
     launch_labelme,
@@ -3024,7 +3025,7 @@ class BumbleBoxV2GUI(tk.Tk):
             picker,
             text=(
                 "Capture a fresh image from the camera and open LabelMe directly. "
-                "Place two point annotations on the known-distance endpoints, save, then load points."
+                "Draw one line across the known-distance endpoints, save, then load points."
             ),
             wraplength=380,
             justify=tk.LEFT,
@@ -5403,11 +5404,13 @@ class BumbleBoxV2GUI(tk.Tk):
             process = launch_labelme(
                 image_path=str(image_path),
                 python_executable=python_override,
+                labelmerc_override=str(default_calibration_labelmerc_path()),
             )
             self._calibration_label_pid = process.pid
             command = build_labelme_command(
                 image_path=str(image_path),
                 python_executable=python_override,
+                labelmerc_override=str(default_calibration_labelmerc_path()),
             )
             self.calibration_output.delete("1.0", tk.END)
             self.calibration_output.insert(
@@ -5418,7 +5421,8 @@ class BumbleBoxV2GUI(tk.Tk):
                     f"Launched LabelMe (pid {process.pid}).\n"
                     f"Command: {' '.join(shlex.quote(part) for part in command)}\n\n"
                     "No JSON exists yet until you save in LabelMe.\n"
-                    "In LabelMe, place two point annotations on the known-distance endpoints and save.\n"
+                    "In LabelMe, draw one line from Point A to Point B on the known-distance endpoints and save.\n"
+                    "The first click becomes Point A and the second click becomes Point B.\n"
                     "Then click 'Load LabelMe Points -> Point A/B'."
                 ),
             )
