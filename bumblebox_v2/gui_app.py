@@ -2966,7 +2966,8 @@ class BumbleBoxV2GUI(tk.Tk):
             sweep_frame,
             text=(
                 "Runs increasing FPS probes, compares target vs real FPS, and estimates max recording duration "
-                "using the current workflow. MP4 and RAM-tracking workflows use a RAM-backed model. "
+                "using the current workflow. RAM-backed workflows try to measure real memory growth on this machine "
+                "while frames are held in memory, then fall back to a heuristic only when direct RAM samples are unavailable. "
                 "MJPEG video-backed workflows use measured file growth and free storage under the current data root. "
                 "If tracking ran this app session, it also estimates tracking time for each recording duration."
             ),
@@ -3038,7 +3039,8 @@ class BumbleBoxV2GUI(tk.Tk):
             text="Assume RAM GiB (RAM-backed only)",
             help_title="Assumed RAM",
             help_details=(
-                "Simulate capacity on a target machine when the sweep uses a RAM-backed model. "
+                "Simulate capacity on a target machine when you are not measuring on the actual Pi. "
+                "When this is set, BumbleBox uses the heuristic RAM model instead of empirical on-machine RAM profiling. "
                 "Ignored for disk-backed MJPEG sweep runs."
             ),
         )

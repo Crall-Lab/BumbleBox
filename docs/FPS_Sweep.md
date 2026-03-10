@@ -12,6 +12,7 @@ The capacity model depends on the current BumbleBox workflow:
 
 - `MP4` recording uses a RAM-backed model because frames are captured into memory first and encoded afterward.
 - `record_and_track` with `tracking_source=ram` also uses a RAM-backed model, even if the recording codec is `MJPEG`, because frames still need to stay in memory for tracking.
+- For real on-machine RAM-backed sweeps, BumbleBox now tries to measure actual memory growth from Linux `MemAvailable` plus process RSS while frames remain in memory. If those samples are unavailable, it falls back to the older frame-size heuristic.
 - `MJPEG` recording without RAM-backed tracking uses a disk-backed model. The sweep writes short MJPEG probe clips under `system.data_root`, measures file growth rate, and estimates how long recording can continue before free space is exhausted.
 
 ## CLI
@@ -59,7 +60,7 @@ Open `FPS Report` tab:
 1. Use `FPS Sweep Capacity Test`.
 2. Set either `FPS list` or `Start/Stop/Step`.
 3. Set `Probe seconds`.
-4. Optionally set `Assume RAM GiB` if you want to simulate a Pi target for a RAM-backed workflow.
+4. Optionally set `Assume RAM GiB` if you want to simulate a Pi target for a RAM-backed workflow. This disables empirical on-machine RAM profiling and uses the heuristic RAM model instead.
 5. Click `Run FPS Sweep`.
 
 The GUI defaults to using tracking benchmark data from the current app session only.

@@ -1302,7 +1302,8 @@ def build_parser() -> argparse.ArgumentParser:
         "fps-sweep",
         help=(
             "Probe target FPS values and estimate max recording durations using the current workflow "
-            "(RAM-backed for MP4 or RAM tracking, disk-backed for MJPEG video-backed capture). "
+            "(empirical RAM profiling for MP4 or RAM tracking on the current machine, "
+            "disk-backed profiling for MJPEG video-backed capture). "
             "If recent tracking exists, include estimated tracking time."
         ),
     )
@@ -1325,6 +1326,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help=(
             "Optional RAM size (GiB) to simulate target hardware during RAM-backed duration estimation. "
+            "When set, BumbleBox uses the heuristic RAM model instead of empirical on-machine RAM profiling. "
             "Ignored for disk-backed MJPEG sweeps."
         ),
     )

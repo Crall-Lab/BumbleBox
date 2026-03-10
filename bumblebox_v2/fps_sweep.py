@@ -47,8 +47,11 @@ class FpsSweepPoint:
     frames_captured: int
     probe_seconds: float
     capture_elapsed_seconds: float
+    capacity_estimation_mode: str
     probe_output_bytes: Optional[int]
     probe_output_mib_per_second: Optional[float]
+    probe_memory_mib_per_second: Optional[float]
+    probe_ram_budget_bytes: Optional[int]
     max_recording_seconds_safe: Optional[float]
     max_recording_seconds_warn: Optional[float]
     max_recording_seconds_high_risk: Optional[float]
@@ -168,6 +171,86 @@ def _resolve_storage_free_bytes(data_root: str | Path) -> tuple[Optional[int], s
         return int(usage.free), str(target)
     except Exception:
         return None, str(target)
+
+
+def _read_mem_available_bytes() -> Optional[int]:
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.exists():
+        return None
+    try:
+        for line in meminfo.read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def _read_process_rss_bytes() -> Optional[int]:
+    status = Path("/proc/self/status")
+    if not status.exists():
+        return None
+    try:
+        for line in status.read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def _capture_ram_snapshot() -> dict[str, Optional[int]]:
+    return {
+        "mem_available_bytes": _read_mem_available_bytes(),
+        "process_rss_bytes": _read_process_rss_bytes(),
+    }
+
+
+def _observed_ram_probe_metrics(
+    before: dict[str, Optional[int]],
+    after: dict[str, Optional[int]],
+    *,
+    capture_elapsed: float,
+    fallback_budget_bytes: Optional[int],
+) -> tuple[Optional[float], Optional[float], Optional[int]]:
+    mem_available_before = before.get("mem_available_bytes")
+    mem_available_after = after.get("mem_available_bytes")
+    process_rss_before = before.get("process_rss_bytes")
+    process_rss_after = after.get("process_rss_bytes")
+
+    deltas: list[int] = []
+    if (
+        mem_available_before is not None
+        and mem_available_after is not None
+        and mem_available_before >= mem_available_after
+    ):
+        deltas.append(int(mem_available_before - mem_available_after))
+    if (
+        process_rss_before is not None
+        and process_rss_after is not None
+        and process_rss_after >= process_rss_before
+    ):
+        deltas.append(int(process_rss_after - process_rss_before))
+
+    observed_growth_bytes = max(deltas) if deltas else None
+    if observed_growth_bytes is None or observed_growth_bytes <= 0 or capture_elapsed <= 0:
+        return None, None, (
+            int(mem_available_before)
+            if mem_available_before is not None and mem_available_before > 0
+            else fallback_budget_bytes
+        )
+
+    bytes_per_second = float(observed_growth_bytes) / float(capture_elapsed)
+    budget_bytes = (
+        int(mem_available_before)
+        if mem_available_before is not None and mem_available_before > 0
+        else fallback_budget_bytes
+    )
+    return bytes_per_second, round(bytes_per_second / (1024**2), 4), budget_bytes
 
 
 def _capacity_mode_for_config(config: Dict[str, Any]) -> tuple[str, str]:
@@ -405,6 +488,7 @@ def run_fps_sweep(
     ram_source = "not used"
     capacity_total_bytes: Optional[int] = None
     capacity_source = "unavailable"
+    use_mock_capture = bool(use_mock_camera if use_mock_camera is not None else config.get("runtime", {}).get("use_mock_camera", False))
     if capacity_mode == "ram":
         total_ram, ram_source = _resolve_total_ram_bytes(config, assume_ram_gb=assume_ram_gb)
         capacity_total_bytes = total_ram
@@ -415,6 +499,25 @@ def run_fps_sweep(
         capacity_source = storage_source
         if assume_ram_gb is not None:
             capacity_note += " Assume RAM GiB is ignored in disk-backed MJPEG mode."
+    config_ram_override = config.get("system", {}).get("ram_gb_override")
+    ram_empirical_enabled = (
+        capacity_mode == "ram"
+        and not use_mock_capture
+        and assume_ram_gb is None
+        and config_ram_override in (None, "", 0)
+    )
+    if capacity_mode == "ram" and ram_empirical_enabled:
+        capacity_note = (
+            "Empirical RAM-backed capacity model: each probe measures observed memory growth "
+            "from Linux MemAvailable and process RSS while frames remain in memory. "
+            "Safe/warn/high-risk durations use RAM available at the start of each probe. "
+            "If memory samples are unavailable for a point, BumbleBox falls back to the frame-size heuristic."
+        )
+    elif capacity_mode == "ram":
+        capacity_note = (
+            "Heuristic RAM-backed capacity model: durations are estimated from frame size, measured FPS, "
+            "and a fixed overhead factor. This path is used for simulated/mock runs or when RAM overrides are set."
+        )
     benchmark = find_recent_tracking_benchmark(
         data_root=config.get("system", {}).get("data_root", ""),
         session_start_iso=session_start_iso,
@@ -427,31 +530,57 @@ def run_fps_sweep(
         measured_fps: float,
         capture_elapsed: float,
         probe_output_bytes: Optional[int] = None,
+        probe_memory_mib_per_second: Optional[float] = None,
+        probe_ram_budget_bytes: Optional[int] = None,
     ) -> FpsSweepPoint:
         effective_fps = measured_fps if measured_fps > 0 else target_fps
         probe_output_mib_per_second: Optional[float] = None
+        capacity_estimation_mode = "disk_empirical" if capacity_mode == "disk" else "ram_heuristic"
         if capacity_mode == "ram":
-            safe_seconds = _duration_budget_seconds(
-                ram_bytes=total_ram,
-                memory_ratio=SAFE_MEMORY_RATIO,
-                frame_bytes=frame_bytes,
-                effective_fps=effective_fps,
-                overhead_factor=overhead_factor,
-            )
-            warn_seconds = _duration_budget_seconds(
-                ram_bytes=total_ram,
-                memory_ratio=WARN_MEMORY_RATIO,
-                frame_bytes=frame_bytes,
-                effective_fps=effective_fps,
-                overhead_factor=overhead_factor,
-            )
-            high_risk_seconds = _duration_budget_seconds(
-                ram_bytes=total_ram,
-                memory_ratio=HIGH_RISK_MEMORY_RATIO,
-                frame_bytes=frame_bytes,
-                effective_fps=effective_fps,
-                overhead_factor=overhead_factor,
-            )
+            if (
+                probe_memory_mib_per_second is not None
+                and probe_ram_budget_bytes is not None
+                and capture_elapsed > 0
+            ):
+                bytes_per_second = float(probe_memory_mib_per_second) * (1024**2)
+                safe_seconds = _duration_budget_from_bytes_per_second(
+                    total_bytes=probe_ram_budget_bytes,
+                    usage_ratio=SAFE_MEMORY_RATIO,
+                    bytes_per_second=bytes_per_second,
+                )
+                warn_seconds = _duration_budget_from_bytes_per_second(
+                    total_bytes=probe_ram_budget_bytes,
+                    usage_ratio=WARN_MEMORY_RATIO,
+                    bytes_per_second=bytes_per_second,
+                )
+                high_risk_seconds = _duration_budget_from_bytes_per_second(
+                    total_bytes=probe_ram_budget_bytes,
+                    usage_ratio=HIGH_RISK_MEMORY_RATIO,
+                    bytes_per_second=bytes_per_second,
+                )
+                capacity_estimation_mode = "ram_empirical"
+            else:
+                safe_seconds = _duration_budget_seconds(
+                    ram_bytes=total_ram,
+                    memory_ratio=SAFE_MEMORY_RATIO,
+                    frame_bytes=frame_bytes,
+                    effective_fps=effective_fps,
+                    overhead_factor=overhead_factor,
+                )
+                warn_seconds = _duration_budget_seconds(
+                    ram_bytes=total_ram,
+                    memory_ratio=WARN_MEMORY_RATIO,
+                    frame_bytes=frame_bytes,
+                    effective_fps=effective_fps,
+                    overhead_factor=overhead_factor,
+                )
+                high_risk_seconds = _duration_budget_seconds(
+                    ram_bytes=total_ram,
+                    memory_ratio=HIGH_RISK_MEMORY_RATIO,
+                    frame_bytes=frame_bytes,
+                    effective_fps=effective_fps,
+                    overhead_factor=overhead_factor,
+                )
         else:
             bytes_per_second = None
             if probe_output_bytes is not None and capture_elapsed > 0:
@@ -479,8 +608,11 @@ def run_fps_sweep(
             frames_captured=int(frames_captured),
             probe_seconds=float(probe_seconds),
             capture_elapsed_seconds=float(capture_elapsed),
+            capacity_estimation_mode=capacity_estimation_mode,
             probe_output_bytes=(int(probe_output_bytes) if probe_output_bytes is not None else None),
             probe_output_mib_per_second=probe_output_mib_per_second,
+            probe_memory_mib_per_second=probe_memory_mib_per_second,
+            probe_ram_budget_bytes=(int(probe_ram_budget_bytes) if probe_ram_budget_bytes is not None else None),
             max_recording_seconds_safe=safe_seconds,
             max_recording_seconds_warn=warn_seconds,
             max_recording_seconds_high_risk=high_risk_seconds,
@@ -510,7 +642,7 @@ def run_fps_sweep(
 
     points: List[FpsSweepPoint] = []
     total = len(prepared_fps)
-    use_persistent_session = not bool(use_mock_camera if use_mock_camera is not None else config.get("runtime", {}).get("use_mock_camera", False))
+    use_persistent_session = not use_mock_capture
     session = open_capture_probe_session(config, use_mock_camera=use_mock_camera) if use_persistent_session else None
     if session is not None:
         session.start()
@@ -552,7 +684,11 @@ def run_fps_sweep(
                             pass
                 else:
                     probe_output_bytes = None
+                    probe_memory_mib_per_second = None
+                    probe_ram_budget_bytes = None
                     if session is not None:
+                        gc.collect()
+                        ram_snapshot_before = _capture_ram_snapshot() if ram_empirical_enabled else {}
                         start_time = time.perf_counter()
                         frames, _timestamps, measured_fps = session.capture_for(
                             fps=float(target_fps),
@@ -560,6 +696,18 @@ def run_fps_sweep(
                         )
                         capture_elapsed = time.perf_counter() - start_time
                         frames_captured = len(frames)
+                        ram_snapshot_after = _capture_ram_snapshot() if ram_empirical_enabled else {}
+                        if ram_empirical_enabled:
+                            (
+                                _probe_memory_bytes_per_second,
+                                probe_memory_mib_per_second,
+                                probe_ram_budget_bytes,
+                            ) = _observed_ram_probe_metrics(
+                                ram_snapshot_before,
+                                ram_snapshot_after,
+                                capture_elapsed=float(capture_elapsed),
+                                fallback_budget_bytes=total_ram,
+                            )
                         del frames
                         gc.collect()
                     else:
@@ -571,6 +719,8 @@ def run_fps_sweep(
                         measured_fps=float(measured_fps),
                         capture_elapsed=float(capture_elapsed),
                         probe_output_bytes=probe_output_bytes,
+                        probe_memory_mib_per_second=probe_memory_mib_per_second,
+                        probe_ram_budget_bytes=probe_ram_budget_bytes,
                     )
                 )
             except Exception as exc:
@@ -581,8 +731,11 @@ def run_fps_sweep(
                         frames_captured=0,
                         probe_seconds=float(probe_seconds),
                         capture_elapsed_seconds=0.0,
+                        capacity_estimation_mode=("disk_empirical" if capacity_mode == "disk" else "ram_heuristic"),
                         probe_output_bytes=None,
                         probe_output_mib_per_second=None,
+                        probe_memory_mib_per_second=None,
+                        probe_ram_budget_bytes=None,
                         max_recording_seconds_safe=None,
                         max_recording_seconds_warn=None,
                         max_recording_seconds_high_risk=None,
@@ -649,6 +802,7 @@ def _capacity_mode_label(mode: str) -> str:
 
 
 def format_fps_sweep_report(report: FpsSweepReport) -> str:
+    empirical_ram_points = sum(1 for point in report.points if point.capacity_estimation_mode == "ram_empirical")
     lines = [
         "FPS Sweep Report",
         "----------------",
@@ -669,9 +823,14 @@ def format_fps_sweep_report(report: FpsSweepReport) -> str:
     else:
         lines.append(f"RAM source: {report.capacity_source}")
         if report.capacity_total_bytes:
-            lines.append(f"RAM available to model: {report.capacity_total_bytes / (1024**3):.2f} GiB")
+            label = "Installed RAM detected" if empirical_ram_points else "RAM available to model"
+            lines.append(f"{label}: {report.capacity_total_bytes / (1024**3):.2f} GiB")
         else:
             lines.append("RAM available to model: unavailable")
+        if empirical_ram_points:
+            lines.append(
+                f"RAM probes using empirical memory growth: {empirical_ram_points}/{len(report.points)}"
+            )
     lines.append(f"Capacity note: {report.capacity_note}")
 
     if report.tracking_benchmark:
@@ -695,6 +854,7 @@ def format_fps_sweep_report(report: FpsSweepReport) -> str:
     else:
         lines.append(
             "Columns: target_fps -> actual_fps | max recording @ safe/warn/high-risk RAM budgets | "
+            "measured RAM growth or heuristic fallback | "
             "est. tracking for configured recording"
         )
     for point in report.points:
@@ -717,14 +877,28 @@ def format_fps_sweep_report(report: FpsSweepReport) -> str:
                 f"{_human_seconds(point.estimated_tracking_seconds_for_configured_recording)}"
             )
         else:
+            ram_growth = (
+                f"{point.probe_memory_mib_per_second:.3f} MiB/s RAM"
+                if point.capacity_estimation_mode == "ram_empirical" and point.probe_memory_mib_per_second is not None
+                else "heuristic RAM model"
+            )
             lines.append(
                 "- "
                 f"{point.target_fps:.2f} -> {point.actual_fps:.3f} | "
                 f"{_human_seconds(point.max_recording_seconds_safe)} / "
                 f"{_human_seconds(point.max_recording_seconds_warn)} / "
                 f"{_human_seconds(point.max_recording_seconds_high_risk)} | "
+                f"{ram_growth} | "
                 f"{_human_seconds(point.estimated_tracking_seconds_for_configured_recording)}"
             )
+            if (
+                point.capacity_estimation_mode == "ram_empirical"
+                and point.probe_ram_budget_bytes is not None
+            ):
+                lines.append(
+                    "  RAM available at probe start: "
+                    f"{point.probe_ram_budget_bytes / (1024**3):.2f} GiB"
+                )
         if point.estimated_tracking_seconds_safe is not None:
             lines.append(
                 "  tracking for safe/warn/high-risk durations: "
