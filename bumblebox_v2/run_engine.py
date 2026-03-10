@@ -145,28 +145,59 @@ def _mock_capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float]
     return frames, timestamps, actual_fps
 
 
-def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float]:
-    try:
-        from picamera2 import Picamera2
-        from libcamera import controls
-    except Exception as exc:  # pragma: no cover - dependency/runtime
-        raise RuntimeError(
-            "picamera2/libcamera not available. Install on Raspberry Pi OS, or set runtime.use_mock_camera=true."
-        ) from exc
+def _capture_frames_from_started_picamera(
+    picam2: Any,
+    fps: float,
+    duration: float,
+) -> Tuple[List[Any], List[float], float]:
+    frames: List[Any] = []
+    timestamps: List[float] = []
 
-    fps = float(config["camera"]["fps_target"])
-    duration = float(config["capture"]["recording_seconds"])
-    width = int(config["camera"]["width"])
-    height = int(config["camera"]["height"])
-    shutter_us = int(config["camera"]["shutter_us"])
-    digital_zoom = config["camera"].get("digital_zoom")
-    noise_reduction = config["camera"].get("noise_reduction", "Auto")
+    start = time.perf_counter()
+    frame_index = 0
+    target_interval = 1.0 / fps
+    while (time.perf_counter() - start) < duration:
+        now = time.perf_counter()
+        expected = start + frame_index * target_interval
+        if now >= expected:
+            yuv420 = picam2.capture_array()
+            frames.append(yuv420)
+            timestamps.append(now - start)
+            frame_index += 1
 
-    def _construct_picamera2(resolved_tuning_file: str | None):
+    elapsed = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else duration
+    actual_fps = (len(timestamps) - 1) / elapsed if elapsed > 0 and len(timestamps) > 1 else float(len(frames)) / max(duration, 1e-6)
+    return frames, timestamps, actual_fps
+
+
+class _PicameraCaptureSession:
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config = config
+        try:
+            from picamera2 import Picamera2
+            from libcamera import controls
+        except Exception as exc:  # pragma: no cover - dependency/runtime
+            raise RuntimeError(
+                "picamera2/libcamera not available. Install on Raspberry Pi OS, or set runtime.use_mock_camera=true."
+            ) from exc
+
+        self._Picamera2 = Picamera2
+        self._controls = controls
+        self.width = int(config["camera"]["width"])
+        self.height = int(config["camera"]["height"])
+        self.shutter_us = int(config["camera"]["shutter_us"])
+        self.digital_zoom = config["camera"].get("digital_zoom")
+        self.noise_reduction = config["camera"].get("noise_reduction", "Auto")
+        self.warmup_s = float(config["runtime"].get("camera_warmup_seconds", 2.0))
+        self.resolved_tuning_file = resolve_camera_tuning_file(config)
+        self.picam2 = self._open_and_configure()
+        self.started = False
+
+    def _construct_picamera2(self) -> Any:
         last_error: Exception | None = None
         for attempt in range(1, CAMERA_REOPEN_RETRY_ATTEMPTS + 1):
             try:
-                camera_info = Picamera2.global_camera_info()
+                camera_info = self._Picamera2.global_camera_info()
                 if isinstance(camera_info, list) and len(camera_info) == 0:
                     raise RuntimeError(
                         "No camera detected by picamera2/libcamera. "
@@ -183,10 +214,10 @@ def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[fl
                 pass
 
             try:
-                if resolved_tuning_file:
-                    tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
-                    return Picamera2(tuning=tuning)
-                return Picamera2()
+                if self.resolved_tuning_file:
+                    tuning = self._Picamera2.load_tuning_file(str(self.resolved_tuning_file))
+                    return self._Picamera2(tuning=tuning)
+                return self._Picamera2()
             except IndexError as exc:
                 last_error = RuntimeError(
                     "No camera detected by picamera2/libcamera (IndexError during camera open). "
@@ -205,9 +236,9 @@ def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[fl
                     continue
                 raise
             except Exception as exc:
-                if resolved_tuning_file:
+                if self.resolved_tuning_file:
                     raise RuntimeError(
-                        f"Failed to open camera with tuning file '{resolved_tuning_file}': {exc}"
+                        f"Failed to open camera with tuning file '{self.resolved_tuning_file}': {exc}"
                     ) from exc
                 raise RuntimeError(f"Failed to open camera: {exc}") from exc
 
@@ -215,69 +246,93 @@ def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[fl
             raise last_error
         raise RuntimeError("Failed to open camera for an unknown reason.")
 
-    resolved_tuning_file = resolve_camera_tuning_file(config)
-    picam2 = _construct_picamera2(resolved_tuning_file)
-    started = False
-    try:
+    def _open_and_configure(self) -> Any:
+        picam2 = self._construct_picamera2()
         try:
-            preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
+            preview = picam2.create_preview_configuration({"format": "YUV420", "size": (self.width, self.height)})
             picam2.align_configuration(preview)
             picam2.configure(preview)
         except IndexError as exc:
+            try:
+                picam2.close()
+            except Exception:
+                pass
             raise RuntimeError(
                 "Camera opened but failed to configure capture stream (IndexError). "
                 "This usually means libcamera could not enumerate valid sensor modes."
             ) from exc
         except Exception as exc:
-            raise RuntimeError(f"Failed to configure capture stream: {exc}") from exc
-        picam2.set_controls({"ExposureTime": shutter_us})
-
-        if noise_reduction != "Auto":
             try:
-                mode = getattr(controls.draft.NoiseReductionModeEnum, str(noise_reduction))
+                picam2.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"Failed to configure capture stream: {exc}") from exc
+
+        picam2.set_controls({"ExposureTime": self.shutter_us})
+
+        if self.noise_reduction != "Auto":
+            try:
+                mode = getattr(self._controls.draft.NoiseReductionModeEnum, str(self.noise_reduction))
                 picam2.set_controls({"NoiseReductionMode": mode})
             except Exception:
                 pass
 
-        if isinstance(digital_zoom, (list, tuple)) and len(digital_zoom) == 4:
-            picam2.set_controls({"ScalerCrop": tuple(digital_zoom)})
+        if isinstance(self.digital_zoom, (list, tuple)) and len(self.digital_zoom) == 4:
+            picam2.set_controls({"ScalerCrop": tuple(self.digital_zoom)})
+        return picam2
 
-        warmup_s = float(config["runtime"].get("camera_warmup_seconds", 2.0))
-        picam2.start()
-        started = True
-        time.sleep(max(0.0, warmup_s))
+    def start(self) -> None:
+        if self.started:
+            return
+        self.picam2.start()
+        self.started = True
+        time.sleep(max(0.0, self.warmup_s))
 
-        frames: List[Any] = []
-        timestamps: List[float] = []
+    def capture_for(self, *, fps: float, duration: float) -> Tuple[List[Any], List[float], float]:
+        self.start()
+        return _capture_frames_from_started_picamera(self.picam2, float(fps), float(duration))
 
-        start = time.perf_counter()
-        frame_index = 0
-        target_interval = 1.0 / fps
-        while (time.perf_counter() - start) < duration:
-            now = time.perf_counter()
-            expected = start + frame_index * target_interval
-            if now >= expected:
-                yuv420 = picam2.capture_array()
-                frames.append(yuv420)
-                timestamps.append(now - start)
-                frame_index += 1
-
-        elapsed = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else duration
-        actual_fps = (len(timestamps) - 1) / elapsed if elapsed > 0 and len(timestamps) > 1 else float(len(frames)) / max(duration, 1e-6)
-        return frames, timestamps, actual_fps
-    finally:
-        if started:
+    def close(self) -> None:
+        if self.started:
             try:
-                picam2.stop()
+                self.picam2.stop()
             except Exception:
                 pass
+            self.started = False
         try:
-            picam2.close()
+            self.picam2.close()
         except Exception:
             pass
-        picam2 = None
+        self.picam2 = None
         gc.collect()
         time.sleep(CAMERA_RELEASE_SETTLE_SECONDS)
+
+    def __enter__(self) -> "_PicameraCaptureSession":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
+def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float]:
+    fps = float(config["camera"]["fps_target"])
+    duration = float(config["capture"]["recording_seconds"])
+    with _PicameraCaptureSession(config) as session:
+        return session.capture_for(fps=fps, duration=duration)
+
+
+def open_capture_probe_session(
+    config: Dict[str, Any],
+    *,
+    use_mock_camera: Optional[bool] = None,
+) -> Optional[_PicameraCaptureSession]:
+    probe_config = deepcopy(config)
+    probe_config.setdefault("runtime", {})
+    if use_mock_camera is not None:
+        probe_config["runtime"]["use_mock_camera"] = bool(use_mock_camera)
+    if bool(probe_config["runtime"].get("use_mock_camera", False)):
+        return None
+    return _PicameraCaptureSession(probe_config)
 
 
 def _capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float]:

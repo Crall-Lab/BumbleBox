@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 from copy import deepcopy
@@ -9,7 +10,7 @@ from pathlib import Path
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .run_engine import capture_probe
+from .run_engine import capture_probe, open_capture_probe_session
 
 CAMERA_SWEEP_COOLDOWN_SECONDS = 0.75
 from .status_history import list_recent_run_records, load_run_summary
@@ -337,103 +338,133 @@ def run_fps_sweep(
         session_start_iso=session_start_iso,
     )
 
+    def _build_point(
+        *,
+        target_fps: float,
+        frames_captured: int,
+        measured_fps: float,
+        capture_elapsed: float,
+    ) -> FpsSweepPoint:
+        effective_fps = measured_fps if measured_fps > 0 else target_fps
+        safe_seconds = _duration_budget_seconds(
+            ram_bytes=total_ram,
+            memory_ratio=SAFE_MEMORY_RATIO,
+            frame_bytes=frame_bytes,
+            effective_fps=effective_fps,
+            overhead_factor=overhead_factor,
+        )
+        warn_seconds = _duration_budget_seconds(
+            ram_bytes=total_ram,
+            memory_ratio=WARN_MEMORY_RATIO,
+            frame_bytes=frame_bytes,
+            effective_fps=effective_fps,
+            overhead_factor=overhead_factor,
+        )
+        high_risk_seconds = _duration_budget_seconds(
+            ram_bytes=total_ram,
+            memory_ratio=HIGH_RISK_MEMORY_RATIO,
+            frame_bytes=frame_bytes,
+            effective_fps=effective_fps,
+            overhead_factor=overhead_factor,
+        )
+        tracking_fps = benchmark.tracking_fps if benchmark else None
+        return FpsSweepPoint(
+            target_fps=float(target_fps),
+            actual_fps=float(measured_fps),
+            frames_captured=int(frames_captured),
+            probe_seconds=float(probe_seconds),
+            capture_elapsed_seconds=float(capture_elapsed),
+            max_recording_seconds_safe=safe_seconds,
+            max_recording_seconds_warn=warn_seconds,
+            max_recording_seconds_high_risk=high_risk_seconds,
+            estimated_tracking_seconds_safe=_estimate_tracking_seconds(
+                recording_seconds=safe_seconds,
+                recording_fps=effective_fps,
+                tracking_fps=tracking_fps,
+            ),
+            estimated_tracking_seconds_warn=_estimate_tracking_seconds(
+                recording_seconds=warn_seconds,
+                recording_fps=effective_fps,
+                tracking_fps=tracking_fps,
+            ),
+            estimated_tracking_seconds_high_risk=_estimate_tracking_seconds(
+                recording_seconds=high_risk_seconds,
+                recording_fps=effective_fps,
+                tracking_fps=tracking_fps,
+            ),
+            estimated_tracking_seconds_for_configured_recording=_estimate_tracking_seconds(
+                recording_seconds=configured_recording_seconds,
+                recording_fps=effective_fps,
+                tracking_fps=tracking_fps,
+            ),
+            status="PASS",
+            error=None,
+        )
+
     points: List[FpsSweepPoint] = []
     total = len(prepared_fps)
-    for index, target_fps in enumerate(prepared_fps, start=1):
-        if progress_callback:
-            progress_callback(index, total, target_fps)
+    use_persistent_session = not bool(use_mock_camera if use_mock_camera is not None else config.get("runtime", {}).get("use_mock_camera", False))
+    session = open_capture_probe_session(config, use_mock_camera=use_mock_camera) if use_persistent_session else None
+    try:
+        for index, target_fps in enumerate(prepared_fps, start=1):
+            if progress_callback:
+                progress_callback(index, total, target_fps)
 
-        probe_cfg = deepcopy(config)
-        probe_cfg.setdefault("camera", {})
-        probe_cfg.setdefault("capture", {})
-        probe_cfg.setdefault("runtime", {})
-        probe_cfg["camera"]["fps_target"] = float(target_fps)
-        probe_cfg["capture"]["recording_seconds"] = float(probe_seconds)
-        if use_mock_camera is not None:
-            probe_cfg["runtime"]["use_mock_camera"] = bool(use_mock_camera)
+            probe_cfg = deepcopy(config)
+            probe_cfg.setdefault("camera", {})
+            probe_cfg.setdefault("capture", {})
+            probe_cfg.setdefault("runtime", {})
+            probe_cfg["camera"]["fps_target"] = float(target_fps)
+            probe_cfg["capture"]["recording_seconds"] = float(probe_seconds)
+            if use_mock_camera is not None:
+                probe_cfg["runtime"]["use_mock_camera"] = bool(use_mock_camera)
 
-        try:
-            frames_captured, measured_fps, capture_elapsed = capture_probe(probe_cfg)
-            effective_fps = measured_fps if measured_fps > 0 else target_fps
-            safe_seconds = _duration_budget_seconds(
-                ram_bytes=total_ram,
-                memory_ratio=SAFE_MEMORY_RATIO,
-                frame_bytes=frame_bytes,
-                effective_fps=effective_fps,
-                overhead_factor=overhead_factor,
-            )
-            warn_seconds = _duration_budget_seconds(
-                ram_bytes=total_ram,
-                memory_ratio=WARN_MEMORY_RATIO,
-                frame_bytes=frame_bytes,
-                effective_fps=effective_fps,
-                overhead_factor=overhead_factor,
-            )
-            high_risk_seconds = _duration_budget_seconds(
-                ram_bytes=total_ram,
-                memory_ratio=HIGH_RISK_MEMORY_RATIO,
-                frame_bytes=frame_bytes,
-                effective_fps=effective_fps,
-                overhead_factor=overhead_factor,
-            )
-
-            tracking_fps = benchmark.tracking_fps if benchmark else None
-            points.append(
-                FpsSweepPoint(
-                    target_fps=float(target_fps),
-                    actual_fps=float(measured_fps),
-                    frames_captured=int(frames_captured),
-                    probe_seconds=float(probe_seconds),
-                    capture_elapsed_seconds=float(capture_elapsed),
-                    max_recording_seconds_safe=safe_seconds,
-                    max_recording_seconds_warn=warn_seconds,
-                    max_recording_seconds_high_risk=high_risk_seconds,
-                    estimated_tracking_seconds_safe=_estimate_tracking_seconds(
-                        recording_seconds=safe_seconds,
-                        recording_fps=effective_fps,
-                        tracking_fps=tracking_fps,
-                    ),
-                    estimated_tracking_seconds_warn=_estimate_tracking_seconds(
-                        recording_seconds=warn_seconds,
-                        recording_fps=effective_fps,
-                        tracking_fps=tracking_fps,
-                    ),
-                    estimated_tracking_seconds_high_risk=_estimate_tracking_seconds(
-                        recording_seconds=high_risk_seconds,
-                        recording_fps=effective_fps,
-                        tracking_fps=tracking_fps,
-                    ),
-                    estimated_tracking_seconds_for_configured_recording=_estimate_tracking_seconds(
-                        recording_seconds=configured_recording_seconds,
-                        recording_fps=effective_fps,
-                        tracking_fps=tracking_fps,
-                    ),
-                    status="PASS",
-                    error=None,
+            try:
+                if session is not None:
+                    start_time = time.perf_counter()
+                    frames, _timestamps, measured_fps = session.capture_for(
+                        fps=float(target_fps),
+                        duration=float(probe_seconds),
+                    )
+                    capture_elapsed = time.perf_counter() - start_time
+                    frames_captured = len(frames)
+                    del frames
+                    gc.collect()
+                else:
+                    frames_captured, measured_fps, capture_elapsed = capture_probe(probe_cfg)
+                points.append(
+                    _build_point(
+                        target_fps=float(target_fps),
+                        frames_captured=int(frames_captured),
+                        measured_fps=float(measured_fps),
+                        capture_elapsed=float(capture_elapsed),
+                    )
                 )
-            )
-        except Exception as exc:
-            points.append(
-                FpsSweepPoint(
-                    target_fps=float(target_fps),
-                    actual_fps=0.0,
-                    frames_captured=0,
-                    probe_seconds=float(probe_seconds),
-                    capture_elapsed_seconds=0.0,
-                    max_recording_seconds_safe=None,
-                    max_recording_seconds_warn=None,
-                    max_recording_seconds_high_risk=None,
-                    estimated_tracking_seconds_safe=None,
-                    estimated_tracking_seconds_warn=None,
-                    estimated_tracking_seconds_high_risk=None,
-                    estimated_tracking_seconds_for_configured_recording=None,
-                    status="FAIL",
-                    error=str(exc),
+            except Exception as exc:
+                points.append(
+                    FpsSweepPoint(
+                        target_fps=float(target_fps),
+                        actual_fps=0.0,
+                        frames_captured=0,
+                        probe_seconds=float(probe_seconds),
+                        capture_elapsed_seconds=0.0,
+                        max_recording_seconds_safe=None,
+                        max_recording_seconds_warn=None,
+                        max_recording_seconds_high_risk=None,
+                        estimated_tracking_seconds_safe=None,
+                        estimated_tracking_seconds_warn=None,
+                        estimated_tracking_seconds_high_risk=None,
+                        estimated_tracking_seconds_for_configured_recording=None,
+                        status="FAIL",
+                        error=str(exc),
+                    )
                 )
-            )
-        finally:
-            if not bool(probe_cfg.get("runtime", {}).get("use_mock_camera", False)) and index < total:
-                time.sleep(CAMERA_SWEEP_COOLDOWN_SECONDS)
+            finally:
+                if session is None and not bool(probe_cfg.get("runtime", {}).get("use_mock_camera", False)) and index < total:
+                    time.sleep(CAMERA_SWEEP_COOLDOWN_SECONDS)
+    finally:
+        if session is not None:
+            session.close()
 
     return FpsSweepReport(
         created_at=_iso_now(),
