@@ -74,7 +74,7 @@ from .run_bundle import (
     format_bundle_export_result,
     resolve_summary_from_session_dir,
 )
-from .run_engine import format_run_summary, run_once
+from .run_engine import format_run_summary, reset_camera_runtime, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
 from .storage_manager import (
     build_storage_setup_sudo_command,
@@ -303,6 +303,41 @@ def _cmd_camera_preview(args: argparse.Namespace) -> int:
 
     print(format_camera_preview_result(result))
     return 0
+
+
+def _format_camera_reset_result(result) -> str:
+    lines = [
+        "Camera Reset",
+        "------------",
+        f"Probe size: {result.probe_width}x{result.probe_height}",
+        f"Detected cameras before reset: {result.detected_cameras_before if result.detected_cameras_before is not None else 'unknown'}",
+        f"Detected cameras after reset: {result.detected_cameras_after if result.detected_cameras_after is not None else 'unknown'}",
+        f"Post-reset settle time: {result.settle_seconds:.2f}s",
+    ]
+    if result.note:
+        lines.append(f"Note: {result.note}")
+    return "\n".join(lines)
+
+
+def _cmd_camera_reset(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    try:
+        result = reset_camera_runtime(
+            config=config,
+            settle_seconds=float(args.settle_seconds),
+        )
+    except Exception as exc:
+        print(f"Camera reset failed: {exc}")
+        return 1
+
+    print(_format_camera_reset_result(result))
+    return 0 if result.detected_cameras_after != 0 else 1
 
 
 def _cmd_camera_test_tracking(args: argparse.Namespace) -> int:
@@ -1211,6 +1246,19 @@ def build_parser() -> argparse.ArgumentParser:
     camera_preview_parser.add_argument("--width", type=int, help="Optional preview width override in pixels.")
     camera_preview_parser.add_argument("--height", type=int, help="Optional preview height override in pixels.")
     camera_preview_parser.set_defaults(func=_cmd_camera_preview)
+
+    camera_reset_parser = subparsers.add_parser(
+        "camera-reset",
+        help="Run a conservative camera open/close reset probe in a fresh process.",
+    )
+    _add_common_config_arg(camera_reset_parser)
+    camera_reset_parser.add_argument(
+        "--settle-seconds",
+        type=float,
+        default=1.5,
+        help="Seconds to wait after releasing the camera before reporting status (default 1.5).",
+    )
+    camera_reset_parser.set_defaults(func=_cmd_camera_reset)
 
     camera_test_parser = subparsers.add_parser(
         "camera-test-tracking",

@@ -70,7 +70,7 @@ from .nest_labeling import (
 from .roadmap import build_roadmap
 from .runtime_alerts import build_runtime_alerts, format_runtime_alerts
 from .run_bundle import export_run_bundle, format_bundle_export_result
-from .run_engine import format_run_summary, record_live_test_clip, reset_camera_runtime, run_once
+from .run_engine import format_run_summary, record_live_test_clip, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
 from .storage_manager import (
     build_storage_setup_sudo_command,
@@ -5367,6 +5367,40 @@ class BumbleBoxV2GUI(tk.Tk):
             details.append(f"stderr:\n{stderr}")
         raise RuntimeError("\n\n".join(details))
 
+    def _run_camera_reset_subprocess(self, *, config_path: Path) -> str:
+        repo_root = Path(__file__).resolve().parents[1]
+        bbx_path = repo_root / "bbx.py"
+        command = [
+            sys.executable,
+            str(bbx_path),
+            "camera-reset",
+            "--config",
+            str(config_path),
+        ]
+
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=build_qt_safe_env(),
+        )
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        if proc.returncode == 0:
+            return stdout or "Camera reset completed."
+
+        details = [
+            "Camera reset failed.",
+            f"Exit code: {proc.returncode}",
+            f"Command: {' '.join(shlex.quote(part) for part in command)}",
+        ]
+        if stdout:
+            details.append(f"stdout:\n{stdout}")
+        if stderr:
+            details.append(f"stderr:\n{stderr}")
+        raise RuntimeError("\n\n".join(details))
+
     def _refresh_roadmap(self, *, select_tab: bool = True) -> None:
         try:
             config, config_path = self._load_config_or_defaults()
@@ -5449,7 +5483,7 @@ class BumbleBoxV2GUI(tk.Tk):
             return
 
         try:
-            config, _ = self._load_config_or_defaults()
+            _config, config_path = self._load_config_or_defaults()
         except Exception as exc:
             self._show_error("Camera reset failed", str(exc))
             return
@@ -5462,15 +5496,15 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._fps_camera_reset_thread = threading.Thread(
             target=self._run_fps_camera_reset_worker,
-            args=(config,),
+            args=(config_path,),
             daemon=True,
         )
         self._fps_camera_reset_thread.start()
         self.after(200, self._poll_fps_camera_reset)
 
-    def _run_fps_camera_reset_worker(self, config: dict) -> None:
+    def _run_fps_camera_reset_worker(self, config_path: Path) -> None:
         try:
-            self._fps_camera_reset_result = reset_camera_runtime(config)
+            self._fps_camera_reset_result = self._run_camera_reset_subprocess(config_path=config_path)
         except Exception as exc:
             self._fps_camera_reset_error = str(exc)
 
@@ -5486,24 +5520,14 @@ class BumbleBoxV2GUI(tk.Tk):
             self._show_error("Camera reset failed", self._fps_camera_reset_error)
             return
 
-        result = self._fps_camera_reset_result
-        if result is None:
+        result_text = self._fps_camera_reset_result
+        if result_text is None:
             self.fps_camera_reset_status_var.set("No result")
             self.fps_output.insert(tk.END, "Camera reset ended without a result.\n")
             return
 
         self.fps_camera_reset_status_var.set("Completed")
-        lines = [
-            "",
-            "Camera reset complete.",
-            f"Probe open/close size: {result.probe_width}x{result.probe_height}",
-            f"Detected cameras before reset: {result.detected_cameras_before if result.detected_cameras_before is not None else 'unknown'}",
-            f"Detected cameras after reset: {result.detected_cameras_after if result.detected_cameras_after is not None else 'unknown'}",
-            f"Post-reset settle time: {result.settle_seconds:.2f}s",
-        ]
-        if result.note:
-            lines.append(f"Note: {result.note}")
-        self.fps_output.insert(tk.END, "\n".join(lines) + "\n")
+        self.fps_output.insert(tk.END, "\n" + result_text.strip() + "\n")
 
     def _run_live_fps_report_worker(self, config: dict, live_seconds: float) -> None:
         try:
