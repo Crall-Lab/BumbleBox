@@ -386,6 +386,9 @@ def reset_camera_runtime(
     reset_config["camera"]["height"] = int(probe_height)
     reset_config["camera"]["digital_zoom"] = None
     reset_config["camera"]["noise_reduction"] = "Auto"
+    reset_config["camera"]["tuning_file"] = None
+    reset_config["camera"]["model"] = "auto"
+    reset_config["camera"]["infrared"] = None
     reset_config["camera"].setdefault("shutter_us", 2500)
     reset_config["runtime"]["camera_warmup_seconds"] = min(
         max(float(reset_config["runtime"].get("camera_warmup_seconds", 0.25)), 0.0),
@@ -414,7 +417,10 @@ def reset_camera_runtime(
     time.sleep(wait_seconds)
     detected_after = _detected_picamera2_camera_count()
 
-    note = "Camera reset probe completed with a conservative 640x480 open/close cycle."
+    note = (
+        "Camera reset probe completed with a conservative 640x480 open/close cycle "
+        "using default libcamera sensor tuning."
+    )
     if detected_after == 0:
         note += " picamera2 still reports no cameras after reset."
     elif detected_before == 0 and detected_after and detected_after > 0:
