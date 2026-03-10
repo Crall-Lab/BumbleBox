@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import shutil
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -10,15 +11,22 @@ from pathlib import Path
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .run_engine import capture_probe, open_capture_probe_session
+from .run_engine import (
+    capture_probe,
+    mjpeg_record_probe,
+    open_capture_probe_session,
+)
+from .status_history import list_recent_run_records, load_run_summary
 
 CAMERA_SWEEP_COOLDOWN_SECONDS = 0.75
-from .status_history import list_recent_run_records, load_run_summary
 
 
 SAFE_MEMORY_RATIO = 0.45
 WARN_MEMORY_RATIO = 0.60
 HIGH_RISK_MEMORY_RATIO = 0.80
+SAFE_DISK_RATIO = 0.70
+WARN_DISK_RATIO = 0.90
+HIGH_RISK_DISK_RATIO = 0.97
 
 
 @dataclass
@@ -39,6 +47,8 @@ class FpsSweepPoint:
     frames_captured: int
     probe_seconds: float
     capture_elapsed_seconds: float
+    probe_output_bytes: Optional[int]
+    probe_output_mib_per_second: Optional[float]
     max_recording_seconds_safe: Optional[float]
     max_recording_seconds_warn: Optional[float]
     max_recording_seconds_high_risk: Optional[float]
@@ -53,12 +63,18 @@ class FpsSweepPoint:
 @dataclass
 class FpsSweepReport:
     created_at: str
+    recording_codec: str
+    tracking_source: str
+    capacity_mode: str
+    capacity_note: str
     camera_width: int
     camera_height: int
     frame_bytes: int
     probe_seconds: float
     configured_recording_seconds: float
     overhead_factor: float
+    capacity_total_bytes: Optional[int]
+    capacity_source: str
     total_ram_bytes: Optional[int]
     ram_source: str
     fps_values: List[float]
@@ -138,6 +154,41 @@ def _resolve_total_ram_bytes(
         return int(override_gb * (1024**3)), "assumed_config"
 
     return _total_ram_bytes(), "detected_host"
+
+
+def _resolve_storage_free_bytes(data_root: str | Path) -> tuple[Optional[int], str]:
+    path = Path(data_root).expanduser()
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    target = path if path.exists() else path.parent
+    try:
+        usage = shutil.disk_usage(target)
+        return int(usage.free), str(target)
+    except Exception:
+        return None, str(target)
+
+
+def _capacity_mode_for_config(config: Dict[str, Any]) -> tuple[str, str]:
+    codec = str(config.get("camera", {}).get("codec", "mp4")).strip().lower()
+    tracking_source = str(config.get("pipeline", {}).get("tracking_source", "ram")).strip().lower()
+    mode = str(config.get("pipeline", {}).get("mode", "record_and_track")).strip().lower()
+
+    if mode == "record_and_track" and tracking_source == "ram":
+        return (
+            "ram",
+            "RAM-backed capacity model: tracking_source=ram keeps frames in memory during recording, so RAM is the limiting factor even if codec is MJPEG.",
+        )
+    if codec == "mjpeg":
+        return (
+            "disk",
+            "Disk-backed capacity model: MJPEG sweep writes probe video during capture and estimates recording duration from measured file growth plus free space under system.data_root.",
+        )
+    return (
+        "ram",
+        "RAM-backed capacity model: MP4 recording captures frames to RAM first and encodes afterward.",
+    )
 
 
 def parse_fps_values(csv_text: str) -> List[float]:
@@ -290,6 +341,21 @@ def _duration_budget_seconds(
     return (ram_bytes * memory_ratio) / bytes_per_second
 
 
+def _duration_budget_from_bytes_per_second(
+    *,
+    total_bytes: Optional[int],
+    usage_ratio: float,
+    bytes_per_second: Optional[float],
+) -> Optional[float]:
+    if not total_bytes or total_bytes <= 0:
+        return None
+    if bytes_per_second is None or bytes_per_second <= 0:
+        return None
+    if usage_ratio <= 0:
+        return None
+    return (float(total_bytes) * float(usage_ratio)) / float(bytes_per_second)
+
+
 def _estimate_tracking_seconds(
     *,
     recording_seconds: Optional[float],
@@ -330,9 +396,25 @@ def run_fps_sweep(
     width = int(config["camera"]["width"])
     height = int(config["camera"]["height"])
     frame_bytes = int(width * height * 1.5)
+    recording_codec = str(config.get("camera", {}).get("codec", "mp4")).strip().lower()
+    tracking_source = str(config.get("pipeline", {}).get("tracking_source", "ram")).strip().lower()
+    capacity_mode, capacity_note = _capacity_mode_for_config(config)
     configured_recording_seconds = float(config.get("capture", {}).get("recording_seconds", probe_seconds))
     overhead_factor = _overhead_factor(config)
-    total_ram, ram_source = _resolve_total_ram_bytes(config, assume_ram_gb=assume_ram_gb)
+    total_ram: Optional[int] = None
+    ram_source = "not used"
+    capacity_total_bytes: Optional[int] = None
+    capacity_source = "unavailable"
+    if capacity_mode == "ram":
+        total_ram, ram_source = _resolve_total_ram_bytes(config, assume_ram_gb=assume_ram_gb)
+        capacity_total_bytes = total_ram
+        capacity_source = ram_source
+    else:
+        storage_free_bytes, storage_source = _resolve_storage_free_bytes(config.get("system", {}).get("data_root", ""))
+        capacity_total_bytes = storage_free_bytes
+        capacity_source = storage_source
+        if assume_ram_gb is not None:
+            capacity_note += " Assume RAM GiB is ignored in disk-backed MJPEG mode."
     benchmark = find_recent_tracking_benchmark(
         data_root=config.get("system", {}).get("data_root", ""),
         session_start_iso=session_start_iso,
@@ -344,29 +426,52 @@ def run_fps_sweep(
         frames_captured: int,
         measured_fps: float,
         capture_elapsed: float,
+        probe_output_bytes: Optional[int] = None,
     ) -> FpsSweepPoint:
         effective_fps = measured_fps if measured_fps > 0 else target_fps
-        safe_seconds = _duration_budget_seconds(
-            ram_bytes=total_ram,
-            memory_ratio=SAFE_MEMORY_RATIO,
-            frame_bytes=frame_bytes,
-            effective_fps=effective_fps,
-            overhead_factor=overhead_factor,
-        )
-        warn_seconds = _duration_budget_seconds(
-            ram_bytes=total_ram,
-            memory_ratio=WARN_MEMORY_RATIO,
-            frame_bytes=frame_bytes,
-            effective_fps=effective_fps,
-            overhead_factor=overhead_factor,
-        )
-        high_risk_seconds = _duration_budget_seconds(
-            ram_bytes=total_ram,
-            memory_ratio=HIGH_RISK_MEMORY_RATIO,
-            frame_bytes=frame_bytes,
-            effective_fps=effective_fps,
-            overhead_factor=overhead_factor,
-        )
+        probe_output_mib_per_second: Optional[float] = None
+        if capacity_mode == "ram":
+            safe_seconds = _duration_budget_seconds(
+                ram_bytes=total_ram,
+                memory_ratio=SAFE_MEMORY_RATIO,
+                frame_bytes=frame_bytes,
+                effective_fps=effective_fps,
+                overhead_factor=overhead_factor,
+            )
+            warn_seconds = _duration_budget_seconds(
+                ram_bytes=total_ram,
+                memory_ratio=WARN_MEMORY_RATIO,
+                frame_bytes=frame_bytes,
+                effective_fps=effective_fps,
+                overhead_factor=overhead_factor,
+            )
+            high_risk_seconds = _duration_budget_seconds(
+                ram_bytes=total_ram,
+                memory_ratio=HIGH_RISK_MEMORY_RATIO,
+                frame_bytes=frame_bytes,
+                effective_fps=effective_fps,
+                overhead_factor=overhead_factor,
+            )
+        else:
+            bytes_per_second = None
+            if probe_output_bytes is not None and capture_elapsed > 0:
+                bytes_per_second = float(probe_output_bytes) / float(capture_elapsed)
+                probe_output_mib_per_second = round(bytes_per_second / (1024**2), 4)
+            safe_seconds = _duration_budget_from_bytes_per_second(
+                total_bytes=capacity_total_bytes,
+                usage_ratio=SAFE_DISK_RATIO,
+                bytes_per_second=bytes_per_second,
+            )
+            warn_seconds = _duration_budget_from_bytes_per_second(
+                total_bytes=capacity_total_bytes,
+                usage_ratio=WARN_DISK_RATIO,
+                bytes_per_second=bytes_per_second,
+            )
+            high_risk_seconds = _duration_budget_from_bytes_per_second(
+                total_bytes=capacity_total_bytes,
+                usage_ratio=HIGH_RISK_DISK_RATIO,
+                bytes_per_second=bytes_per_second,
+            )
         tracking_fps = benchmark.tracking_fps if benchmark else None
         return FpsSweepPoint(
             target_fps=float(target_fps),
@@ -374,6 +479,8 @@ def run_fps_sweep(
             frames_captured=int(frames_captured),
             probe_seconds=float(probe_seconds),
             capture_elapsed_seconds=float(capture_elapsed),
+            probe_output_bytes=(int(probe_output_bytes) if probe_output_bytes is not None else None),
+            probe_output_mib_per_second=probe_output_mib_per_second,
             max_recording_seconds_safe=safe_seconds,
             max_recording_seconds_warn=warn_seconds,
             max_recording_seconds_high_risk=high_risk_seconds,
@@ -405,6 +512,12 @@ def run_fps_sweep(
     total = len(prepared_fps)
     use_persistent_session = not bool(use_mock_camera if use_mock_camera is not None else config.get("runtime", {}).get("use_mock_camera", False))
     session = open_capture_probe_session(config, use_mock_camera=use_mock_camera) if use_persistent_session else None
+    if session is not None:
+        session.start()
+    probe_base = Path(capacity_source).expanduser() if capacity_mode == "disk" else Path(
+        config.get("system", {}).get("data_root", "")
+    ).expanduser()
+    probe_root = probe_base / ".bbx_fps_sweep_probe"
     try:
         for index, target_fps in enumerate(prepared_fps, start=1):
             if progress_callback:
@@ -420,24 +533,44 @@ def run_fps_sweep(
                 probe_cfg["runtime"]["use_mock_camera"] = bool(use_mock_camera)
 
             try:
-                if session is not None:
-                    start_time = time.perf_counter()
-                    frames, _timestamps, measured_fps = session.capture_for(
-                        fps=float(target_fps),
-                        duration=float(probe_seconds),
-                    )
-                    capture_elapsed = time.perf_counter() - start_time
-                    frames_captured = len(frames)
-                    del frames
-                    gc.collect()
+                if capacity_mode == "disk":
+                    probe_root.mkdir(parents=True, exist_ok=True)
+                    probe_path = probe_root / f"probe_{index:03d}_{target_fps:.3f}.avi"
+                    try:
+                        frames_captured, measured_fps, capture_elapsed, probe_output_bytes = mjpeg_record_probe(
+                            probe_cfg,
+                            output_path=probe_path,
+                            fps_target=float(target_fps),
+                            recording_seconds=float(probe_seconds),
+                            use_mock_camera=use_mock_camera,
+                            session=session,
+                        )
+                    finally:
+                        try:
+                            probe_path.unlink()
+                        except Exception:
+                            pass
                 else:
-                    frames_captured, measured_fps, capture_elapsed = capture_probe(probe_cfg)
+                    probe_output_bytes = None
+                    if session is not None:
+                        start_time = time.perf_counter()
+                        frames, _timestamps, measured_fps = session.capture_for(
+                            fps=float(target_fps),
+                            duration=float(probe_seconds),
+                        )
+                        capture_elapsed = time.perf_counter() - start_time
+                        frames_captured = len(frames)
+                        del frames
+                        gc.collect()
+                    else:
+                        frames_captured, measured_fps, capture_elapsed = capture_probe(probe_cfg)
                 points.append(
                     _build_point(
                         target_fps=float(target_fps),
                         frames_captured=int(frames_captured),
                         measured_fps=float(measured_fps),
                         capture_elapsed=float(capture_elapsed),
+                        probe_output_bytes=probe_output_bytes,
                     )
                 )
             except Exception as exc:
@@ -448,6 +581,8 @@ def run_fps_sweep(
                         frames_captured=0,
                         probe_seconds=float(probe_seconds),
                         capture_elapsed_seconds=0.0,
+                        probe_output_bytes=None,
+                        probe_output_mib_per_second=None,
                         max_recording_seconds_safe=None,
                         max_recording_seconds_warn=None,
                         max_recording_seconds_high_risk=None,
@@ -465,15 +600,26 @@ def run_fps_sweep(
     finally:
         if session is not None:
             session.close()
+        try:
+            if probe_root.exists():
+                probe_root.rmdir()
+        except Exception:
+            pass
 
     return FpsSweepReport(
         created_at=_iso_now(),
+        recording_codec=recording_codec,
+        tracking_source=tracking_source,
+        capacity_mode=capacity_mode,
+        capacity_note=capacity_note,
         camera_width=width,
         camera_height=height,
         frame_bytes=frame_bytes,
         probe_seconds=float(probe_seconds),
         configured_recording_seconds=float(configured_recording_seconds),
         overhead_factor=float(overhead_factor),
+        capacity_total_bytes=int(capacity_total_bytes) if capacity_total_bytes else None,
+        capacity_source=capacity_source,
         total_ram_bytes=int(total_ram) if total_ram else None,
         ram_source=ram_source,
         fps_values=[float(v) for v in prepared_fps],
@@ -496,20 +642,37 @@ def _human_seconds(seconds: Optional[float]) -> str:
     return f"{hours:.2f}h"
 
 
+def _capacity_mode_label(mode: str) -> str:
+    if str(mode).strip().lower() == "disk":
+        return "disk-backed MJPEG streaming"
+    return "RAM-backed capture"
+
+
 def format_fps_sweep_report(report: FpsSweepReport) -> str:
     lines = [
         "FPS Sweep Report",
         "----------------",
         f"Created at: {report.created_at}",
+        f"Recording codec: {report.recording_codec}",
+        f"Tracking source: {report.tracking_source}",
+        f"Capacity model: {_capacity_mode_label(report.capacity_mode)}",
         f"Resolution: {report.camera_width}x{report.camera_height}",
         f"Probe duration per FPS: {_human_seconds(report.probe_seconds)}",
         f"Configured recording duration: {_human_seconds(report.configured_recording_seconds)}",
-        f"RAM source: {report.ram_source}",
     ]
-    if report.total_ram_bytes:
-        lines.append(f"RAM total: {report.total_ram_bytes / (1024**3):.2f} GiB")
+    if report.capacity_mode == "disk":
+        lines.append(f"Storage path checked: {report.capacity_source}")
+        if report.capacity_total_bytes:
+            lines.append(f"Free storage at start: {report.capacity_total_bytes / (1024**3):.2f} GiB")
+        else:
+            lines.append("Free storage at start: unavailable")
     else:
-        lines.append("RAM total: unavailable")
+        lines.append(f"RAM source: {report.capacity_source}")
+        if report.capacity_total_bytes:
+            lines.append(f"RAM available to model: {report.capacity_total_bytes / (1024**3):.2f} GiB")
+        else:
+            lines.append("RAM available to model: unavailable")
+    lines.append(f"Capacity note: {report.capacity_note}")
 
     if report.tracking_benchmark:
         lines.append(
@@ -524,22 +687,44 @@ def format_fps_sweep_report(report: FpsSweepReport) -> str:
         lines.append("Tracking benchmark: unavailable (run at least one tracking session first).")
 
     lines.append("")
-    lines.append(
-        "Columns: target_fps -> actual_fps | max recording @ safe/warn/high-risk RAM | "
-        "est. tracking for configured recording"
-    )
+    if report.capacity_mode == "disk":
+        lines.append(
+            "Columns: target_fps -> actual_fps | max recording @ safe/warn/high-risk free-space budgets | "
+            "measured MJPEG write rate | est. tracking for configured recording"
+        )
+    else:
+        lines.append(
+            "Columns: target_fps -> actual_fps | max recording @ safe/warn/high-risk RAM budgets | "
+            "est. tracking for configured recording"
+        )
     for point in report.points:
         if point.status == "FAIL":
             lines.append(f"- {point.target_fps:.2f} -> FAIL ({point.error})")
             continue
-        lines.append(
-            "- "
-            f"{point.target_fps:.2f} -> {point.actual_fps:.3f} | "
-            f"{_human_seconds(point.max_recording_seconds_safe)} / "
-            f"{_human_seconds(point.max_recording_seconds_warn)} / "
-            f"{_human_seconds(point.max_recording_seconds_high_risk)} | "
-            f"{_human_seconds(point.estimated_tracking_seconds_for_configured_recording)}"
-        )
+        if report.capacity_mode == "disk":
+            write_rate = (
+                f"{point.probe_output_mib_per_second:.3f} MiB/s"
+                if point.probe_output_mib_per_second is not None
+                else "n/a MiB/s"
+            )
+            lines.append(
+                "- "
+                f"{point.target_fps:.2f} -> {point.actual_fps:.3f} | "
+                f"{_human_seconds(point.max_recording_seconds_safe)} / "
+                f"{_human_seconds(point.max_recording_seconds_warn)} / "
+                f"{_human_seconds(point.max_recording_seconds_high_risk)} | "
+                f"{write_rate} | "
+                f"{_human_seconds(point.estimated_tracking_seconds_for_configured_recording)}"
+            )
+        else:
+            lines.append(
+                "- "
+                f"{point.target_fps:.2f} -> {point.actual_fps:.3f} | "
+                f"{_human_seconds(point.max_recording_seconds_safe)} / "
+                f"{_human_seconds(point.max_recording_seconds_warn)} / "
+                f"{_human_seconds(point.max_recording_seconds_high_risk)} | "
+                f"{_human_seconds(point.estimated_tracking_seconds_for_configured_recording)}"
+            )
         if point.estimated_tracking_seconds_safe is not None:
             lines.append(
                 "  tracking for safe/warn/high-risk durations: "

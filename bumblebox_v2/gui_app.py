@@ -2943,8 +2943,9 @@ class BumbleBoxV2GUI(tk.Tk):
             sweep_frame,
             text=(
                 "Runs increasing FPS probes, compares target vs real FPS, and estimates max recording duration "
-                "at safe/warn/high-risk RAM budgets. If tracking ran this app session, it also estimates "
-                "tracking time for each recording duration."
+                "using the current workflow. MP4 and RAM-tracking workflows use a RAM-backed model. "
+                "MJPEG video-backed workflows use measured file growth and free storage under the current data root. "
+                "If tracking ran this app session, it also estimates tracking time for each recording duration."
             ),
             wraplength=420,
             justify=tk.LEFT,
@@ -3011,9 +3012,12 @@ class BumbleBoxV2GUI(tk.Tk):
             advanced,
             row=1,
             column=0,
-            text="Assume RAM GiB (optional)",
+            text="Assume RAM GiB (RAM-backed only)",
             help_title="Assumed RAM",
-            help_details="Simulate capacity on a target machine (for example Pi) when running sweep elsewhere.",
+            help_details=(
+                "Simulate capacity on a target machine when the sweep uses a RAM-backed model. "
+                "Ignored for disk-backed MJPEG sweep runs."
+            ),
         )
         ttk.Entry(advanced, textvariable=self.fps_sweep_assume_ram_var, width=8).grid(
             row=1, column=1, sticky="w", padx=8, pady=3

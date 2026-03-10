@@ -3,10 +3,16 @@
 `fps-sweep` probes increasing target framerates and reports:
 
 - target FPS vs measured real FPS
-- estimated maximum recording duration at safe/warn/high-risk RAM budgets
+- estimated maximum recording duration at safe/warn/high-risk capacity budgets
 - estimated tracking time (when recent tracking benchmark data exists)
 
 This is intended to answer: "How long can I record at higher FPS on this hardware?"
+
+The capacity model depends on the current BumbleBox workflow:
+
+- `MP4` recording uses a RAM-backed model because frames are captured into memory first and encoded afterward.
+- `record_and_track` with `tracking_source=ram` also uses a RAM-backed model, even if the recording codec is `MJPEG`, because frames still need to stay in memory for tracking.
+- `MJPEG` recording without RAM-backed tracking uses a disk-backed model. The sweep writes short MJPEG probe clips under `system.data_root`, measures file growth rate, and estimates how long recording can continue before free space is exhausted.
 
 ## CLI
 
@@ -53,7 +59,7 @@ Open `FPS Report` tab:
 1. Use `FPS Sweep Capacity Test`.
 2. Set either `FPS list` or `Start/Stop/Step`.
 3. Set `Probe seconds`.
-4. Optionally set `Assume RAM GiB` (for simulated Pi target).
+4. Optionally set `Assume RAM GiB` if you want to simulate a Pi target for a RAM-backed workflow.
 5. Click `Run FPS Sweep`.
 
 The GUI defaults to using tracking benchmark data from the current app session only.

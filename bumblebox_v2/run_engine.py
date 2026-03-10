@@ -369,6 +369,130 @@ def capture_probe(
     return frame_count, float(actual_fps), float(elapsed)
 
 
+def _stream_mjpeg_from_started_picamera(
+    picam2: Any,
+    *,
+    fps: float,
+    duration: float,
+    width: int,
+    height: int,
+    output_path: Path,
+) -> Tuple[int, float, int]:
+    try:
+        import cv2
+    except ImportError as exc:  # pragma: no cover - dependency/runtime
+        raise RuntimeError("OpenCV is required for MJPEG sweep probes.") from exc
+
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        float(fps),
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open MJPEG probe writer for {output_path}")
+
+    timestamps: List[float] = []
+    frame_count = 0
+    try:
+        start = time.perf_counter()
+        target_interval = 1.0 / float(fps)
+        while (time.perf_counter() - start) < float(duration):
+            now = time.perf_counter()
+            expected = start + frame_count * target_interval
+            if now >= expected:
+                yuv420 = picam2.capture_array()
+                writer.write(_frame_to_bgr(yuv420))
+                timestamps.append(now - start)
+                frame_count += 1
+    finally:
+        writer.release()
+
+    elapsed = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else float(duration)
+    actual_fps = (len(timestamps) - 1) / elapsed if elapsed > 0 and len(timestamps) > 1 else float(frame_count) / max(float(duration), 1e-6)
+    size_bytes = int(output_path.stat().st_size) if output_path.exists() else 0
+    return int(frame_count), float(actual_fps), size_bytes
+
+
+def mjpeg_record_probe(
+    config: Dict[str, Any],
+    *,
+    output_path: str | Path,
+    fps_target: Optional[float] = None,
+    recording_seconds: Optional[float] = None,
+    use_mock_camera: Optional[bool] = None,
+    session: Optional[_PicameraCaptureSession] = None,
+) -> Tuple[int, float, float, int]:
+    probe_config = deepcopy(config)
+    probe_config.setdefault("camera", {})
+    probe_config.setdefault("capture", {})
+    probe_config.setdefault("runtime", {})
+
+    if fps_target is not None:
+        probe_config["camera"]["fps_target"] = float(fps_target)
+    if recording_seconds is not None:
+        probe_config["capture"]["recording_seconds"] = float(recording_seconds)
+    if use_mock_camera is not None:
+        probe_config["runtime"]["use_mock_camera"] = bool(use_mock_camera)
+
+    fps = float(probe_config["camera"]["fps_target"])
+    duration = float(probe_config["capture"]["recording_seconds"])
+    width = int(probe_config["camera"]["width"])
+    height = int(probe_config["camera"]["height"])
+    output_path = Path(output_path)
+
+    if bool(probe_config["runtime"].get("use_mock_camera", False)):
+        start = time.perf_counter()
+        frames, _timestamps, actual_fps = _mock_capture_frames(probe_config)
+        capture_elapsed = time.perf_counter() - start
+        try:
+            import cv2
+        except ImportError as exc:  # pragma: no cover - dependency/runtime
+            raise RuntimeError("OpenCV is required for MJPEG sweep probes.") from exc
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*"MJPG"),
+            fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to open MJPEG probe writer for {output_path}")
+        try:
+            for frame in frames:
+                writer.write(_frame_to_bgr(frame))
+        finally:
+            writer.release()
+        frame_count = len(frames)
+        del frames
+        gc.collect()
+        size_bytes = int(output_path.stat().st_size) if output_path.exists() else 0
+        return int(frame_count), float(actual_fps), float(capture_elapsed), int(size_bytes)
+
+    start = time.perf_counter()
+    if session is not None:
+        frame_count, actual_fps, size_bytes = _stream_mjpeg_from_started_picamera(
+            session.picam2,
+            fps=fps,
+            duration=duration,
+            width=width,
+            height=height,
+            output_path=output_path,
+        )
+    else:
+        with _PicameraCaptureSession(probe_config) as temp_session:
+            temp_session.start()
+            frame_count, actual_fps, size_bytes = _stream_mjpeg_from_started_picamera(
+                temp_session.picam2,
+                fps=fps,
+                duration=duration,
+                width=width,
+                height=height,
+                output_path=output_path,
+            )
+    capture_elapsed = time.perf_counter() - start
+    return int(frame_count), float(actual_fps), float(capture_elapsed), int(size_bytes)
+
+
 def record_live_test_clip(
     config: Dict[str, Any],
     *,

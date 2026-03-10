@@ -1253,7 +1253,8 @@ def build_parser() -> argparse.ArgumentParser:
     fps_sweep_parser = subparsers.add_parser(
         "fps-sweep",
         help=(
-            "Probe target FPS values and estimate max recording durations at safe/warn/high-risk RAM levels. "
+            "Probe target FPS values and estimate max recording durations using the current workflow "
+            "(RAM-backed for MP4 or RAM tracking, disk-backed for MJPEG video-backed capture). "
             "If recent tracking exists, include estimated tracking time."
         ),
     )
@@ -1274,7 +1275,10 @@ def build_parser() -> argparse.ArgumentParser:
     fps_sweep_parser.add_argument(
         "--assume-ram-gb",
         type=float,
-        help="Optional RAM size (GiB) to simulate target hardware during duration estimation.",
+        help=(
+            "Optional RAM size (GiB) to simulate target hardware during RAM-backed duration estimation. "
+            "Ignored for disk-backed MJPEG sweeps."
+        ),
     )
     fps_sweep_parser.add_argument(
         "--session-start",
