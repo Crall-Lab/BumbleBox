@@ -1409,6 +1409,7 @@ class BumbleBoxV2GUI(tk.Tk):
     def _set_ui_mode(self) -> None:
         mode = self.ui_mode_var.get().strip().lower()
         self._toggle_advanced_widgets(show_advanced=(mode == "advanced"))
+        self._refresh_config_field_visibility()
 
     def _go_to_tab(self, tab_key: str) -> None:
         tab = self._tab_lookup.get(tab_key)
@@ -2334,6 +2335,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Camera Configuration",
                 [
                     ("Codec", "camera.codec", str, ["mp4", "mjpeg"], None),
+                    ("MP4 encoder", "camera.mp4_codec", str, self._mp4_codec_display_options(), None),
                     ("Width (px)", "camera.width", int, None, None),
                     ("Height (px)", "camera.height", int, None, None),
                     ("FPS target", "camera.fps_target", float, None, None),
@@ -2368,6 +2370,39 @@ class BumbleBoxV2GUI(tk.Tk):
             ),
         ]
 
+    @staticmethod
+    def _mp4_codec_display_options() -> list[str]:
+        return [
+            "H.264 (Recommended)",
+            "MPEG-4 (Faster/Larger)",
+            "H.265 (Smaller/Slower)",
+        ]
+
+    @staticmethod
+    def _mp4_codec_display_to_value() -> dict[str, str]:
+        return {
+            "H.264 (Recommended)": "libx264",
+            "MPEG-4 (Faster/Larger)": "mpeg4",
+            "H.265 (Smaller/Slower)": "libx265",
+        }
+
+    @classmethod
+    def _mp4_codec_value_to_display(cls) -> dict[str, str]:
+        display_to_value = cls._mp4_codec_display_to_value()
+        mapping = {value: display for display, value in display_to_value.items()}
+        mapping.update(
+            {
+                "mp4v": "MPEG-4 (Faster/Larger)",
+                "h264": "H.264 (Recommended)",
+                "x264": "H.264 (Recommended)",
+                "avc": "H.264 (Recommended)",
+                "h265": "H.265 (Smaller/Slower)",
+                "hevc": "H.265 (Smaller/Slower)",
+                "x265": "H.265 (Smaller/Slower)",
+            }
+        )
+        return mapping
+
     def _config_widget_width(self, key: str, value_type: type, choices: list[str] | None) -> int:
         if choices:
             longest = max((len(str(choice)) for choice in choices), default=12)
@@ -2395,6 +2430,11 @@ class BumbleBoxV2GUI(tk.Tk):
             "runtime.ui_theme_mode": "Default GUI theme mode when app starts.",
             "runtime.use_mock_camera": "Use synthetic camera frames for testing without camera hardware.",
             "camera.codec": "Recording codec. MP4 is compact and convenient; MJPEG is larger but simple per-frame encoding.",
+            "camera.mp4_codec": (
+                "MP4 encoder used after RAM capture. "
+                "H.264 is the recommended default; MPEG-4 is faster but makes larger files; "
+                "H.265 makes smaller files but is slower to encode."
+            ),
             "camera.width": "Capture width in pixels. Higher values increase detail and resource usage.",
             "camera.height": "Capture height in pixels. Higher values increase detail and resource usage.",
             "camera.fps_target": "Requested capture framerate. Real framerate can differ; verify with FPS Report.",
@@ -2580,6 +2620,15 @@ class BumbleBoxV2GUI(tk.Tk):
                 self._pipeline_trace_bound = True
             except Exception:
                 self._pipeline_trace_bound = False
+
+        codec_binding = getattr(self, "_config_codec_trace_bound", False)
+        codec_field = self.config_fields.get("camera.codec")
+        if (not codec_binding) and codec_field is not None:
+            try:
+                codec_field[0].trace_add("write", lambda *_args: self._refresh_config_field_visibility())
+                self._config_codec_trace_bound = True
+            except Exception:
+                self._config_codec_trace_bound = False
 
         self._set_config_page(0)
         self._update_pipeline_tracking_hint()
@@ -2771,10 +2820,20 @@ class BumbleBoxV2GUI(tk.Tk):
                 fleet_role = str(role_field[0].get()).strip().lower() or "standalone"
             except Exception:
                 fleet_role = "standalone"
+        codec_value = "mp4"
+        codec_field = self.config_fields.get("camera.codec")
+        if codec_field is not None:
+            try:
+                codec_value = str(codec_field[0].get()).strip().lower() or "mp4"
+            except Exception:
+                codec_value = "mp4"
+        ui_mode = str(self.ui_mode_var.get()).strip().lower()
 
         for key, row in rows.items():
             allowed_roles = roles_cfg.get(key)
             should_show = allowed_roles is None or fleet_role in allowed_roles
+            if key == "camera.mp4_codec":
+                should_show = should_show and codec_value == "mp4" and ui_mode == "advanced"
             if should_show:
                 row.grid()
             else:
@@ -4684,6 +4743,11 @@ class BumbleBoxV2GUI(tk.Tk):
                 raw = self._get_nested(config, key)
                 if key == "camera.preview_window":
                     raw = "QT"
+                elif key == "camera.mp4_codec":
+                    raw = self._mp4_codec_value_to_display().get(
+                        str(raw).strip().lower(),
+                        "H.264 (Recommended)",
+                    )
                 if value_type is bool:
                     variable.set(bool(raw))
                 else:
@@ -4710,6 +4774,8 @@ class BumbleBoxV2GUI(tk.Tk):
                     parsed = None
                 elif key == "camera.codec":
                     parsed = text.lower() or "mp4"
+                elif key == "camera.mp4_codec":
+                    parsed = self._mp4_codec_display_to_value().get(text, "libx264")
                 elif key == "camera.preview_window":
                     parsed = "QT"
                 else:

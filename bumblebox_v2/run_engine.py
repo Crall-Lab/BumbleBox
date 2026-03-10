@@ -320,7 +320,7 @@ def record_live_test_clip(
         width=int(test_config["camera"]["width"]),
         height=int(test_config["camera"]["height"]),
         recording_codec=requested_video_codec,
-        mp4_codec=str(test_config["camera"].get("mp4_codec", "mp4v")),
+        mp4_codec=str(test_config["camera"].get("mp4_codec", "libx264")),
     )
 
     if not _video_file_is_readable(video_path):
@@ -335,7 +335,7 @@ def record_live_test_clip(
                 width=int(test_config["camera"]["width"]),
                 height=int(test_config["camera"]["height"]),
                 recording_codec="mjpeg",
-                mp4_codec=str(test_config["camera"].get("mp4_codec", "mp4v")),
+                mp4_codec=str(test_config["camera"].get("mp4_codec", "libx264")),
             )
             if _video_file_is_readable(fallback_path):
                 video_codec = "mjpeg"
@@ -818,7 +818,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                 width=int(config["camera"]["width"]),
                 height=int(config["camera"]["height"]),
                 recording_codec=video_codec,
-                mp4_codec=str(config["camera"].get("mp4_codec", "mp4v")),
+                mp4_codec=str(config["camera"].get("mp4_codec", "libx264")),
             )
 
             recording_preview_png_path = _write_midpoint_preview_png(frames, session_dir, session_name)

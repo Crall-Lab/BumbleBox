@@ -275,7 +275,7 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ConfigError(
             f"camera.codec must be one of {sorted(VALID_CAMERA_CODECS)}, got: {camera_codec}"
         )
-    mp4_codec = str(config["camera"].get("mp4_codec", "mp4v")).strip()
+    mp4_codec = str(config["camera"].get("mp4_codec", "libx264")).strip()
     if not mp4_codec:
         raise ConfigError("camera.mp4_codec must be a non-empty string")
 

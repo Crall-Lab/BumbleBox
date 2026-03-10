@@ -17,7 +17,7 @@ camera:
   preview_window: "QT"
   tuning_file: null
   digital_zoom: null
-  mp4_codec: "mp4v"
+  mp4_codec: "libx264"
 
 pipeline:
   mode: "record_and_track"
