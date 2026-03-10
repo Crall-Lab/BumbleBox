@@ -64,6 +64,17 @@ class LiveRecordingResult:
     video_write_warning: Optional[str]
 
 
+@dataclass
+class CameraResetResult:
+    used_mock_camera: bool
+    detected_cameras_before: Optional[int]
+    detected_cameras_after: Optional[int]
+    probe_width: int
+    probe_height: int
+    settle_seconds: float
+    note: Optional[str]
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -99,6 +110,21 @@ def _normalize_recording_codec(config: Dict[str, Any]) -> str:
     if raw in {"mjpeg", "mjpg"}:
         return "mjpeg"
     return "mp4"
+
+
+def _detected_picamera2_camera_count() -> Optional[int]:
+    try:
+        from picamera2 import Picamera2
+    except Exception:
+        return None
+
+    try:
+        camera_info = Picamera2.global_camera_info()
+    except Exception:
+        return None
+    if isinstance(camera_info, list):
+        return len(camera_info)
+    return None
 
 
 def _make_session_paths(config: Dict[str, Any]) -> Tuple[str, Path]:
@@ -333,6 +359,76 @@ def open_capture_probe_session(
     if bool(probe_config["runtime"].get("use_mock_camera", False)):
         return None
     return _PicameraCaptureSession(probe_config)
+
+
+def reset_camera_runtime(
+    config: Dict[str, Any],
+    *,
+    settle_seconds: float = 1.5,
+    probe_width: int = 640,
+    probe_height: int = 480,
+) -> CameraResetResult:
+    reset_config = deepcopy(config)
+    reset_config.setdefault("runtime", {})
+    if bool(reset_config["runtime"].get("use_mock_camera", False)):
+        return CameraResetResult(
+            used_mock_camera=True,
+            detected_cameras_before=None,
+            detected_cameras_after=None,
+            probe_width=int(probe_width),
+            probe_height=int(probe_height),
+            settle_seconds=0.0,
+            note="runtime.use_mock_camera=true, so no hardware camera reset was performed.",
+        )
+
+    reset_config.setdefault("camera", {})
+    reset_config["camera"]["width"] = int(probe_width)
+    reset_config["camera"]["height"] = int(probe_height)
+    reset_config["camera"]["digital_zoom"] = None
+    reset_config["camera"]["noise_reduction"] = "Auto"
+    reset_config["camera"].setdefault("shutter_us", 2500)
+    reset_config["runtime"]["camera_warmup_seconds"] = min(
+        max(float(reset_config["runtime"].get("camera_warmup_seconds", 0.25)), 0.0),
+        0.5,
+    )
+
+    detected_before = _detected_picamera2_camera_count()
+    try:
+        with _PicameraCaptureSession(reset_config) as session:
+            session.start()
+            try:
+                session.picam2.capture_array()
+            except Exception:
+                pass
+    except Exception as exc:
+        detected_after_failure = _detected_picamera2_camera_count()
+        raise RuntimeError(
+            "Camera reset probe failed. "
+            f"Detected cameras before reset: {detected_before if detected_before is not None else 'unknown'}. "
+            f"Detected cameras after failure: {detected_after_failure if detected_after_failure is not None else 'unknown'}. "
+            f"Underlying error: {exc}"
+        ) from exc
+
+    wait_seconds = max(float(settle_seconds), CAMERA_RELEASE_SETTLE_SECONDS)
+    gc.collect()
+    time.sleep(wait_seconds)
+    detected_after = _detected_picamera2_camera_count()
+
+    note = "Camera reset probe completed with a conservative 640x480 open/close cycle."
+    if detected_after == 0:
+        note += " picamera2 still reports no cameras after reset."
+    elif detected_before == 0 and detected_after and detected_after > 0:
+        note += " The camera became visible again after reset."
+
+    return CameraResetResult(
+        used_mock_camera=False,
+        detected_cameras_before=detected_before,
+        detected_cameras_after=detected_after,
+        probe_width=int(probe_width),
+        probe_height=int(probe_height),
+        settle_seconds=wait_seconds,
+        note=note,
+    )
 
 
 def _capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float]:

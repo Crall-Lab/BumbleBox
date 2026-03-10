@@ -70,7 +70,7 @@ from .nest_labeling import (
 from .roadmap import build_roadmap
 from .runtime_alerts import build_runtime_alerts, format_runtime_alerts
 from .run_bundle import export_run_bundle, format_bundle_export_result
-from .run_engine import format_run_summary, record_live_test_clip, run_once
+from .run_engine import format_run_summary, record_live_test_clip, reset_camera_runtime, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
 from .storage_manager import (
     build_storage_setup_sudo_command,
@@ -148,6 +148,9 @@ class BumbleBoxV2GUI(tk.Tk):
         self._fps_live_error: str | None = None
         self._fps_live_report: dict | None = None
         self._fps_live_capture = None
+        self._fps_camera_reset_thread: threading.Thread | None = None
+        self._fps_camera_reset_error: str | None = None
+        self._fps_camera_reset_result = None
         self._config_form_canvas: tk.Canvas | None = None
         self._config_form_window: int | None = None
         self._theme_knob: tk.Scale | None = None
@@ -2849,6 +2852,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self.recording_seconds_var = tk.StringVar()
         self.fps_live_seconds_var = tk.StringVar(value="10.0")
         self.fps_live_status_var = tk.StringVar(value="Idle")
+        self.fps_camera_reset_status_var = tk.StringVar(value="")
         self.fps_sweep_values_var = tk.StringVar(value="")
         self.fps_sweep_start_var = tk.StringVar(value="2.0")
         self.fps_sweep_stop_var = tk.StringVar(value="20.0")
@@ -2933,6 +2937,25 @@ class BumbleBoxV2GUI(tk.Tk):
         self.fps_live_run_btn.grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Label(live_frame, textvariable=self.fps_live_status_var).grid(
             row=2, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(8, 0)
+        )
+        reset_controls = ttk.Frame(live_frame)
+        reset_controls.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.fps_camera_reset_btn = ttk.Button(
+            reset_controls,
+            text="Reset Camera",
+            command=self._start_fps_camera_reset,
+        )
+        self.fps_camera_reset_btn.pack(side=tk.LEFT)
+        self._make_help_button(
+            reset_controls,
+            title="Reset Camera",
+            details=(
+                "Runs a conservative open/close probe to release and reacquire the Pi camera stack. "
+                "Use this if the camera is reported missing or busy after an FPS test."
+            ),
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(reset_controls, textvariable=self.fps_camera_reset_status_var).pack(
+            side=tk.LEFT, padx=(10, 0)
         )
         live_frame.columnconfigure(2, weight=1)
         report_frame.columnconfigure(1, weight=1)
@@ -5373,6 +5396,9 @@ class BumbleBoxV2GUI(tk.Tk):
         if self._fps_live_thread and self._fps_live_thread.is_alive():
             self._show_info("Live FPS test running", "A live FPS capture is already running.")
             return
+        if self._fps_camera_reset_thread and self._fps_camera_reset_thread.is_alive():
+            self._show_info("Camera reset running", "Wait for the camera reset to finish before starting a live FPS test.")
+            return
 
         try:
             config, _ = self._load_config_or_defaults()
@@ -5410,6 +5436,74 @@ class BumbleBoxV2GUI(tk.Tk):
         )
         self._fps_live_thread.start()
         self.after(200, self._poll_live_fps_report)
+
+    def _start_fps_camera_reset(self) -> None:
+        if self._fps_camera_reset_thread and self._fps_camera_reset_thread.is_alive():
+            self._show_info("Camera reset running", "A camera reset is already running.")
+            return
+        if self._fps_live_thread and self._fps_live_thread.is_alive():
+            self._show_info("Live FPS test running", "Wait for the live FPS test to finish before resetting the camera.")
+            return
+        if self._fps_sweep_thread and self._fps_sweep_thread.is_alive():
+            self._show_info("FPS sweep running", "Wait for the FPS sweep to finish before resetting the camera.")
+            return
+
+        try:
+            config, _ = self._load_config_or_defaults()
+        except Exception as exc:
+            self._show_error("Camera reset failed", str(exc))
+            return
+
+        self._fps_camera_reset_error = None
+        self._fps_camera_reset_result = None
+        self.fps_camera_reset_status_var.set("Resetting...")
+        self.fps_camera_reset_btn.config(state=tk.DISABLED)
+        self.fps_output.insert(tk.END, "\nResetting camera...\n")
+
+        self._fps_camera_reset_thread = threading.Thread(
+            target=self._run_fps_camera_reset_worker,
+            args=(config,),
+            daemon=True,
+        )
+        self._fps_camera_reset_thread.start()
+        self.after(200, self._poll_fps_camera_reset)
+
+    def _run_fps_camera_reset_worker(self, config: dict) -> None:
+        try:
+            self._fps_camera_reset_result = reset_camera_runtime(config)
+        except Exception as exc:
+            self._fps_camera_reset_error = str(exc)
+
+    def _poll_fps_camera_reset(self) -> None:
+        if self._fps_camera_reset_thread and self._fps_camera_reset_thread.is_alive():
+            self.after(200, self._poll_fps_camera_reset)
+            return
+
+        self.fps_camera_reset_btn.config(state=tk.NORMAL)
+        if self._fps_camera_reset_error:
+            self.fps_camera_reset_status_var.set("Failed")
+            self.fps_output.insert(tk.END, f"Camera reset failed: {self._fps_camera_reset_error}\n")
+            self._show_error("Camera reset failed", self._fps_camera_reset_error)
+            return
+
+        result = self._fps_camera_reset_result
+        if result is None:
+            self.fps_camera_reset_status_var.set("No result")
+            self.fps_output.insert(tk.END, "Camera reset ended without a result.\n")
+            return
+
+        self.fps_camera_reset_status_var.set("Completed")
+        lines = [
+            "",
+            "Camera reset complete.",
+            f"Probe open/close size: {result.probe_width}x{result.probe_height}",
+            f"Detected cameras before reset: {result.detected_cameras_before if result.detected_cameras_before is not None else 'unknown'}",
+            f"Detected cameras after reset: {result.detected_cameras_after if result.detected_cameras_after is not None else 'unknown'}",
+            f"Post-reset settle time: {result.settle_seconds:.2f}s",
+        ]
+        if result.note:
+            lines.append(f"Note: {result.note}")
+        self.fps_output.insert(tk.END, "\n".join(lines) + "\n")
 
     def _run_live_fps_report_worker(self, config: dict, live_seconds: float) -> None:
         try:
@@ -5473,6 +5567,9 @@ class BumbleBoxV2GUI(tk.Tk):
     def _start_fps_sweep(self) -> None:
         if self._fps_sweep_thread and self._fps_sweep_thread.is_alive():
             self._show_info("FPS sweep running", "An FPS sweep is already running.")
+            return
+        if self._fps_camera_reset_thread and self._fps_camera_reset_thread.is_alive():
+            self._show_info("Camera reset running", "Wait for the camera reset to finish before starting an FPS sweep.")
             return
 
         try:
