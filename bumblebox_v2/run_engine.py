@@ -14,6 +14,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .tuning import resolve_camera_tuning_file
 
+CAMERA_REOPEN_RETRY_ATTEMPTS = 3
+CAMERA_REOPEN_RETRY_DELAY_SECONDS = 0.75
+CAMERA_RELEASE_SETTLE_SECONDS = 0.75
+
 
 @dataclass
 class RunSummary:
@@ -47,6 +51,7 @@ class LiveRecordingResult:
     session_name: str
     session_dir: str
     requested_video_codec: str
+    requested_mp4_codec: Optional[str]
     video_codec: str
     video_path: str
     video_size_bytes: int
@@ -158,36 +163,57 @@ def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[fl
     noise_reduction = config["camera"].get("noise_reduction", "Auto")
 
     def _construct_picamera2(resolved_tuning_file: str | None):
-        try:
-            camera_info = Picamera2.global_camera_info()
-            if isinstance(camera_info, list) and len(camera_info) == 0:
-                raise RuntimeError(
-                    "No camera detected by picamera2/libcamera. "
-                    "Check ribbon cable orientation/seating and enable camera stack."
-                )
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
+        last_error: Exception | None = None
+        for attempt in range(1, CAMERA_REOPEN_RETRY_ATTEMPTS + 1):
+            try:
+                camera_info = Picamera2.global_camera_info()
+                if isinstance(camera_info, list) and len(camera_info) == 0:
+                    raise RuntimeError(
+                        "No camera detected by picamera2/libcamera. "
+                        "Check ribbon cable orientation/seating and enable camera stack."
+                    )
+            except RuntimeError as exc:
+                last_error = exc
+                if attempt < CAMERA_REOPEN_RETRY_ATTEMPTS:
+                    gc.collect()
+                    time.sleep(CAMERA_REOPEN_RETRY_DELAY_SECONDS)
+                    continue
+                raise
+            except Exception:
+                pass
 
-        try:
-            if resolved_tuning_file:
-                tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
-                return Picamera2(tuning=tuning)
-            return Picamera2()
-        except IndexError as exc:
-            raise RuntimeError(
-                "No camera detected by picamera2/libcamera (IndexError during camera open). "
-                "Check ribbon cable orientation/seating, camera power, and that no other process owns the camera."
-            ) from exc
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            if resolved_tuning_file:
-                raise RuntimeError(
-                    f"Failed to open camera with tuning file '{resolved_tuning_file}': {exc}"
-                ) from exc
-            raise RuntimeError(f"Failed to open camera: {exc}") from exc
+            try:
+                if resolved_tuning_file:
+                    tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
+                    return Picamera2(tuning=tuning)
+                return Picamera2()
+            except IndexError as exc:
+                last_error = RuntimeError(
+                    "No camera detected by picamera2/libcamera (IndexError during camera open). "
+                    "Check ribbon cable orientation/seating, camera power, and that no other process owns the camera."
+                )
+                if attempt < CAMERA_REOPEN_RETRY_ATTEMPTS:
+                    gc.collect()
+                    time.sleep(CAMERA_REOPEN_RETRY_DELAY_SECONDS)
+                    continue
+                raise last_error from exc
+            except RuntimeError as exc:
+                last_error = exc
+                if attempt < CAMERA_REOPEN_RETRY_ATTEMPTS:
+                    gc.collect()
+                    time.sleep(CAMERA_REOPEN_RETRY_DELAY_SECONDS)
+                    continue
+                raise
+            except Exception as exc:
+                if resolved_tuning_file:
+                    raise RuntimeError(
+                        f"Failed to open camera with tuning file '{resolved_tuning_file}': {exc}"
+                    ) from exc
+                raise RuntimeError(f"Failed to open camera: {exc}") from exc
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Failed to open camera for an unknown reason.")
 
     resolved_tuning_file = resolve_camera_tuning_file(config)
     picam2 = _construct_picamera2(resolved_tuning_file)
@@ -251,7 +277,7 @@ def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[fl
             pass
         picam2 = None
         gc.collect()
-        time.sleep(0.35)
+        time.sleep(CAMERA_RELEASE_SETTLE_SECONDS)
 
 
 def _capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float]:
@@ -284,6 +310,7 @@ def capture_probe(
     elapsed = time.perf_counter() - start
     frame_count = len(frames)
     del frames
+    gc.collect()
     return frame_count, float(actual_fps), float(elapsed)
 
 
@@ -310,6 +337,11 @@ def record_live_test_clip(
         timestamp_path = _write_timestamps(timestamps, session_dir, session_name)
 
     requested_video_codec = _normalize_recording_codec(test_config)
+    requested_mp4_codec = (
+        _normalize_ffmpeg_mp4_codec(str(test_config["camera"].get("mp4_codec", "libx264")))
+        if requested_video_codec == "mp4"
+        else None
+    )
     video_codec = requested_video_codec
     video_write_warning: Optional[str] = None
     video_path = _write_recording_video(
@@ -376,6 +408,7 @@ def record_live_test_clip(
         session_name=session_name,
         session_dir=str(session_dir),
         requested_video_codec=requested_video_codec,
+        requested_mp4_codec=requested_mp4_codec,
         video_codec=video_codec,
         video_path=str(video_path),
         video_size_bytes=int(video_path.stat().st_size) if video_path.exists() else 0,

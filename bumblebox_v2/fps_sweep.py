@@ -6,9 +6,12 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .run_engine import capture_probe
+
+CAMERA_SWEEP_COOLDOWN_SECONDS = 0.75
 from .status_history import list_recent_run_records, load_run_summary
 
 
@@ -428,6 +431,9 @@ def run_fps_sweep(
                     error=str(exc),
                 )
             )
+        finally:
+            if not bool(probe_cfg.get("runtime", {}).get("use_mock_camera", False)) and index < total:
+                time.sleep(CAMERA_SWEEP_COOLDOWN_SECONDS)
 
     return FpsSweepReport(
         created_at=_iso_now(),

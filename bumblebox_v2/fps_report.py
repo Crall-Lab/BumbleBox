@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import shutil
 from statistics import mean, pstdev
+import subprocess
 from typing import Any, Dict, List
 
 try:
@@ -51,6 +53,74 @@ def _candidate_timestamp_paths(video_path: Path) -> List[Path]:
     ]
 
 
+def _fourcc_to_text(value: float | int) -> str | None:
+    try:
+        fourcc_int = int(value)
+    except Exception:
+        return None
+    if fourcc_int <= 0:
+        return None
+    chars = [chr((fourcc_int >> (8 * idx)) & 0xFF) for idx in range(4)]
+    text = "".join(chars).strip().strip("\x00")
+    return text or None
+
+
+def _detect_video_codec(video_path: Path, capture: Any | None = None) -> Dict[str, Any]:
+    ffprobe_bin = shutil.which("ffprobe")
+    if ffprobe_bin:
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe_bin,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=codec_name,codec_long_name,codec_tag_string",
+                    "-of",
+                    "json",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout or "{}")
+                streams = data.get("streams") or []
+                if streams:
+                    stream = streams[0] or {}
+                    codec_name = str(stream.get("codec_name") or "").strip() or None
+                    codec_long_name = str(stream.get("codec_long_name") or "").strip() or None
+                    codec_tag = str(stream.get("codec_tag_string") or "").strip() or None
+                    if codec_name or codec_long_name or codec_tag:
+                        return {
+                            "video_codec_name": codec_name,
+                            "video_codec_long_name": codec_long_name,
+                            "video_codec_tag": codec_tag,
+                            "video_codec_source": "ffprobe",
+                        }
+        except Exception:
+            pass
+
+    if capture is not None and cv2 is not None:
+        try:
+            fourcc_value = capture.get(cv2.CAP_PROP_FOURCC)
+        except Exception:
+            fourcc_value = 0
+        fourcc_text = _fourcc_to_text(fourcc_value)
+        if fourcc_text:
+            return {
+                "video_codec_name": None,
+                "video_codec_long_name": None,
+                "video_codec_tag": fourcc_text,
+                "video_codec_source": "opencv-fourcc",
+            }
+
+    return {}
+
+
 def build_fps_report(
     video_path: str | Path,
     timestamps_path: str | Path | None = None,
@@ -76,6 +146,7 @@ def build_fps_report(
     if capture.isOpened():
         frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         metadata_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        codec_info = _detect_video_codec(video_path, capture)
         capture.release()
 
         metadata_duration_s = None
@@ -89,6 +160,7 @@ def build_fps_report(
                 "metadata_duration_s": _safe_round(metadata_duration_s),
             }
         )
+        report.update(codec_info)
     else:
         capture.release()
         report["video_open_warning"] = f"Unable to open video with OpenCV: {video_path}"
@@ -180,6 +252,17 @@ def format_report(report: Dict[str, Any]) -> str:
     lines.append(f"Video: {report['video']}")
     if report.get("video_size_bytes") is not None:
         lines.append(f"Video size (bytes): {report.get('video_size_bytes')}")
+    codec_name = report.get("video_codec_name")
+    codec_long_name = report.get("video_codec_long_name")
+    codec_tag = report.get("video_codec_tag")
+    codec_source = report.get("video_codec_source")
+    if codec_name and codec_long_name:
+        lines.append(f"Encoded video codec: {codec_name} ({codec_long_name})")
+    elif codec_name:
+        lines.append(f"Encoded video codec: {codec_name}")
+    elif codec_tag:
+        suffix = " estimate" if codec_source == "opencv-fourcc" else ""
+        lines.append(f"Encoded video codec tag{suffix}: {codec_tag}")
     if report.get("captured_frames_from_timestamps") is not None:
         lines.append(f"Captured frame count (timestamps): {report.get('captured_frames_from_timestamps')}")
     lines.append(f"Encoded frame count (OpenCV metadata estimate): {report.get('frame_count')}")

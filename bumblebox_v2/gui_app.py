@@ -5459,6 +5459,8 @@ class BumbleBoxV2GUI(tk.Tk):
             "",
             format_fps_report(report),
         ]
+        if capture_result.requested_mp4_codec:
+            lines.insert(4, f"Requested MP4 encoder: {capture_result.requested_mp4_codec}")
         if capture_result.video_write_warning:
             lines.insert(8, f"Warning: {capture_result.video_write_warning}")
         self.fps_output.delete("1.0", tk.END)
