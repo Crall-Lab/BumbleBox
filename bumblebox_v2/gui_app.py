@@ -5388,7 +5388,7 @@ class BumbleBoxV2GUI(tk.Tk):
             f"Midpoint PNG: {capture_result.recording_preview_png_path or '(none)'}",
             f"Timestamps path: {capture_result.timestamp_path or '(none)'}",
             f"Session dir: {capture_result.session_dir}",
-            f"Frames captured: {capture_result.frames_captured}",
+            f"Captured frame count (timestamps): {capture_result.frames_captured}",
             f"Capture-estimated FPS: {capture_result.actual_fps}",
             "",
             format_fps_report(report),

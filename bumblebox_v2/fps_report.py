@@ -130,6 +130,14 @@ def build_fps_report(
             if metadata_fps_value and actual_fps:
                 drift_pct = ((actual_fps - float(metadata_fps_value)) / float(metadata_fps_value)) * 100.0
                 report["actual_vs_metadata_drift_pct"] = _safe_round(drift_pct, 3)
+            frame_count_value = report.get("frame_count")
+            if frame_count_value is not None and int(frame_count_value) != len(timestamps):
+                report["frame_count_mismatch_warning"] = (
+                    "Encoded video frame count reported by OpenCV "
+                    f"({int(frame_count_value)}) does not match captured timestamp count "
+                    f"({len(timestamps)}). This usually means container/decoder metadata differs from the "
+                    "capture-side count, not necessarily that capture failed."
+                )
         else:
             report["timestamp_file"] = str(ts_path)
             report["timestamp_warning"] = "Timestamp file found, but fewer than 2 timestamps were parsed."
@@ -172,7 +180,9 @@ def format_report(report: Dict[str, Any]) -> str:
     lines.append(f"Video: {report['video']}")
     if report.get("video_size_bytes") is not None:
         lines.append(f"Video size (bytes): {report.get('video_size_bytes')}")
-    lines.append(f"Frame count: {report.get('frame_count')}")
+    if report.get("captured_frames_from_timestamps") is not None:
+        lines.append(f"Captured frame count (timestamps): {report.get('captured_frames_from_timestamps')}")
+    lines.append(f"Encoded frame count (OpenCV metadata estimate): {report.get('frame_count')}")
     lines.append(f"Metadata FPS: {report.get('metadata_fps')}")
     lines.append(f"Metadata duration (s): {report.get('metadata_duration_s')}")
 
@@ -192,6 +202,8 @@ def format_report(report: Dict[str, Any]) -> str:
 
     if report.get("timestamp_warning"):
         lines.append(f"Warning: {report['timestamp_warning']}")
+    if report.get("frame_count_mismatch_warning"):
+        lines.append(f"Warning: {report['frame_count_mismatch_warning']}")
     if report.get("video_open_warning"):
         lines.append(f"Warning: {report['video_open_warning']}")
     if report.get("video_size_warning"):
