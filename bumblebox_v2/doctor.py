@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import os
 import platform
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -207,6 +208,27 @@ def _camera_stack_check() -> CheckResult:
     )
 
 
+def _ffmpeg_check(config: Dict[str, Any]) -> CheckResult:
+    codec = str(config.get("camera", {}).get("codec", "mp4")).strip().lower()
+    resolved = shutil.which("ffmpeg")
+    if resolved:
+        if codec == "mp4":
+            return CheckResult("Dependency: ffmpeg", "PASS", f"Installed at {resolved} (required for MP4 recording).")
+        return CheckResult("Dependency: ffmpeg", "PASS", f"Installed at {resolved}.")
+
+    if codec == "mp4":
+        return CheckResult(
+            "Dependency: ffmpeg",
+            "FAIL",
+            "Missing. MP4 recording now requires ffmpeg. Install with: sudo apt install ffmpeg",
+        )
+    return CheckResult(
+        "Dependency: ffmpeg",
+        "WARN",
+        "Missing. Not required for MJPEG recording, but needed if you switch codec to MP4.",
+    )
+
+
 def _data_root_check(data_root: str) -> CheckResult:
     path = Path(data_root)
     try:
@@ -351,6 +373,7 @@ def run_doctor(config: Dict[str, Any]) -> List[CheckResult]:
     results.append(_picamera2_check(detected_model))
     results.append(_dependency_check("yaml", "pip3 install pyyaml"))
     results.append(_dependency_check("pandas", "pip3 install pandas"))
+    results.append(_ffmpeg_check(config))
     results.append(_camera_stack_check())
     results.append(_camera_tuning_check(config))
     results.append(_data_root_check(config["system"]["data_root"]))

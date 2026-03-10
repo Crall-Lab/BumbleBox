@@ -345,7 +345,7 @@ if PI_MODEL="$(detect_pi_model)"; then
     SKIPPED_PIP_PICAMERA2_ON_PI=1
   fi
 
-  maybe_install_apt_packages "Pi camera stack" python3-picamera2 libcamera-apps || true
+  maybe_install_apt_packages "Pi camera stack" python3-picamera2 libcamera-apps ffmpeg || true
   if [[ "$SETUP_LABEL_ENV" -eq 1 ]]; then
     maybe_install_apt_packages "Pi Qt stack for nest labeling" python3-pyqt5 || true
   fi
@@ -404,6 +404,7 @@ if [[ "$RUN_SMOKE_CHECK" -eq 1 ]]; then
   echo "[BumbleBox] Running smoke checks for main env"
   "$VENV_PY" - <<'PY'
 import importlib
+import shutil
 import sys
 
 required = ["yaml", "numpy", "pandas", "cv2"]
@@ -422,6 +423,11 @@ import cv2
 has_aruco = hasattr(cv2, "aruco") and hasattr(cv2.aruco, "ArucoDetector")
 if not has_aruco:
     print("Warning: cv2.aruco/ArucoDetector unavailable (check opencv-contrib-python install).")
+
+if shutil.which("ffmpeg"):
+    print("ffmpeg available on PATH.")
+else:
+    print("Warning: ffmpeg not found on PATH. MP4 recording requires ffmpeg.")
 
 print("Main env smoke checks passed.")
 PY

@@ -50,7 +50,7 @@ Recommended Raspberry Pi setup (more reliable than pip for camera/Qt stack):
 
 ```bash
 sudo apt update
-sudo apt install python3-venv python3-picamera2 libcamera-apps python3-pyqt5
+sudo apt install python3-venv python3-picamera2 libcamera-apps python3-pyqt5 ffmpeg
 python3 -m venv --copies --system-site-packages /Users/aec/Desktop/BumbleBox/.venv
 bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh --system-site-packages --skip-picamera2 --skip-nest-label
 ```
@@ -65,7 +65,7 @@ Minimum Python packages:
 pip3 install pyyaml opencv-contrib-python pandas numpy
 ```
 
-On Raspberry Pi, install and enable the camera stack (`rpicam`/`libcamera` + `picamera2`) using Raspberry Pi OS package sources.
+On Raspberry Pi, install and enable the camera stack (`rpicam`/`libcamera` + `picamera2`) using Raspberry Pi OS package sources. MP4 recording also requires `ffmpeg`; `scripts/setup_venv.sh` now tries to install it automatically on Pi via `apt`.
 
 For nest labeling on Debian/Pi, prefer distro packages for Qt compatibility:
 

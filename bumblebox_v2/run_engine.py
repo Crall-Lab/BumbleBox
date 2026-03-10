@@ -3,7 +3,9 @@ from __future__ import annotations
 from copy import deepcopy
 import gc
 import json
+import shutil
 import socket
+import subprocess
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -44,6 +46,7 @@ class RunSummary:
 class LiveRecordingResult:
     session_name: str
     session_dir: str
+    requested_video_codec: str
     video_codec: str
     video_path: str
     video_size_bytes: int
@@ -53,6 +56,7 @@ class LiveRecordingResult:
     actual_fps: float
     configured_fps_target: float
     requested_recording_seconds: float
+    video_write_warning: Optional[str]
 
 
 def _now_iso() -> str:
@@ -305,7 +309,9 @@ def record_live_test_clip(
     if timestamps:
         timestamp_path = _write_timestamps(timestamps, session_dir, session_name)
 
-    video_codec = _normalize_recording_codec(test_config)
+    requested_video_codec = _normalize_recording_codec(test_config)
+    video_codec = requested_video_codec
+    video_write_warning: Optional[str] = None
     video_path = _write_recording_video(
         frames,
         session_dir,
@@ -313,14 +319,48 @@ def record_live_test_clip(
         fps=float(test_config["camera"]["fps_target"]),
         width=int(test_config["camera"]["width"]),
         height=int(test_config["camera"]["height"]),
-        recording_codec=video_codec,
+        recording_codec=requested_video_codec,
         mp4_codec=str(test_config["camera"].get("mp4_codec", "mp4v")),
     )
 
-    if video_codec == "mjpeg":
-        recording_preview_png_path = _write_midpoint_preview_png(frames, session_dir, session_name)
+    if not _video_file_is_readable(video_path):
+        primary_size = int(video_path.stat().st_size) if video_path.exists() else 0
+        if requested_video_codec == "mp4":
+            fallback_session_name = f"{session_name}_fallback_mjpeg"
+            fallback_path = _write_recording_video(
+                frames,
+                session_dir,
+                fallback_session_name,
+                fps=float(test_config["camera"]["fps_target"]),
+                width=int(test_config["camera"]["width"]),
+                height=int(test_config["camera"]["height"]),
+                recording_codec="mjpeg",
+                mp4_codec=str(test_config["camera"].get("mp4_codec", "mp4v")),
+            )
+            if _video_file_is_readable(fallback_path):
+                video_codec = "mjpeg"
+                video_path = fallback_path
+                video_write_warning = (
+                    "Configured MP4 live-test output was unreadable "
+                    f"({primary_size} bytes). MJPEG fallback clip was written instead."
+                )
+            else:
+                fallback_size = int(fallback_path.stat().st_size) if fallback_path.exists() else 0
+                video_write_warning = (
+                    "Configured MP4 live-test output was unreadable "
+                    f"({primary_size} bytes), and MJPEG fallback was also unreadable ({fallback_size} bytes). "
+                    "FPS estimates can still be derived from timestamps."
+                )
+        else:
+            video_write_warning = (
+                f"Configured {requested_video_codec.upper()} live-test output was unreadable "
+                f"({primary_size} bytes). FPS estimates can still be derived from timestamps."
+            )
 
-    if video_codec == "mp4":
+    preview_base_name = Path(video_path).stem
+    recording_preview_png_path = _write_midpoint_preview_png(frames, session_dir, preview_base_name)
+
+    if requested_video_codec == "mp4":
         sidecar = session_dir / f"{session_name}_actual_fps.txt"
         sidecar.write_text(f"{actual_fps:.6f}\n")
 
@@ -335,6 +375,7 @@ def record_live_test_clip(
     return LiveRecordingResult(
         session_name=session_name,
         session_dir=str(session_dir),
+        requested_video_codec=requested_video_codec,
         video_codec=video_codec,
         video_path=str(video_path),
         video_size_bytes=int(video_path.stat().st_size) if video_path.exists() else 0,
@@ -346,6 +387,7 @@ def record_live_test_clip(
         actual_fps=round(actual_fps, 6),
         configured_fps_target=float(test_config["camera"]["fps_target"]),
         requested_recording_seconds=requested_recording_seconds,
+        video_write_warning=video_write_warning,
     )
 
 
@@ -359,28 +401,182 @@ def _write_recording_video(
     recording_codec: str,
     mp4_codec: str,
 ) -> Path:
+    codec_name = str(recording_codec).strip().lower()
+    if codec_name == "mjpeg":
+        try:
+            import cv2
+        except ImportError as exc:  # pragma: no cover - dependency/runtime
+            raise RuntimeError("OpenCV is required to write MJPEG recording output.") from exc
+
+        output = session_dir / f"{session_name}.mjpeg"
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        writer = cv2.VideoWriter(str(output), fourcc, fps, (width, height))
+        if not writer.isOpened():
+            raise RuntimeError(f"Failed to open VideoWriter for {output}")
+
+        for frame in frames:
+            writer.write(_frame_to_bgr(frame))
+
+        writer.release()
+        return output
+
+    output = session_dir / f"{session_name}.mp4"
+    return _write_mp4_video_with_ffmpeg(
+        frames=frames,
+        output=output,
+        fps=fps,
+        width=width,
+        height=height,
+        mp4_codec=mp4_codec,
+    )
+
+
+def _normalize_ffmpeg_mp4_codec(mp4_codec: str) -> str:
+    raw = str(mp4_codec or "").strip().lower()
+    aliases = {
+        "mp4v": "mpeg4",
+        "mpeg4": "mpeg4",
+        "h264": "libx264",
+        "x264": "libx264",
+        "libx264": "libx264",
+        "avc": "libx264",
+        "h265": "libx265",
+        "hevc": "libx265",
+        "x265": "libx265",
+        "libx265": "libx265",
+    }
+    return aliases.get(raw, raw or "mpeg4")
+
+
+def _find_ffmpeg_binary() -> Optional[str]:
+    resolved = shutil.which("ffmpeg")
+    if resolved:
+        return resolved
+    for candidate in ("/usr/bin/ffmpeg", "/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _write_mp4_video_with_ffmpeg(
+    frames: List[Any],
+    output: Path,
+    fps: float,
+    width: int,
+    height: int,
+    mp4_codec: str,
+) -> Path:
+    ffmpeg_bin = _find_ffmpeg_binary()
+    if not ffmpeg_bin:
+        raise RuntimeError(
+            "MP4 recording requires ffmpeg, but it was not found on PATH. "
+            "Install ffmpeg or switch camera.codec to 'mjpeg'."
+        )
+
+    ffmpeg_codec = _normalize_ffmpeg_mp4_codec(mp4_codec)
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s:v",
+        f"{width}x{height}",
+        "-r",
+        f"{float(fps):.6f}",
+        "-i",
+        "pipe:0",
+        "-an",
+        "-c:v",
+        ffmpeg_codec,
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if ffmpeg_codec == "libx264":
+        cmd.extend(["-preset", "fast", "-crf", "18"])
+    elif ffmpeg_codec == "libx265":
+        cmd.extend(["-preset", "fast", "-crf", "20"])
+    elif ffmpeg_codec == "mpeg4":
+        cmd.extend(["-q:v", "2"])
+    cmd.extend(["-movflags", "+faststart", str(output)])
+
+    process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    stderr_text = ""
+    try:
+        if process.stdin is None:
+            raise RuntimeError("Failed to open ffmpeg stdin for MP4 encoding.")
+        for frame in frames:
+            process.stdin.write(_frame_to_bgr(frame).tobytes())
+    except BrokenPipeError as exc:
+        stderr_bytes = b""
+        if process.stderr is not None:
+            stderr_bytes = process.stderr.read()
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"ffmpeg stopped while encoding MP4 '{output.name}': {stderr_text or 'broken pipe'}"
+        ) from exc
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+
+    if process.stderr is not None:
+        stderr_text = process.stderr.read().decode("utf-8", errors="replace").strip()
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(
+            f"ffmpeg failed while encoding MP4 '{output.name}' with codec "
+            f"'{ffmpeg_codec}' (from camera.mp4_codec='{mp4_codec}'). "
+            f"Details: {stderr_text or 'no stderr output'}"
+        )
+    if not _video_file_is_readable(output):
+        size_bytes = int(output.stat().st_size) if output.exists() else 0
+        raise RuntimeError(
+            f"ffmpeg finished but MP4 output '{output.name}' is unreadable ({size_bytes} bytes)."
+        )
+    return output
+
+
+def _frame_to_bgr(frame: Any) -> Any:
     try:
         import cv2
     except ImportError as exc:  # pragma: no cover - dependency/runtime
-        raise RuntimeError("OpenCV is required to write recording output.") from exc
+        raise RuntimeError("OpenCV is required for frame conversion.") from exc
 
-    codec_name = str(recording_codec).strip().lower()
-    if codec_name == "mjpeg":
-        output = session_dir / f"{session_name}.mjpeg"
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-    else:
-        output = session_dir / f"{session_name}.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*str(mp4_codec or "mp4v")[:4])
-    writer = cv2.VideoWriter(str(output), fourcc, fps, (width, height))
-    if not writer.isOpened():
-        raise RuntimeError(f"Failed to open VideoWriter for {output}")
+    return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
 
-    for frame in frames:
-        bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
-        writer.write(bgr)
 
-    writer.release()
-    return output
+def _video_file_is_readable(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size < 1024:
+        return False
+    try:
+        import cv2
+    except ImportError:
+        return path.stat().st_size >= 1024
+
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            return False
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if frame_count > 0:
+            return True
+        ok, _frame = capture.read()
+        return bool(ok)
+    finally:
+        capture.release()
 
 
 def _write_midpoint_preview_png(
@@ -397,7 +593,7 @@ def _write_midpoint_preview_png(
 
     mid_idx = max(0, min(len(frames) - 1, len(frames) // 2))
     frame = frames[mid_idx]
-    bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+    bgr = _frame_to_bgr(frame)
     out = session_dir / f"{session_name}_midframe.png"
     ok = cv2.imwrite(str(out), bgr)
     if not ok:
@@ -625,10 +821,9 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                 mp4_codec=str(config["camera"].get("mp4_codec", "mp4v")),
             )
 
-            if video_codec == "mjpeg":
-                recording_preview_png_path = _write_midpoint_preview_png(frames, session_dir, session_name)
-                if recording_preview_png_path is None:
-                    warnings.append("Could not write MJPEG midpoint preview PNG.")
+            recording_preview_png_path = _write_midpoint_preview_png(frames, session_dir, session_name)
+            if recording_preview_png_path is None:
+                warnings.append("Could not write midpoint preview PNG.")
 
             if video_codec == "mp4" and bool(config["runtime"].get("save_mp4_sidecar_fps_txt", True)):
                 sidecar = session_dir / f"{session_name}_actual_fps.txt"
@@ -726,7 +921,7 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Tracking processing FPS: {summary.tracking_processing_fps if summary.tracking_processing_fps is not None else 'n/a'}",
         f"Recording codec: {summary.video_codec or 'n/a'}",
         f"Video: {summary.video_path or 'none'}",
-        f"MJPEG midpoint PNG: {summary.recording_preview_png_path or 'none'}",
+        f"Midpoint PNG: {summary.recording_preview_png_path or 'none'}",
         f"Timestamps: {summary.timestamp_path or 'none'}",
         f"Raw CSV: {summary.raw_csv_path or 'none'}",
         f"NoID CSV: {summary.noid_csv_path or 'none'}",

@@ -5381,16 +5381,20 @@ class BumbleBoxV2GUI(tk.Tk):
         lines = [
             "Live FPS test capture complete.",
             f"Configured FPS target: {float(capture_result.configured_fps_target):.1f}",
+            f"Requested codec: {capture_result.requested_video_codec}",
+            f"Saved test clip codec: {capture_result.video_codec}",
             f"Video path: {capture_result.video_path}",
             f"Video size (bytes): {capture_result.video_size_bytes}",
+            f"Midpoint PNG: {capture_result.recording_preview_png_path or '(none)'}",
             f"Timestamps path: {capture_result.timestamp_path or '(none)'}",
             f"Session dir: {capture_result.session_dir}",
-            f"Codec: {capture_result.video_codec}",
             f"Frames captured: {capture_result.frames_captured}",
             f"Capture-estimated FPS: {capture_result.actual_fps}",
             "",
             format_fps_report(report),
         ]
+        if capture_result.video_write_warning:
+            lines.insert(8, f"Warning: {capture_result.video_write_warning}")
         self.fps_output.delete("1.0", tk.END)
         self.fps_output.insert(tk.END, "\n".join(lines))
 
