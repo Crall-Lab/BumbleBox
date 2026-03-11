@@ -127,6 +127,14 @@ def _detected_picamera2_camera_count() -> Optional[int]:
     return None
 
 
+def _native_camera_probe_command() -> Optional[list[str]]:
+    for command_name in ("rpicam-hello", "libcamera-hello"):
+        resolved = shutil.which(command_name)
+        if resolved:
+            return [resolved, "-t", "750", "--nopreview"]
+    return None
+
+
 def _make_session_paths(config: Dict[str, Any]) -> Tuple[str, Path]:
     hostname = socket.gethostname()
     dt = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
@@ -396,6 +404,33 @@ def reset_camera_runtime(
     )
 
     detected_before = _detected_picamera2_camera_count()
+    native_command = _native_camera_probe_command()
+    native_probe_error: Optional[str] = None
+    if native_command is not None:
+        proc = subprocess.run(native_command, capture_output=True, text=True, check=False)
+        if proc.returncode == 0:
+            wait_seconds = max(float(settle_seconds), CAMERA_RELEASE_SETTLE_SECONDS)
+            gc.collect()
+            time.sleep(wait_seconds)
+            return CameraResetResult(
+                used_mock_camera=False,
+                detected_cameras_before=detected_before,
+                detected_cameras_after=None,
+                probe_width=int(probe_width),
+                probe_height=int(probe_height),
+                settle_seconds=wait_seconds,
+                note=(
+                    f"Camera reset completed via native camera app '{Path(native_command[0]).name}'. "
+                    "This bypasses the Picamera2 reset probe and is the preferred recovery path on Pi when available."
+                ),
+            )
+        native_probe_error = (
+            f"Native camera probe '{Path(native_command[0]).name}' failed "
+            f"(exit {proc.returncode}). "
+            f"stdout: {(proc.stdout or '').strip() or '(none)'} "
+            f"stderr: {(proc.stderr or '').strip() or '(none)'}"
+        )
+
     try:
         with _PicameraCaptureSession(reset_config) as session:
             session.start()
@@ -409,7 +444,8 @@ def reset_camera_runtime(
             "Camera reset probe failed. "
             f"Detected cameras before reset: {detected_before if detected_before is not None else 'unknown'}. "
             f"Detected cameras after failure: {detected_after_failure if detected_after_failure is not None else 'unknown'}. "
-            f"Underlying error: {exc}"
+            + (f"Native probe error: {native_probe_error}. " if native_probe_error else "")
+            + f"Underlying error: {exc}"
         ) from exc
 
     wait_seconds = max(float(settle_seconds), CAMERA_RELEASE_SETTLE_SECONDS)
