@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 import queue
@@ -3343,7 +3344,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
     def _run_schedule_check(self) -> None:
         try:
-            config, _ = self._load_config_or_defaults()
+            config, _ = self._load_effective_action_config()
             benchmark_input = self.schedule_benchmark_input_var.get().strip() or None
             benchmark_frames = int(self.schedule_benchmark_frames_var.get().strip())
             if benchmark_frames <= 0:
@@ -3360,7 +3361,11 @@ class BumbleBoxV2GUI(tk.Tk):
                 assume_ram_gb=assume_ram_gb,
             )
             self.schedule_check_output.delete("1.0", tk.END)
-            self.schedule_check_output.insert(tk.END, format_schedule_check_report(report))
+            self.schedule_check_output.insert(
+                tk.END,
+                "Using Config Editor snapshot for schedule check.\n\n"
+                + format_schedule_check_report(report),
+            )
             self.notebook.select(self.schedule_check_tab)
             if report.has_failures:
                 self._show_warning(
@@ -3841,8 +3846,19 @@ class BumbleBoxV2GUI(tk.Tk):
                 else:
                     config = load_defaults()
                 updated = apply_best_params_to_config(config, result.best_params)
-                save_config(config_path_obj, updated)
+                snapshot_path, history_warning = self._save_config_with_history(
+                    config_path_obj,
+                    updated,
+                    reason="optimize_tracking_apply_best",
+                )
                 self._optimize_applied_config = str(config_path_obj)
+                history_note = self._format_config_history_note(snapshot_path, history_warning)
+                if history_note:
+                    self._optimize_warning = (
+                        history_note
+                        if self._optimize_warning is None
+                        else f"{self._optimize_warning}\n{history_note}"
+                    )
             except Exception as exc:
                 self._optimize_warning = f"Optimization finished, but config update failed: {exc}"
 
@@ -4268,7 +4284,11 @@ class BumbleBoxV2GUI(tk.Tk):
             self.fleet_pull_min_mem_var.set(str(media.get("min_queen_mem_gb", 0.8)))
             self.fleet_pull_allow_active_var.set(bool(media.get("allow_when_queen_bbox_active", False)))
             self.fleet_pull_no_visual_var.set(bool(media.get("disable_visualization", False)))
-            save_config(config_path, updated)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                updated,
+                reason="fleet_init_queen",
+            )
 
             self.fleet_output.delete("1.0", tk.END)
             self.fleet_output.insert(tk.END, format_fleet_init_result(result, show_public_key=False))
@@ -4290,6 +4310,9 @@ class BumbleBoxV2GUI(tk.Tk):
                     f"track every {media.get('track_interval_minutes')} min)."
                 ),
             )
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            if history_note:
+                self.fleet_output.insert(tk.END, f"\n{history_note}")
             self.notebook.select(self.fleet_tab)
         except Exception as exc:
             self._show_error("Fleet init failed", str(exc))
@@ -4321,11 +4344,18 @@ class BumbleBoxV2GUI(tk.Tk):
                 identity_file=self.fleet_identity_var.get().strip() or None,
                 install_key=bool(self.fleet_install_key_var.get()),
             )
-            save_config(config_path, updated)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                updated,
+                reason="fleet_enroll_worker",
+            )
             self.fleet_pull_max_total_var.set(str(result.queen_media_max_videos_total))
             self.fleet_output.delete("1.0", tk.END)
             self.fleet_output.insert(tk.END, format_fleet_enroll_result(result))
             self.fleet_output.insert(tk.END, f"\n\nSaved config: {config_path}")
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            if history_note:
+                self.fleet_output.insert(tk.END, f"\n{history_note}")
             self.notebook.select(self.fleet_tab)
         except Exception as exc:
             self._show_error("Fleet enroll failed", str(exc))
@@ -4351,7 +4381,11 @@ class BumbleBoxV2GUI(tk.Tk):
         try:
             config, config_path = self._load_config_or_defaults()
             target = sync_media_capacity_to_workers(config, include_disabled=False, minimum=1)
-            save_config(config_path, config)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                config,
+                reason="fleet_sync_media_capacity",
+            )
             self.fleet_pull_max_total_var.set(str(target))
             self.fleet_output.delete("1.0", tk.END)
             self.fleet_output.insert(
@@ -4362,6 +4396,9 @@ class BumbleBoxV2GUI(tk.Tk):
                     f"- config: {config_path}"
                 ),
             )
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            if history_note:
+                self.fleet_output.insert(tk.END, f"\n{history_note}")
             self.notebook.select(self.fleet_tab)
         except Exception as exc:
             self._show_error("Capacity update failed", str(exc))
@@ -4487,7 +4524,11 @@ class BumbleBoxV2GUI(tk.Tk):
             media["min_queen_mem_gb"] = float(settings["min_queen_mem_gb"])
             media["allow_when_queen_bbox_active"] = bool(settings["allow_when_queen_bbox_active"])
             media["disable_visualization"] = bool(settings["disable_visualization"])
-            save_config(config_path, config)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                config,
+                reason="fleet_save_media_schedule",
+            )
 
             self.fleet_output.delete("1.0", tk.END)
             self.fleet_output.insert(
@@ -4501,6 +4542,9 @@ class BumbleBoxV2GUI(tk.Tk):
                 f"- output_root: {media.get('output_root') or '(default)'}\n\n"
                 "Next: run systemd-write then systemd-install to apply timers.",
             )
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            if history_note:
+                self.fleet_output.insert(tk.END, f"\n\n{history_note}")
             self.notebook.select(self.fleet_tab)
         except Exception as exc:
             self._show_error("Save schedule failed", str(exc))
@@ -4845,6 +4889,78 @@ class BumbleBoxV2GUI(tk.Tk):
             self._set_nested(config, key, parsed)
         return config
 
+    def _load_effective_action_config(self) -> tuple[dict, Path]:
+        _, config_path = self._load_config_or_defaults()
+        if not self.config_fields:
+            return self._load_config_or_defaults()
+        config = self._build_editor_config()
+        validate_config(config)
+        return config, config_path
+
+    @staticmethod
+    def _history_reason_slug(reason: str) -> str:
+        cleaned = []
+        for ch in str(reason).strip().lower():
+            if ch.isalnum() or ch in {"-", "_"}:
+                cleaned.append(ch)
+            else:
+                cleaned.append("_")
+        slug = "".join(cleaned).strip("_")
+        return slug or "config_update"
+
+    def _write_config_history_snapshot(
+        self,
+        *,
+        config_path: Path,
+        config: dict,
+        reason: str,
+    ) -> tuple[Path | None, str | None]:
+        try:
+            data_root_text = str(config.get("system", {}).get("data_root", "")).strip()
+            if not data_root_text:
+                raise ValueError("system.data_root is empty")
+
+            recorded_at = datetime.now()
+            history_dir = Path(data_root_text).expanduser() / "config_history"
+            history_dir.mkdir(parents=True, exist_ok=True)
+
+            snapshot_path = history_dir / (
+                f"{recorded_at.strftime('%Y-%m-%d_%H-%M-%S_%f')}_"
+                f"{self._history_reason_slug(reason)}.json"
+            )
+            payload = {
+                "recorded_at": recorded_at.isoformat(timespec="seconds"),
+                "reason": reason,
+                "active_config_path": str(Path(config_path).expanduser().resolve()),
+                "config": config,
+            }
+            snapshot_path.write_text(json.dumps(payload, indent=2))
+            return snapshot_path, None
+        except Exception as exc:
+            return None, str(exc)
+
+    def _save_config_with_history(
+        self,
+        config_path: Path,
+        config: dict,
+        *,
+        reason: str,
+    ) -> tuple[Path | None, str | None]:
+        save_config(config_path, config)
+        return self._write_config_history_snapshot(
+            config_path=config_path,
+            config=config,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _format_config_history_note(snapshot_path: Path | None, warning: str | None) -> str:
+        if snapshot_path is not None:
+            return f"Config history snapshot: {snapshot_path}"
+        if warning:
+            return f"Config history warning: {warning}"
+        return ""
+
     def _validate_editor_config(self) -> None:
         try:
             config = self._build_editor_config()
@@ -4859,7 +4975,11 @@ class BumbleBoxV2GUI(tk.Tk):
             config = self._build_editor_config()
             validate_config(config)
             _, config_path = self._load_config_or_defaults()
-            save_config(config_path, config)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                config,
+                reason="gui_save_config",
+            )
             self._set_theme_mode(
                 str(config.get("runtime", {}).get("ui_theme_mode", "dark")),
                 sync_knob=True,
@@ -4867,7 +4987,13 @@ class BumbleBoxV2GUI(tk.Tk):
             )
             self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)
-            self.config_output.insert(tk.END, f"Saved config to {config_path}")
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            self.config_output.insert(
+                tk.END,
+                "Saved config to "
+                f"{config_path}"
+                + (f"\n{history_note}" if history_note else ""),
+            )
         except Exception as exc:
             self._show_error("Save failed", str(exc))
 
@@ -4957,12 +5083,19 @@ class BumbleBoxV2GUI(tk.Tk):
             config, config_path = self._load_config_or_defaults()
             config.setdefault("system", {})
             config["system"]["data_root"] = mount_point
-            save_config(config_path, config)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                config,
+                reason="storage_save_mount_point",
+            )
             self.storage_output.delete("1.0", tk.END)
             self.storage_output.insert(
                 tk.END,
                 f"Saved mount point to config:\n- system.data_root: {mount_point}\n- config: {config_path}",
             )
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            if history_note:
+                self.storage_output.insert(tk.END, f"\n{history_note}")
             self._refresh_storage_device_choices()
             self._refresh_storage_status()
         except Exception as exc:
@@ -5056,8 +5189,15 @@ class BumbleBoxV2GUI(tk.Tk):
                 self.storage_output.insert(tk.END, format_storage_setup_result(result))
                 config.setdefault("system", {})
                 config["system"]["data_root"] = mount_point
-                save_config(config_path, config)
+                snapshot_path, history_warning = self._save_config_with_history(
+                    config_path,
+                    config,
+                    reason="storage_setup_auto_mount",
+                )
                 self.storage_output.insert(tk.END, f"\n\nUpdated config: {config_path}")
+                history_note = self._format_config_history_note(snapshot_path, history_warning)
+                if history_note:
+                    self.storage_output.insert(tk.END, f"\n{history_note}")
             except PermissionError:
                 if self._run_pkexec_storage_setup(
                     config_path=config_path,
@@ -5470,7 +5610,7 @@ class BumbleBoxV2GUI(tk.Tk):
             return
 
         try:
-            config, _ = self._load_config_or_defaults()
+            config, _ = self._load_effective_action_config()
             live_seconds_text = self.fps_live_seconds_var.get().strip()
             live_seconds = (
                 float(live_seconds_text)
@@ -5494,6 +5634,7 @@ class BumbleBoxV2GUI(tk.Tk):
             (
                 "Recording live FPS test clip...\n"
                 f"Requested seconds: {live_seconds:.2f}\n"
+                f"Using Config Editor snapshot => codec {str(config.get('camera', {}).get('codec', 'mp4')).strip().lower()}\n"
                 f"Using current camera config from BumbleBox => {float(config.get('camera', {}).get('fps_target', 0.0)):.1f} FPS\n"
             ),
         )
@@ -5647,7 +5788,7 @@ class BumbleBoxV2GUI(tk.Tk):
             return
 
         try:
-            config, config_path = self._load_config_or_defaults()
+            config, config_path = self._load_effective_action_config()
             fps_values_text = self.fps_sweep_values_var.get().strip()
             if fps_values_text:
                 fps_values = parse_fps_values(fps_values_text)
@@ -5683,7 +5824,27 @@ class BumbleBoxV2GUI(tk.Tk):
         session_start = self._session_started_iso if bool(self.fps_sweep_session_only_var.get()) else None
 
         self.fps_output.delete("1.0", tk.END)
-        self.fps_output.insert(tk.END, "Running FPS sweep...\n")
+        self.fps_output.insert(
+            tk.END,
+            (
+                "Running FPS sweep...\n"
+                f"Using Config Editor snapshot => codec {str(config.get('camera', {}).get('codec', 'mp4')).strip().lower()}, "
+                f"mode {str(config.get('pipeline', {}).get('mode', 'record_and_track')).strip().lower()}, "
+                f"tracking_source {str(config.get('pipeline', {}).get('tracking_source', 'ram')).strip().lower()}\n"
+            ),
+        )
+        if (
+            str(config.get("camera", {}).get("codec", "mp4")).strip().lower() == "mjpeg"
+            and str(config.get("pipeline", {}).get("mode", "record_and_track")).strip().lower() == "record_and_track"
+            and str(config.get("pipeline", {}).get("tracking_source", "ram")).strip().lower() == "ram"
+        ):
+            self.fps_output.insert(
+                tk.END,
+                (
+                    "MJPEG override: this sweep will still use the RAM-backed model because "
+                    "record_and_track + tracking_source=ram keeps frames in memory during recording.\n"
+                ),
+            )
         self.fps_sweep_status_var.set(
             "Running..." if bool(self.fps_sweep_mock_var.get()) else "Running in subprocess..."
         )
@@ -5733,6 +5894,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 return
 
             output_text, has_errors = self._run_fps_sweep_subprocess(
+                config=config,
                 config_path=config_path,
                 fps_values=fps_values,
                 probe_seconds=probe_seconds,
@@ -5791,6 +5953,7 @@ class BumbleBoxV2GUI(tk.Tk):
     def _run_fps_sweep_subprocess(
         self,
         *,
+        config: dict,
         config_path: Path,
         fps_values: list[float],
         probe_seconds: float,
@@ -5799,29 +5962,32 @@ class BumbleBoxV2GUI(tk.Tk):
     ) -> tuple[str, bool]:
         repo_root = Path(__file__).resolve().parents[1]
         bbx_path = repo_root / "bbx.py"
-        command = [
-            sys.executable,
-            str(bbx_path),
-            "fps-sweep",
-            "--config",
-            str(config_path),
-            "--fps-values",
-            ",".join(f"{float(value):g}" for value in fps_values),
-            "--probe-seconds",
-            f"{float(probe_seconds):.3f}",
-        ]
-        if assume_ram_gb is not None:
-            command.extend(["--assume-ram-gb", f"{float(assume_ram_gb):.3f}"])
-        if session_start:
-            command.extend(["--session-start", session_start])
+        with tempfile.TemporaryDirectory(prefix="bbx_fps_sweep_") as temp_dir:
+            temp_config_path = Path(temp_dir) / config_path.name
+            save_config(temp_config_path, config)
+            command = [
+                sys.executable,
+                str(bbx_path),
+                "fps-sweep",
+                "--config",
+                str(temp_config_path),
+                "--fps-values",
+                ",".join(f"{float(value):g}" for value in fps_values),
+                "--probe-seconds",
+                f"{float(probe_seconds):.3f}",
+            ]
+            if assume_ram_gb is not None:
+                command.extend(["--assume-ram-gb", f"{float(assume_ram_gb):.3f}"])
+            if session_start:
+                command.extend(["--session-start", session_start])
 
-        proc = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=build_camera_safe_env(),
-        )
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=build_camera_safe_env(),
+            )
         stdout = (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
         has_report = "FPS Sweep Report" in stdout
@@ -5978,7 +6144,11 @@ class BumbleBoxV2GUI(tk.Tk):
                 )
                 return
             updated = apply_scale_to_config(config, result)
-            save_config(config_path, updated)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                updated,
+                reason="calibration_load_and_apply",
+            )
             calibration_text = format_calibration(
                 result,
                 pixel_contact_distance=updated.get("metrics", {}).get("pixel_contact_distance"),
@@ -5994,6 +6164,9 @@ class BumbleBoxV2GUI(tk.Tk):
                     f"{calibration_text}"
                 ),
             )
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            if history_note:
+                self.calibration_output.insert(tk.END, f"\n\n{history_note}")
         except Exception as exc:
             self._show_error("Load + calibrate failed", str(exc))
 
@@ -6006,7 +6179,11 @@ class BumbleBoxV2GUI(tk.Tk):
                 float(self.manual_distance_cm.get().strip()),
             )
             updated = apply_scale_to_config(config, result)
-            save_config(config_path, updated)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                updated,
+                reason="calibration_manual",
+            )
 
             self.calibration_output.delete("1.0", tk.END)
             self.calibration_output.insert(
@@ -6016,6 +6193,9 @@ class BumbleBoxV2GUI(tk.Tk):
                     pixel_contact_distance=updated.get("metrics", {}).get("pixel_contact_distance"),
                 ),
             )
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            if history_note:
+                self.calibration_output.insert(tk.END, f"\n\n{history_note}")
         except Exception as exc:
             self._show_error("Manual calibration failed", str(exc))
 
@@ -6032,7 +6212,11 @@ class BumbleBoxV2GUI(tk.Tk):
                 marker_id=marker_id,
             )
             updated = apply_scale_to_config(config, result)
-            save_config(config_path, updated)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                updated,
+                reason="calibration_aruco",
+            )
 
             self.calibration_output.delete("1.0", tk.END)
             self.calibration_output.insert(
@@ -6042,20 +6226,36 @@ class BumbleBoxV2GUI(tk.Tk):
                     pixel_contact_distance=updated.get("metrics", {}).get("pixel_contact_distance"),
                 ),
             )
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            if history_note:
+                self.calibration_output.insert(tk.END, f"\n\n{history_note}")
         except Exception as exc:
             self._show_error("ArUco calibration failed", str(exc))
 
     def _run_once_now(self) -> None:
         try:
-            config, _ = self._load_config_or_defaults()
-            config.setdefault("runtime", {})
+            config, config_path = self._load_effective_action_config()
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                config,
+                reason="gui_run_once_apply",
+            )
+            run_config = deepcopy(config)
+            run_config.setdefault("runtime", {})
             if self.run_mock_var.get():
-                config["runtime"]["use_mock_camera"] = True
+                run_config["runtime"]["use_mock_camera"] = True
 
             mode_override = self.run_mode_var.get().strip() or None
-            summary = run_once(config=config, mode_override=mode_override)
+            summary = run_once(config=run_config, mode_override=mode_override)
             self.run_output.delete("1.0", tk.END)
-            self.run_output.insert(tk.END, format_run_summary(summary))
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            lines = [f"Applied Config Editor snapshot to {config_path}"]
+            if history_note:
+                lines.append(history_note)
+            if self.run_mock_var.get():
+                lines.append("Run-once override: mock camera enabled for this run only.")
+            lines.extend(["", format_run_summary(summary)])
+            self.run_output.insert(tk.END, "\n".join(lines))
             self._refresh_run_history()
             self.notebook.select(self.run_tab)
         except Exception as exc:
@@ -6063,21 +6263,44 @@ class BumbleBoxV2GUI(tk.Tk):
 
     def _generate_systemd_units(self) -> None:
         try:
-            config, config_path = self._load_config_or_defaults()
+            config, config_path = self._load_effective_action_config()
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                config,
+                reason="gui_systemd_generate_units",
+            )
             result = write_systemd_units(
                 config=config,
                 config_path=config_path,
                 output_dir=self.systemd_output_dir_var.get().strip(),
             )
             self.run_output.delete("1.0", tk.END)
-            self.run_output.insert(tk.END, format_systemd_result(result))
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            self.run_output.insert(
+                tk.END,
+                (
+                    f"Applied Config Editor snapshot to {config_path}\n"
+                    + (f"{history_note}\n\n" if history_note else "\n")
+                    + format_systemd_result(result)
+                ),
+            )
             self.notebook.select(self.run_tab)
         except Exception as exc:
             self._show_error("Systemd generation failed", str(exc))
 
     def _systemd_action(self, action: str) -> None:
         try:
-            config, config_path = self._load_config_or_defaults()
+            if action in {"install", "enable"}:
+                config, config_path = self._load_effective_action_config()
+                snapshot_path, history_warning = self._save_config_with_history(
+                    config_path,
+                    config,
+                    reason=f"gui_systemd_{action}",
+                )
+            else:
+                config, config_path = self._load_config_or_defaults()
+                snapshot_path = None
+                history_warning = None
             result = run_systemd_action(
                 config=config,
                 action=action,
@@ -6085,6 +6308,15 @@ class BumbleBoxV2GUI(tk.Tk):
                 config_path=config_path,
             )
             self.run_output.delete("1.0", tk.END)
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            if snapshot_path is not None or history_warning is not None:
+                self.run_output.insert(
+                    tk.END,
+                    (
+                        f"Applied Config Editor snapshot to {config_path}\n"
+                        + (f"{history_note}\n\n" if history_note else "\n")
+                    ),
+                )
             self.run_output.insert(tk.END, format_systemd_action_result(result))
             self.notebook.select(self.run_tab)
         except Exception as exc:

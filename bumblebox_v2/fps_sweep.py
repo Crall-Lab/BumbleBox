@@ -803,6 +803,11 @@ def _capacity_mode_label(mode: str) -> str:
 
 def format_fps_sweep_report(report: FpsSweepReport) -> str:
     empirical_ram_points = sum(1 for point in report.points if point.capacity_estimation_mode == "ram_empirical")
+    mjpeg_ram_override = (
+        report.recording_codec == "mjpeg"
+        and report.capacity_mode == "ram"
+        and report.tracking_source == "ram"
+    )
     lines = [
         "FPS Sweep Report",
         "----------------",
@@ -831,6 +836,11 @@ def format_fps_sweep_report(report: FpsSweepReport) -> str:
             lines.append(
                 f"RAM probes using empirical memory growth: {empirical_ram_points}/{len(report.points)}"
             )
+    if mjpeg_ram_override:
+        lines.append(
+            "MJPEG override: MJPEG is selected, but this sweep is RAM-backed because "
+            "pipeline.mode=record_and_track and tracking_source=ram keep frames in memory during recording."
+        )
     lines.append(f"Capacity note: {report.capacity_note}")
 
     if report.tracking_benchmark:
