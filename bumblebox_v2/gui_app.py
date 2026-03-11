@@ -5415,7 +5415,7 @@ class BumbleBoxV2GUI(tk.Tk):
             capture_output=True,
             text=True,
             check=False,
-            env=build_qt_safe_env(),
+            env=build_camera_safe_env(),
         )
         stdout = (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
