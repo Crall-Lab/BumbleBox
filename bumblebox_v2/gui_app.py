@@ -7,6 +7,7 @@ import shutil
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -143,6 +144,8 @@ class BumbleBoxV2GUI(tk.Tk):
         self._fps_sweep_thread: threading.Thread | None = None
         self._fps_sweep_error: str | None = None
         self._fps_sweep_report = None
+        self._fps_sweep_output_text: str | None = None
+        self._fps_sweep_report_has_errors = False
         self._fps_sweep_progress_q: queue.Queue[tuple[int, int, float]] = queue.Queue()
         self._fps_live_thread: threading.Thread | None = None
         self._fps_live_error: str | None = None
@@ -5644,7 +5647,7 @@ class BumbleBoxV2GUI(tk.Tk):
             return
 
         try:
-            config, _ = self._load_config_or_defaults()
+            config, config_path = self._load_config_or_defaults()
             fps_values_text = self.fps_sweep_values_var.get().strip()
             if fps_values_text:
                 fps_values = parse_fps_values(fps_values_text)
@@ -5675,17 +5678,22 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._fps_sweep_error = None
         self._fps_sweep_report = None
+        self._fps_sweep_output_text = None
+        self._fps_sweep_report_has_errors = False
         session_start = self._session_started_iso if bool(self.fps_sweep_session_only_var.get()) else None
 
         self.fps_output.delete("1.0", tk.END)
         self.fps_output.insert(tk.END, "Running FPS sweep...\n")
-        self.fps_sweep_status_var.set("Running...")
+        self.fps_sweep_status_var.set(
+            "Running..." if bool(self.fps_sweep_mock_var.get()) else "Running in subprocess..."
+        )
         self.fps_sweep_run_btn.config(state=tk.DISABLED)
 
         self._fps_sweep_thread = threading.Thread(
             target=self._run_fps_sweep_worker,
             args=(
                 config,
+                config_path,
                 fps_values,
                 probe_seconds,
                 assume_ram_gb,
@@ -5700,6 +5708,7 @@ class BumbleBoxV2GUI(tk.Tk):
     def _run_fps_sweep_worker(
         self,
         config: dict,
+        config_path: Path,
         fps_values: list[float],
         probe_seconds: float,
         assume_ram_gb: float | None,
@@ -5710,16 +5719,28 @@ class BumbleBoxV2GUI(tk.Tk):
             self._fps_sweep_progress_q.put((done, total, target_fps))
 
         try:
-            report = run_fps_sweep(
-                config=config,
+            if use_mock_camera:
+                report = run_fps_sweep(
+                    config=config,
+                    fps_values=fps_values,
+                    probe_seconds=probe_seconds,
+                    assume_ram_gb=assume_ram_gb,
+                    use_mock_camera=True,
+                    session_start_iso=session_start,
+                    progress_callback=progress_callback,
+                )
+                self._fps_sweep_report = report
+                return
+
+            output_text, has_errors = self._run_fps_sweep_subprocess(
+                config_path=config_path,
                 fps_values=fps_values,
                 probe_seconds=probe_seconds,
                 assume_ram_gb=assume_ram_gb,
-                use_mock_camera=use_mock_camera if use_mock_camera else None,
-                session_start_iso=session_start,
-                progress_callback=progress_callback,
+                session_start=session_start,
             )
-            self._fps_sweep_report = report
+            self._fps_sweep_output_text = output_text
+            self._fps_sweep_report_has_errors = has_errors
         except Exception as exc:
             self._fps_sweep_error = str(exc)
 
@@ -5746,6 +5767,16 @@ class BumbleBoxV2GUI(tk.Tk):
             self._show_error("FPS sweep failed", self._fps_sweep_error)
             return
 
+        if self._fps_sweep_output_text is not None:
+            self.fps_sweep_status_var.set(
+                "Completed with warnings" if self._fps_sweep_report_has_errors else "Completed"
+            )
+            self.fps_output.delete("1.0", tk.END)
+            self.fps_output.insert(tk.END, self._fps_sweep_output_text)
+            if self._fps_sweep_report_has_errors:
+                self._show_warning("FPS sweep", "One or more FPS probes failed. Review the output for details.")
+            return
+
         if self._fps_sweep_report is None:
             self.fps_sweep_status_var.set("No result")
             self.fps_output.insert(tk.END, "\nFPS sweep ended without a report.\n")
@@ -5756,6 +5787,64 @@ class BumbleBoxV2GUI(tk.Tk):
         self.fps_output.insert(tk.END, format_fps_sweep_report(self._fps_sweep_report))
         if self._fps_sweep_report.has_errors:
             self._show_warning("FPS sweep", "One or more FPS probes failed. Review the output for details.")
+
+    def _run_fps_sweep_subprocess(
+        self,
+        *,
+        config_path: Path,
+        fps_values: list[float],
+        probe_seconds: float,
+        assume_ram_gb: float | None,
+        session_start: str | None,
+    ) -> tuple[str, bool]:
+        repo_root = Path(__file__).resolve().parents[1]
+        bbx_path = repo_root / "bbx.py"
+        command = [
+            sys.executable,
+            str(bbx_path),
+            "fps-sweep",
+            "--config",
+            str(config_path),
+            "--fps-values",
+            ",".join(f"{float(value):g}" for value in fps_values),
+            "--probe-seconds",
+            f"{float(probe_seconds):.3f}",
+        ]
+        if assume_ram_gb is not None:
+            command.extend(["--assume-ram-gb", f"{float(assume_ram_gb):.3f}"])
+        if session_start:
+            command.extend(["--session-start", session_start])
+
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=build_camera_safe_env(),
+        )
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        has_report = "FPS Sweep Report" in stdout
+
+        if proc.returncode == 0 and has_report:
+            return stdout, False
+
+        if has_report:
+            details = stdout
+            if stderr:
+                details = f"{details}\n\nstderr:\n{stderr}"
+            return details, True
+
+        detail_lines = [
+            "FPS sweep failed.",
+            f"Exit code: {proc.returncode}",
+            f"Command: {' '.join(shlex.quote(part) for part in command)}",
+        ]
+        if stdout:
+            detail_lines.append(f"stdout:\n{stdout}")
+        if stderr:
+            detail_lines.append(f"stderr:\n{stderr}")
+        raise RuntimeError("\n\n".join(detail_lines))
 
     def _capture_and_open_calibration_labelme(self) -> None:
         try:
