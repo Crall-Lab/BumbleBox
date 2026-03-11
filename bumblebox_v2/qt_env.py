@@ -38,6 +38,25 @@ def build_qt_safe_env(base_env: Mapping[str, str] | None = None) -> dict[str, st
     return env
 
 
+def build_camera_safe_env(
+    base_env: Mapping[str, str] | None = None,
+    *,
+    include_qt: bool = False,
+) -> dict[str, str]:
+    env = build_qt_safe_env(base_env) if include_qt else dict(base_env if base_env is not None else os.environ)
+
+    for key in list(env.keys()):
+        upper = key.upper()
+        if upper.startswith(("LIBCAMERA_", "PICAMERA2_", "IPA_")):
+            env.pop(key, None)
+
+    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"):
+        env.pop(key, None)
+
+    env["TMPDIR"] = "/tmp"
+    return env
+
+
 def sanitize_current_qt_env() -> None:
     safe_env = build_qt_safe_env()
 

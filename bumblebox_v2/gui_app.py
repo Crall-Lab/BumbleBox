@@ -36,7 +36,7 @@ from .fps_sweep import (
     parse_fps_values,
     run_fps_sweep,
 )
-from .qt_env import build_qt_safe_env
+from .qt_env import build_camera_safe_env, build_qt_safe_env
 from .fleet import (
     apply_queen_media_schedule_defaults,
     enroll_worker_config,
@@ -5010,7 +5010,7 @@ class BumbleBoxV2GUI(tk.Tk):
             capture_output=True,
             text=True,
             check=False,
-            env=build_qt_safe_env(),
+            env=build_camera_safe_env(include_qt=True),
         )
         self.storage_output.delete("1.0", tk.END)
         if proc.returncode == 0:
@@ -5379,7 +5379,7 @@ class BumbleBoxV2GUI(tk.Tk):
             capture_output=True,
             text=True,
             check=False,
-            env=build_qt_safe_env(),
+            env=build_camera_safe_env(),
         )
         stdout = (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
