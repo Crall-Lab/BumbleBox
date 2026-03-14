@@ -291,6 +291,7 @@ def _set_v4l2_y16_format(device_path: str, width: int, height: int) -> tuple[boo
 
 
 def discover_thermal_devices() -> List[ThermalDevice]:
+    have_v4l2_ctl = shutil.which("v4l2-ctl") is not None
     labels = _parse_v4l2_list_devices()
     if not labels:
         labels = _sysfs_video_devices()
@@ -321,7 +322,13 @@ def discover_thermal_devices() -> List[ThermalDevice]:
         if supports_y16:
             notes.append("V4L2 advertises Y16, which is the preferred radiometric-ish format to inspect first.")
         if not format_codes:
-            notes.append("Could not read V4L2 format list; install v4l-utils for better diagnostics.")
+            if have_v4l2_ctl:
+                notes.append(
+                    "This device node did not report formats through v4l2-ctl. That is common for some internal "
+                    "Pi nodes and sideband interfaces and does not mean v4l-utils is missing."
+                )
+            else:
+                notes.append("Could not read V4L2 format list; install v4l-utils for better diagnostics.")
         devices.append(
             ThermalDevice(
                 device_path=device_path,
@@ -458,8 +465,6 @@ def run_thermal_check(
             requested_width,
             requested_height,
         )
-        if not _set_ok and shutil.which("v4l2-ctl") is not None:
-            warnings.append("Tried to force V4L2 Y16 format, but v4l2-ctl did not confirm the format change.")
         y16_probe = _probe_capture(
             device_path=selected.device_path,
             width=requested_width,
@@ -471,6 +476,17 @@ def run_thermal_check(
         y16_frame_shape = y16_probe["frame_shape"]
         y16_frame_dtype = y16_probe["frame_dtype"]
         y16_raw16_layout = y16_probe["raw16_layout"]
+        if not _set_ok and shutil.which("v4l2-ctl") is not None:
+            if y16_probe_frame_read and y16_raw16_layout:
+                warnings.append(
+                    "v4l2-ctl did not confirm a persistent Y16 mode switch, but the explicit Y16 probe still returned "
+                    f"{y16_raw16_layout}. Treat the explicit raw16 probe as authoritative for this device."
+                )
+            else:
+                warnings.append(
+                    "Tried to force V4L2 Y16 format, but v4l2-ctl did not confirm the format change and the explicit "
+                    "Y16 probe did not produce usable raw16 data."
+                )
         if y16_probe["error"] and not y16_probe_frame_read:
             warnings.append(f"Explicit Y16 probe did not return a frame: {y16_probe['error']}")
 

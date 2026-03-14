@@ -14,6 +14,9 @@ Implemented now:
 - explicit apply path:
   - CLI: `thermal-check --apply`
   - GUI: `Camera Setup -> Apply Detected Thermal Settings`
+- first-pass synchronized RGB + thermal recording in normal BumbleBox runs when `thermal.enabled: true`
+  - RGB recording/tracking remains the primary pipeline
+  - thermal outputs are saved alongside the RGB session with shared session naming and separate timestamp CSVs
 
 ```bash
 /Users/aec/Desktop/BumbleBox/bbx thermal-check
@@ -105,8 +108,10 @@ Notes:
 ### Phase 3: synchronized recording
 
 - dual-camera session runner
-- shared timestamps for RGB and thermal frames
-- saved session bundle with both outputs
+- shared session timing for RGB and thermal frames
+- separate timestamp CSVs for each stream
+- saved RGB outputs plus thermal raw stack / preview outputs
+- tracking still runs from RGB only in this first pass
 
 ### Phase 4: pre-colony alignment
 

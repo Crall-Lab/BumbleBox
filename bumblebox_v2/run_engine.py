@@ -6,12 +6,14 @@ import json
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .thermal_camera import resolve_thermal_device_path
 from .tuning import resolve_camera_tuning_file
 
 CAMERA_REOPEN_RETRY_ATTEMPTS = 3
@@ -36,6 +38,15 @@ class RunSummary:
     video_path: Optional[str]
     recording_preview_png_path: Optional[str]
     timestamp_path: Optional[str]
+    thermal_enabled: bool
+    thermal_device_path: Optional[str]
+    thermal_frames_captured: int
+    thermal_actual_fps: Optional[float]
+    thermal_timestamp_path: Optional[str]
+    thermal_raw_npy_path: Optional[str]
+    thermal_preview_video_path: Optional[str]
+    thermal_preview_png_path: Optional[str]
+    thermal_metadata_json_path: Optional[str]
     raw_csv_path: Optional[str]
     noid_csv_path: Optional[str]
     cleaned_csv_path: Optional[str]
@@ -73,6 +84,19 @@ class CameraResetResult:
     probe_height: int
     settle_seconds: float
     note: Optional[str]
+
+
+@dataclass
+class ThermalRecordingArtifacts:
+    device_path: str
+    raw16_layout: str
+    frames_captured: int
+    actual_fps: float
+    timestamp_path: Optional[Path]
+    raw_npy_path: Path
+    preview_video_path: Path
+    preview_png_path: Optional[Path]
+    metadata_json_path: Path
 
 
 def _now_iso() -> str:
@@ -155,6 +179,19 @@ def _write_timestamps(timestamps: List[float], session_dir: Path, session_name: 
     return path
 
 
+def _write_named_timestamps(
+    timestamps: List[float],
+    session_dir: Path,
+    stem: str,
+) -> Path:
+    path = session_dir / f"{stem}.csv"
+    with path.open("w") as f:
+        f.write("frame,time_s\n")
+        for i, value in enumerate(timestamps):
+            f.write(f"{i},{value:.6f}\n")
+    return path
+
+
 def _mock_capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float]:
     try:
         import numpy as np
@@ -183,11 +220,21 @@ def _capture_frames_from_started_picamera(
     picam2: Any,
     fps: float,
     duration: float,
+    *,
+    start_monotonic: float | None = None,
 ) -> Tuple[List[Any], List[float], float]:
     frames: List[Any] = []
     timestamps: List[float] = []
 
-    start = time.perf_counter()
+    if start_monotonic is None:
+        start = time.perf_counter()
+    else:
+        start = float(start_monotonic)
+        while True:
+            now = time.perf_counter()
+            if now >= start:
+                break
+            time.sleep(min(0.001, max(0.0, start - now)))
     frame_index = 0
     target_interval = 1.0 / fps
     while (time.perf_counter() - start) < duration:
@@ -322,9 +369,20 @@ class _PicameraCaptureSession:
         self.started = True
         time.sleep(max(0.0, self.warmup_s))
 
-    def capture_for(self, *, fps: float, duration: float) -> Tuple[List[Any], List[float], float]:
+    def capture_for(
+        self,
+        *,
+        fps: float,
+        duration: float,
+        start_monotonic: float | None = None,
+    ) -> Tuple[List[Any], List[float], float]:
         self.start()
-        return _capture_frames_from_started_picamera(self.picam2, float(fps), float(duration))
+        return _capture_frames_from_started_picamera(
+            self.picam2,
+            float(fps),
+            float(duration),
+            start_monotonic=start_monotonic,
+        )
 
     def close(self) -> None:
         if self.started:
@@ -353,6 +411,345 @@ def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[fl
     duration = float(config["capture"]["recording_seconds"])
     with _PicameraCaptureSession(config) as session:
         return session.capture_for(fps=fps, duration=duration)
+
+
+def _thermal_enabled_for_recording(config: Dict[str, Any]) -> bool:
+    thermal = config.get("thermal", {})
+    return isinstance(thermal, dict) and bool(thermal.get("enabled", False))
+
+
+def _infer_thermal_raw16_layout(frame: Any) -> Optional[str]:
+    shape = getattr(frame, "shape", None)
+    dtype = str(getattr(frame, "dtype", ""))
+    if shape is None:
+        return None
+    if dtype == "uint16" and len(shape) == 2:
+        return "uint16_mono16"
+    if dtype == "uint8" and len(shape) == 3 and int(shape[2]) == 2:
+        return "uint8_2ch_packed16"
+    return None
+
+
+def _decode_thermal_raw16_frame(frame: Any, raw16_layout: str) -> Any:
+    if raw16_layout == "uint16_mono16":
+        return frame.copy()
+    if raw16_layout == "uint8_2ch_packed16":
+        packed = frame.copy()
+        return packed.view("<u2").reshape(packed.shape[0], packed.shape[1])
+    raise RuntimeError(f"Unsupported thermal raw16 layout: {raw16_layout}")
+
+
+class _ThermalCaptureSession:
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config = config
+        thermal = config.get("thermal", {})
+        if not isinstance(thermal, dict):
+            raise RuntimeError("thermal config section is missing or malformed.")
+
+        self.device_path = resolve_thermal_device_path(config)
+        if not self.device_path:
+            raise RuntimeError("No thermal capture device could be resolved from config.")
+        self.width = int(thermal.get("width", 160))
+        self.height = int(thermal.get("height", 120))
+        self.pixel_format = str(thermal.get("pixel_format", "auto")).strip().lower() or "auto"
+        if self.pixel_format not in {"auto", "y16"}:
+            raise RuntimeError(
+                "Synchronized thermal recording currently supports thermal.pixel_format 'auto' or 'y16' only."
+            )
+
+        try:
+            import cv2
+        except Exception as exc:  # pragma: no cover - dependency/runtime
+            raise RuntimeError("OpenCV is required for thermal capture.") from exc
+
+        self._cv2 = cv2
+        self.capture = cv2.VideoCapture(self.device_path, cv2.CAP_V4L2)
+        if not self.capture.isOpened():
+            raise RuntimeError(f"Could not open thermal device for synchronized recording: {self.device_path}")
+
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
+        if hasattr(cv2, "CAP_PROP_CONVERT_RGB"):
+            self.capture.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+        if hasattr(cv2, "CAP_PROP_FOURCC"):
+            self.capture.set(cv2.CAP_PROP_FOURCC, float(cv2.VideoWriter_fourcc(*"Y16 ")))
+
+        self.raw16_layout: Optional[str] = None
+
+    def capture_for(
+        self,
+        *,
+        fps: float,
+        duration: float,
+        start_monotonic: float | None = None,
+    ) -> Tuple[List[Any], List[float], float, str]:
+        frames: List[Any] = []
+        timestamps: List[float] = []
+
+        if start_monotonic is None:
+            start = time.perf_counter()
+        else:
+            start = float(start_monotonic)
+            while True:
+                now = time.perf_counter()
+                if now >= start:
+                    break
+                time.sleep(min(0.001, max(0.0, start - now)))
+
+        frame_index = 0
+        target_interval = 1.0 / float(fps)
+        first_error: Optional[str] = None
+        while (time.perf_counter() - start) < float(duration):
+            now = time.perf_counter()
+            expected = start + frame_index * target_interval
+            if now < expected:
+                time.sleep(min(0.001, max(0.0, expected - now)))
+                continue
+
+            ok, frame = self.capture.read()
+            if not ok or frame is None:
+                if first_error is None:
+                    first_error = "Thermal device opened, but frame reads failed during synchronized capture."
+                time.sleep(0.002)
+                continue
+
+            layout = _infer_thermal_raw16_layout(frame)
+            if layout is None:
+                if first_error is None:
+                    first_error = (
+                        "Thermal capture returned frames, but not in a usable raw16 layout during synchronized capture."
+                    )
+                time.sleep(0.002)
+                continue
+
+            if self.raw16_layout is None:
+                self.raw16_layout = layout
+            decoded = _decode_thermal_raw16_frame(frame, layout)
+            frames.append(decoded)
+            timestamps.append(now - start)
+            frame_index += 1
+
+        if self.raw16_layout is None:
+            raise RuntimeError(first_error or "Thermal synchronized capture did not yield any usable raw16 frames.")
+
+        elapsed = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else float(duration)
+        actual_fps = (
+            (len(timestamps) - 1) / elapsed
+            if elapsed > 0 and len(timestamps) > 1
+            else float(len(frames)) / max(float(duration), 1e-6)
+        )
+        return frames, timestamps, float(actual_fps), self.raw16_layout
+
+    def close(self) -> None:
+        try:
+            self.capture.release()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "_ThermalCaptureSession":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
+def _mock_capture_thermal_frames(
+    config: Dict[str, Any],
+    *,
+    timestamps: List[float],
+    actual_fps: float,
+) -> Tuple[List[Any], List[float], float, str, str]:
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - dependency/runtime
+        raise RuntimeError("numpy is required for mock thermal capture mode") from exc
+
+    thermal = config.get("thermal", {})
+    width = int(thermal.get("width", 160))
+    height = int(thermal.get("height", 120))
+    frames: List[Any] = []
+    for idx, _timestamp in enumerate(timestamps):
+        base = np.full((height, width), 29000 + (idx % 97), dtype=np.uint16)
+        frames.append(base)
+    return frames, list(timestamps), float(actual_fps), "uint16_mono16", "mock://thermal"
+
+
+def _capture_rgb_and_optional_thermal(
+    config: Dict[str, Any],
+) -> Tuple[List[Any], List[float], float, Optional[dict[str, Any]]]:
+    if not _thermal_enabled_for_recording(config):
+        frames, timestamps, actual_fps = _capture_frames(config)
+        return frames, timestamps, actual_fps, None
+
+    if bool(config["runtime"].get("use_mock_camera", False)):
+        frames, timestamps, actual_fps = _capture_frames(config)
+        thermal_frames, thermal_timestamps, thermal_actual_fps, raw16_layout, device_path = _mock_capture_thermal_frames(
+            config,
+            timestamps=timestamps,
+            actual_fps=actual_fps,
+        )
+        return frames, timestamps, actual_fps, {
+            "device_path": device_path,
+            "frames": thermal_frames,
+            "timestamps": thermal_timestamps,
+            "actual_fps": thermal_actual_fps,
+            "raw16_layout": raw16_layout,
+        }
+
+    fps = float(config["camera"]["fps_target"])
+    duration = float(config["capture"]["recording_seconds"])
+    start_monotonic = time.perf_counter() + 0.20
+
+    rgb_result: dict[str, Any] = {}
+    thermal_result: dict[str, Any] = {}
+    errors: list[str] = []
+
+    def rgb_worker(session: _PicameraCaptureSession) -> None:
+        try:
+            frames, timestamps, actual_fps = session.capture_for(
+                fps=fps,
+                duration=duration,
+                start_monotonic=start_monotonic,
+            )
+            rgb_result.update(
+                {
+                    "frames": frames,
+                    "timestamps": timestamps,
+                    "actual_fps": actual_fps,
+                }
+            )
+        except Exception as exc:
+            errors.append(f"RGB synchronized capture failed: {exc}")
+
+    def thermal_worker(session: _ThermalCaptureSession) -> None:
+        try:
+            frames, timestamps, actual_fps, raw16_layout = session.capture_for(
+                fps=fps,
+                duration=duration,
+                start_monotonic=start_monotonic,
+            )
+            thermal_result.update(
+                {
+                    "device_path": session.device_path,
+                    "frames": frames,
+                    "timestamps": timestamps,
+                    "actual_fps": actual_fps,
+                    "raw16_layout": raw16_layout,
+                }
+            )
+        except Exception as exc:
+            errors.append(f"Thermal synchronized capture failed: {exc}")
+
+    with _PicameraCaptureSession(config) as rgb_session, _ThermalCaptureSession(config) as thermal_session:
+        rgb_session.start()
+        rgb_thread = threading.Thread(target=rgb_worker, args=(rgb_session,), daemon=True)
+        thermal_thread = threading.Thread(target=thermal_worker, args=(thermal_session,), daemon=True)
+        rgb_thread.start()
+        thermal_thread.start()
+        rgb_thread.join()
+        thermal_thread.join()
+
+    if errors:
+        raise RuntimeError(" | ".join(errors))
+    return (
+        rgb_result["frames"],
+        rgb_result["timestamps"],
+        float(rgb_result["actual_fps"]),
+        thermal_result or None,
+    )
+
+
+def _write_thermal_recording_outputs(
+    *,
+    session_dir: Path,
+    session_name: str,
+    device_path: str,
+    frames: List[Any],
+    timestamps: List[float],
+    actual_fps: float,
+    raw16_layout: str,
+) -> ThermalRecordingArtifacts:
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:  # pragma: no cover - dependency/runtime
+        raise RuntimeError(f"OpenCV/numpy are required for thermal recording outputs: {exc}") from exc
+
+    if not frames:
+        raise RuntimeError("No thermal frames were captured.")
+
+    stack = np.stack(frames, axis=0)
+    raw_npy_path = session_dir / f"{session_name}_thermal_raw16.npy"
+    np.save(raw_npy_path, stack)
+
+    timestamp_path = _write_named_timestamps(
+        timestamps,
+        session_dir,
+        f"{session_name}_thermal_frame_timestamps",
+    ) if timestamps else None
+
+    min_value = int(stack.min())
+    max_value = int(stack.max())
+    if max_value == min_value:
+        preview8 = np.zeros_like(stack, dtype=np.uint8)
+    else:
+        preview8 = ((stack.astype(np.float32) - float(min_value)) * (255.0 / float(max_value - min_value))).clip(0, 255).astype(np.uint8)
+
+    preview_video_path = session_dir / f"{session_name}_thermal_preview.avi"
+    writer = cv2.VideoWriter(
+        str(preview_video_path),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        float(actual_fps if actual_fps > 0 else 1.0),
+        (int(stack.shape[2]), int(stack.shape[1])),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open thermal preview video writer for {preview_video_path}")
+    try:
+        for frame8 in preview8:
+            writer.write(cv2.applyColorMap(frame8, cv2.COLORMAP_INFERNO))
+    finally:
+        writer.release()
+
+    mid_idx = max(0, min(int(stack.shape[0]) - 1, int(stack.shape[0]) // 2))
+    preview_png_path = session_dir / f"{session_name}_thermal_midframe.png"
+    preview_png_ok = cv2.imwrite(
+        str(preview_png_path),
+        cv2.applyColorMap(preview8[mid_idx], cv2.COLORMAP_INFERNO),
+    )
+    if not preview_png_ok:
+        preview_png_path = None
+
+    metadata_json_path = session_dir / f"{session_name}_thermal_metadata.json"
+    metadata_json_path.write_text(
+        json.dumps(
+            {
+                "captured_at": _now_iso(),
+                "device_path": device_path,
+                "raw16_layout": raw16_layout,
+                "frame_count": int(stack.shape[0]),
+                "frame_shape": [int(stack.shape[1]), int(stack.shape[2])],
+                "actual_fps": float(actual_fps),
+                "min_value": min_value,
+                "max_value": max_value,
+                "timestamp_csv": str(timestamp_path) if timestamp_path else None,
+                "preview_video": str(preview_video_path),
+                "raw_npy": str(raw_npy_path),
+            },
+            indent=2,
+        )
+    )
+
+    return ThermalRecordingArtifacts(
+        device_path=device_path,
+        raw16_layout=raw16_layout,
+        frames_captured=int(stack.shape[0]),
+        actual_fps=float(actual_fps),
+        timestamp_path=timestamp_path,
+        raw_npy_path=raw_npy_path,
+        preview_video_path=preview_video_path,
+        preview_png_path=preview_png_path,
+        metadata_json_path=metadata_json_path,
+    )
 
 
 def open_capture_probe_session(
@@ -1142,6 +1539,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     video_path: Optional[Path] = None
     recording_preview_png_path: Optional[Path] = None
     timestamp_path: Optional[Path] = None
+    thermal_artifacts: Optional[ThermalRecordingArtifacts] = None
     raw_csv: Optional[Path] = None
     noid_csv: Optional[Path] = None
     cleaned_csv: Optional[Path] = None
@@ -1153,7 +1551,46 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         should_track = mode in {"track_only", "record_and_track"}
 
         if should_record or should_track:
-            frames, timestamps, actual_fps = _capture_frames(config)
+            if should_record and _thermal_enabled_for_recording(config):
+                thermal_cfg = config.get("thermal", {})
+                try:
+                    thermal_target_fps = float(thermal_cfg.get("fps_target", config["camera"]["fps_target"]))
+                except Exception:
+                    thermal_target_fps = float(config["camera"]["fps_target"])
+                if abs(thermal_target_fps - float(config["camera"]["fps_target"])) > 1e-6:
+                    warnings.append(
+                        "Synchronized thermal recording follows camera.fps_target. "
+                        f"thermal.fps_target={thermal_target_fps:.3f} was ignored for this run."
+                    )
+                frames, timestamps, actual_fps, thermal_capture = _capture_rgb_and_optional_thermal(config)
+                if thermal_capture is not None:
+                    thermal_artifacts = _write_thermal_recording_outputs(
+                        session_dir=session_dir,
+                        session_name=session_name,
+                        device_path=str(thermal_capture["device_path"]),
+                        frames=list(thermal_capture["frames"]),
+                        timestamps=list(thermal_capture["timestamps"]),
+                        actual_fps=float(thermal_capture["actual_fps"]),
+                        raw16_layout=str(thermal_capture["raw16_layout"]),
+                    )
+                    if thermal_artifacts.frames_captured != len(frames):
+                        warnings.append(
+                            "RGB and thermal synchronized recording captured different frame counts "
+                            f"({len(frames)} RGB vs {thermal_artifacts.frames_captured} thermal). "
+                            "Use the separate timestamp CSV files for alignment."
+                        )
+                    if abs(float(actual_fps) - float(thermal_artifacts.actual_fps)) > 0.25:
+                        warnings.append(
+                            "RGB and thermal actual FPS differed during synchronized recording "
+                            f"({actual_fps:.3f} RGB vs {thermal_artifacts.actual_fps:.3f} thermal)."
+                        )
+                    del thermal_capture["frames"]
+                else:
+                    thermal_artifacts = None
+            else:
+                frames, timestamps, actual_fps = _capture_frames(config)
+                if should_track and _thermal_enabled_for_recording(config) and not should_record:
+                    warnings.append("thermal.enabled is set, but thermal capture runs only during recording modes.")
 
         if bool(config["runtime"].get("save_frame_timestamps", True)) and timestamps:
             timestamp_path = _write_timestamps(timestamps, session_dir, session_name)
@@ -1244,6 +1681,15 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         video_path=str(video_path) if video_path else None,
         recording_preview_png_path=str(recording_preview_png_path) if recording_preview_png_path else None,
         timestamp_path=str(timestamp_path) if timestamp_path else None,
+        thermal_enabled=bool(_thermal_enabled_for_recording(config)),
+        thermal_device_path=(thermal_artifacts.device_path if thermal_artifacts else None),
+        thermal_frames_captured=(thermal_artifacts.frames_captured if thermal_artifacts else 0),
+        thermal_actual_fps=(round(thermal_artifacts.actual_fps, 6) if thermal_artifacts else None),
+        thermal_timestamp_path=(str(thermal_artifacts.timestamp_path) if thermal_artifacts and thermal_artifacts.timestamp_path else None),
+        thermal_raw_npy_path=(str(thermal_artifacts.raw_npy_path) if thermal_artifacts else None),
+        thermal_preview_video_path=(str(thermal_artifacts.preview_video_path) if thermal_artifacts else None),
+        thermal_preview_png_path=(str(thermal_artifacts.preview_png_path) if thermal_artifacts and thermal_artifacts.preview_png_path else None),
+        thermal_metadata_json_path=(str(thermal_artifacts.metadata_json_path) if thermal_artifacts else None),
         raw_csv_path=str(raw_csv) if raw_csv else None,
         noid_csv_path=str(noid_csv) if noid_csv else None,
         cleaned_csv_path=str(cleaned_csv) if cleaned_csv else None,
@@ -1273,6 +1719,15 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Video: {summary.video_path or 'none'}",
         f"Midpoint PNG: {summary.recording_preview_png_path or 'none'}",
         f"Timestamps: {summary.timestamp_path or 'none'}",
+        f"Thermal enabled: {summary.thermal_enabled}",
+        f"Thermal device: {summary.thermal_device_path or 'none'}",
+        f"Thermal frames captured: {summary.thermal_frames_captured}",
+        f"Thermal actual FPS: {summary.thermal_actual_fps if summary.thermal_actual_fps is not None else 'n/a'}",
+        f"Thermal timestamps: {summary.thermal_timestamp_path or 'none'}",
+        f"Thermal raw NPY: {summary.thermal_raw_npy_path or 'none'}",
+        f"Thermal preview video: {summary.thermal_preview_video_path or 'none'}",
+        f"Thermal midpoint PNG: {summary.thermal_preview_png_path or 'none'}",
+        f"Thermal metadata JSON: {summary.thermal_metadata_json_path or 'none'}",
         f"Raw CSV: {summary.raw_csv_path or 'none'}",
         f"NoID CSV: {summary.noid_csv_path or 'none'}",
         f"Cleaned CSV: {summary.cleaned_csv_path or 'none'}",
