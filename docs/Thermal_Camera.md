@@ -7,12 +7,17 @@ This document tracks the staged PureThermal3 + Lepton 3.5 integration path for B
 Implemented now:
 
 - config placeholders for a thermal device (`thermal.*`)
-- USB/V4L2 thermal discovery and probe command:
+- USB/V4L2 thermal discovery and probe command
 - stable-path recommendation (`/dev/v4l/by-id/...` when available)
 - explicit Y16 probe reporting for raw/radiometric-style capture checks
+- raw thermal snapshot command that saves `.npy`, 16-bit `.png`, preview `.png`, and metadata JSON
+- explicit apply path:
+  - CLI: `thermal-check --apply`
+  - GUI: `Camera Setup -> Apply Detected Thermal Settings`
 
 ```bash
 /Users/aec/Desktop/BumbleBox/bbx thermal-check
+/Users/aec/Desktop/BumbleBox/bbx thermal-snapshot
 ```
 
 This path is intentionally separate from the Pi HQ / Module 3 camera path. The RGB camera remains on
@@ -28,11 +33,22 @@ v4l2-ctl --list-devices
 /Users/aec/Desktop/BumbleBox/bbx thermal-check
 ```
 
+`v4l-utils` is recommended for the thermal workflow and is now included in BumbleBox's Pi setup script.
+
 Look for these lines in the report:
 
 - `Recommended stable path: ...`
 - `Explicit Y16 probe frame read: yes`
 - `Y16 raw layout: uint16_mono16` or `uint8_2ch_packed16`
+
+If you see:
+
+- `Recommended stable path: /dev/v4l/by-id/...`
+- `Y16 frame dtype: uint16`
+- `Y16 raw layout: uint16_mono16`
+
+then the PureThermal board is stable enough to pin in config and raw thermal capture is working well enough to move
+to saved snapshots and synchronized recording work.
 
 If BumbleBox reports `uint8_2ch_packed16`, that is still likely usable raw data; it means the 16-bit payload is
 arriving as two 8-bit channels and must be reinterpreted in code rather than used as a pre-converted OpenCV image.
@@ -42,6 +58,12 @@ If `v4l2-ctl` is missing:
 ```bash
 sudo apt update
 sudo apt install v4l-utils
+```
+
+If the report fully passes, you can apply the detected stable path and Y16 settings directly:
+
+```bash
+/Users/aec/Desktop/BumbleBox/bbx thermal-check --apply
 ```
 
 ## Thermal Config Fields
@@ -116,6 +138,10 @@ Notes:
 
 ```bash
 /Users/aec/Desktop/BumbleBox/bbx thermal-check
+/Users/aec/Desktop/BumbleBox/bbx thermal-check --apply
 /Users/aec/Desktop/BumbleBox/bbx thermal-check --device /dev/video2
 /Users/aec/Desktop/BumbleBox/bbx thermal-check --json-out /tmp/thermal_check.json
+/Users/aec/Desktop/BumbleBox/bbx thermal-snapshot
+/Users/aec/Desktop/BumbleBox/bbx thermal-snapshot --device /dev/video8
+/Users/aec/Desktop/BumbleBox/bbx thermal-snapshot --output-dir /tmp/thermal
 ```

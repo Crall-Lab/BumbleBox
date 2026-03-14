@@ -19,6 +19,8 @@ bash /Users/aec/Desktop/BumbleBox/start_bumblebox.sh
 /Users/aec/Desktop/BumbleBox/bbx init
 /Users/aec/Desktop/BumbleBox/bbx doctor
 /Users/aec/Desktop/BumbleBox/bbx thermal-check
+/Users/aec/Desktop/BumbleBox/bbx thermal-check --apply
+/Users/aec/Desktop/BumbleBox/bbx thermal-snapshot
 /Users/aec/Desktop/BumbleBox/bbx camera-preview --seconds 20
 /Users/aec/Desktop/BumbleBox/bbx camera-test-tracking --seconds 20
 /Users/aec/Desktop/BumbleBox/bbx roadmap
@@ -66,7 +68,7 @@ Minimum Python packages:
 pip3 install pyyaml opencv-contrib-python pandas numpy
 ```
 
-On Raspberry Pi, install and enable the camera stack (`rpicam`/`libcamera` + `picamera2`) using Raspberry Pi OS package sources. MP4 recording also requires `ffmpeg`; `scripts/setup_venv.sh` now tries to install it automatically on Pi via `apt`.
+On Raspberry Pi, install and enable the camera stack (`rpicam`/`libcamera` + `picamera2`) using Raspberry Pi OS package sources. MP4 recording also requires `ffmpeg`; thermal camera diagnostics work better with `v4l-utils`. `scripts/setup_venv.sh` now tries to install both automatically on Pi via `apt`.
 
 For nest labeling on Debian/Pi, prefer distro packages for Qt compatibility:
 
@@ -79,7 +81,7 @@ sudo apt install python3-pyqt5 labelme
 
 - Pi 4/5 compatibility checks (`doctor`)
 - camera stack checks for HQ/Module3 workflows
-- USB thermal camera discovery/probe path for PureThermal/Lepton-style devices (`thermal-check`)
+- USB thermal camera discovery/probe/snapshot path for PureThermal/Lepton-style devices (`thermal-check`, `thermal-snapshot`)
 - camera setup tools for focus/framing and live tag-detection validation (`camera-preview`, `camera-test-tracking`)
 - explicit camera tuning selection: auto-resolve by camera model + IR/NoIR flag (Pi4 `vc4` / Pi5 `pisp`) with manual override via `camera.tuning_file`
 - flexible mode model (`record_only`, `track_only`, `record_and_track`, `mixed_schedule`)

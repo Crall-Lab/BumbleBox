@@ -345,7 +345,7 @@ if PI_MODEL="$(detect_pi_model)"; then
     SKIPPED_PIP_PICAMERA2_ON_PI=1
   fi
 
-  maybe_install_apt_packages "Pi camera stack" python3-picamera2 libcamera-apps ffmpeg || true
+  maybe_install_apt_packages "Pi camera + thermal stack" python3-picamera2 libcamera-apps ffmpeg v4l-utils || true
   if [[ "$SETUP_LABEL_ENV" -eq 1 ]]; then
     maybe_install_apt_packages "Pi Qt stack for nest labeling" python3-pyqt5 || true
   fi
@@ -428,6 +428,11 @@ if shutil.which("ffmpeg"):
     print("ffmpeg available on PATH.")
 else:
     print("Warning: ffmpeg not found on PATH. MP4 recording requires ffmpeg.")
+
+if shutil.which("v4l2-ctl"):
+    print("v4l2-ctl available on PATH.")
+else:
+    print("Warning: v4l2-ctl not found on PATH. Thermal camera diagnostics work better with v4l-utils installed.")
 
 print("Main env smoke checks passed.")
 PY

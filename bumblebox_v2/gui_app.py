@@ -89,6 +89,11 @@ from .systemd_units import (
     run_systemd_action,
     write_systemd_units,
 )
+from .thermal_camera import (
+    apply_detected_thermal_config,
+    format_thermal_check_result,
+    run_thermal_check,
+)
 
 OCEAN_SLATE_PALETTE = {
     "app_bg": "#2B3A42",
@@ -156,6 +161,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._fps_camera_reset_error: str | None = None
         self._fps_camera_reset_result = None
         self._fps_camera_reset_source: str | None = None
+        self._thermal_check_result = None
         self._config_form_canvas: tk.Canvas | None = None
         self._config_form_window: int | None = None
         self._theme_knob: tk.Scale | None = None
@@ -1714,6 +1720,49 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Button(actions, text="Run Full Setup Check (A then B)", command=self._run_full_camera_setup_check).pack(
             side=tk.LEFT, padx=8
         )
+
+        thermal = ttk.LabelFrame(top, text="Step C: Thermal Camera Check", padding=8)
+        thermal.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(
+            thermal,
+            text=(
+                "Checks the attached PureThermal/Lepton board separately from the HQ camera, verifies a stable "
+                "device path, and confirms raw Y16 access for radiometric-style capture."
+            ),
+            wraplength=860,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Label(
+            thermal,
+            text=(
+                "If the check fully passes, 'Apply Detected Thermal Settings' writes the recommended stable path "
+                "and Y16 settings into your active config."
+            ),
+            wraplength=860,
+            justify=tk.LEFT,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        thermal_actions = ttk.Frame(thermal)
+        thermal_actions.grid(row=2, column=0, columnspan=3, sticky="w")
+        ttk.Button(
+            thermal_actions,
+            text="Run Thermal Check",
+            command=self._run_thermal_check_setup,
+        ).pack(side=tk.LEFT)
+        self.thermal_apply_button = ttk.Button(
+            thermal_actions,
+            text="Apply Detected Thermal Settings",
+            command=self._apply_detected_thermal_settings_setup,
+            state=tk.DISABLED,
+        )
+        self.thermal_apply_button.pack(side=tk.LEFT, padx=8)
+        self._make_help_button(
+            thermal_actions,
+            title="Thermal Camera Check",
+            details=(
+                "A fully passing thermal check must identify a stable /dev/v4l/by-id path and successfully read an "
+                "explicit Y16 frame with a usable raw 16-bit layout. Only then should the thermal settings be applied."
+            ),
+        ).pack(side=tk.LEFT)
 
         top.columnconfigure(0, weight=1)
         top.columnconfigure(1, weight=1)
@@ -5477,6 +5526,71 @@ class BumbleBoxV2GUI(tk.Tk):
             self.notebook.select(self.camera_setup_tab)
         except Exception as exc:
             self._show_error("Full camera setup check failed", str(exc))
+
+    def _run_thermal_check_setup(self) -> None:
+        try:
+            config, _ = self._load_effective_action_config()
+            self.camera_setup_output.delete("1.0", tk.END)
+            self.camera_setup_output.insert(
+                tk.END,
+                "Running thermal camera check against the current Config Editor snapshot.\n",
+            )
+            self.update_idletasks()
+            result = run_thermal_check(config=config)
+            self._thermal_check_result = result
+            self.camera_setup_output.delete("1.0", tk.END)
+            self.camera_setup_output.insert(tk.END, format_thermal_check_result(result))
+            if self._thermal_check_can_apply():
+                self.thermal_apply_button.configure(state=tk.NORMAL)
+                self.camera_setup_output.insert(
+                    tk.END,
+                    "\n\nThermal apply is available. Click 'Apply Detected Thermal Settings' to write the stable "
+                    "path and Y16 settings into config.",
+                )
+            else:
+                self.thermal_apply_button.configure(state=tk.DISABLED)
+            self.notebook.select(self.camera_setup_tab)
+        except Exception as exc:
+            self.thermal_apply_button.configure(state=tk.DISABLED)
+            self._show_error("Thermal check failed", str(exc))
+
+    def _thermal_check_can_apply(self) -> bool:
+        if self._thermal_check_result is None:
+            return False
+        try:
+            apply_detected_thermal_config(load_defaults(), self._thermal_check_result)
+            return True
+        except Exception:
+            return False
+
+    def _apply_detected_thermal_settings_setup(self) -> None:
+        if self._thermal_check_result is None:
+            self._show_error("Apply thermal settings failed", "Run Thermal Check first.")
+            return
+        try:
+            config, config_path = self._load_effective_action_config()
+            updated = apply_detected_thermal_config(config, self._thermal_check_result)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                updated,
+                reason="thermal_check_apply",
+            )
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            self.camera_setup_output.delete("1.0", tk.END)
+            self.camera_setup_output.insert(
+                tk.END,
+                (
+                    "Applied detected thermal settings to config.\n"
+                    f"Config path: {config_path}\n"
+                    f"thermal.device_path: {updated.get('thermal', {}).get('device_path')}\n"
+                    f"thermal.pixel_format: {updated.get('thermal', {}).get('pixel_format')}\n"
+                    f"thermal.enabled: {updated.get('thermal', {}).get('enabled')}"
+                    + (f"\n{history_note}" if history_note else "")
+                ),
+            )
+            self.notebook.select(self.camera_setup_tab)
+        except Exception as exc:
+            self._show_error("Apply thermal settings failed", str(exc))
 
     def _run_camera_preview_subprocess(
         self,

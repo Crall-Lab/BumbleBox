@@ -90,9 +90,13 @@ from .systemd_units import (
     write_systemd_units,
 )
 from .thermal_camera import (
+    apply_detected_thermal_config,
+    capture_thermal_snapshot,
     format_thermal_check_result,
+    format_thermal_snapshot_result,
     run_thermal_check,
     write_thermal_check_json,
+    write_thermal_snapshot_json,
 )
 
 
@@ -483,6 +487,18 @@ def _cmd_thermal_check(args: argparse.Namespace) -> int:
 
     print(format_thermal_check_result(result))
 
+    if args.apply:
+        try:
+            updated = apply_detected_thermal_config(config, result)
+            save_config(config_path, updated)
+            print(f"\nApplied detected thermal settings to: {config_path}")
+            print(f"  thermal.enabled = true")
+            print(f"  thermal.device_path = {updated.get('thermal', {}).get('device_path')}")
+            print(f"  thermal.pixel_format = {updated.get('thermal', {}).get('pixel_format')}")
+        except Exception as exc:
+            print(f"\nThermal check completed, but apply failed: {exc}")
+            return 1
+
     if args.json_out:
         try:
             path = write_thermal_check_json(result, args.json_out)
@@ -491,6 +507,38 @@ def _cmd_thermal_check(args: argparse.Namespace) -> int:
             print(f"Thermal check completed, but failed to write JSON report: {exc}")
             return 1
     return 1 if result.errors else 0
+
+
+def _cmd_thermal_snapshot(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    try:
+        result = capture_thermal_snapshot(
+            config=config,
+            device_override=args.device,
+            width_override=args.width,
+            height_override=args.height,
+            output_dir=args.output_dir,
+        )
+    except Exception as exc:
+        print(f"Thermal snapshot failed: {exc}")
+        return 1
+
+    print(format_thermal_snapshot_result(result))
+
+    if args.json_out:
+        try:
+            path = write_thermal_snapshot_json(result, args.json_out)
+            print(f"\nJSON report saved: {path}")
+        except Exception as exc:
+            print(f"Thermal snapshot completed, but failed to write JSON report: {exc}")
+            return 1
+    return 0
 
 
 def _cmd_calibrate_manual(args: argparse.Namespace) -> int:
@@ -1395,8 +1443,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     thermal_parser.add_argument("--width", type=int, help="Optional probe width override.")
     thermal_parser.add_argument("--height", type=int, help="Optional probe height override.")
+    thermal_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="If the thermal check fully passes, write the detected stable path and Y16 settings into config.",
+    )
     thermal_parser.add_argument("--json-out", help="Optional path to save JSON report.")
     thermal_parser.set_defaults(func=_cmd_thermal_check)
+
+    thermal_snapshot_parser = subparsers.add_parser(
+        "thermal-snapshot",
+        help=(
+            "Capture one raw thermal frame from the selected PureThermal/Lepton device, save the raw 16-bit data, "
+            "a 16-bit PNG, a preview PNG, and metadata."
+        ),
+    )
+    _add_common_config_arg(thermal_snapshot_parser)
+    thermal_snapshot_parser.add_argument(
+        "--device",
+        help="Optional explicit thermal device path (example: /dev/video8). Overrides thermal.device_path.",
+    )
+    thermal_snapshot_parser.add_argument("--width", type=int, help="Optional capture width override.")
+    thermal_snapshot_parser.add_argument("--height", type=int, help="Optional capture height override.")
+    thermal_snapshot_parser.add_argument(
+        "--output-dir",
+        help="Optional output directory. Defaults to <system.data_root>/<date>/thermal.",
+    )
+    thermal_snapshot_parser.add_argument("--json-out", help="Optional path to save JSON report.")
+    thermal_snapshot_parser.set_defaults(func=_cmd_thermal_snapshot)
 
     run_once_parser = subparsers.add_parser(
         "run-once",

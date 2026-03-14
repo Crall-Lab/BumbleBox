@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from datetime import datetime
 import json
 import re
 import shutil
@@ -55,6 +57,23 @@ class ThermalCheckResult:
     y16_raw16_layout: Optional[str]
     warnings: List[str]
     errors: List[str]
+
+
+@dataclass
+class ThermalSnapshotResult:
+    selected_device: str
+    selected_recommended_path: str
+    requested_width: int
+    requested_height: int
+    raw16_layout: str
+    raw16_dtype: str
+    raw16_shape: str
+    raw_npy_path: str
+    raw_png16_path: str
+    preview_png_path: str
+    metadata_json_path: str
+    min_value: int
+    max_value: int
 
 
 def _run_command(command: List[str]) -> tuple[bool, str]:
@@ -246,6 +265,7 @@ def _probe_capture(
             "frame_shape": frame_shape,
             "frame_dtype": frame_dtype,
             "raw16_layout": raw16_layout,
+            "frame": frame if frame_read else None,
             "error": None if frame_read else "Thermal device opened, but no frame was read.",
         }
     finally:
@@ -346,6 +366,16 @@ def _select_device(devices: List[ThermalDevice], preferred_device: str | None) -
         if device.is_candidate:
             return device
     return devices[0] if devices else None
+
+
+def resolve_thermal_device_path(config: Dict[str, Any], device_override: str | None = None) -> Optional[str]:
+    devices = discover_thermal_devices()
+    selected = _select_device(devices, preferred_device=_preferred_thermal_device(config, device_override))
+    if selected is None:
+        return None
+    if device_override:
+        return str(device_override).strip()
+    return selected.recommended_path or selected.device_path
 
 
 def run_thermal_check(
@@ -477,6 +507,181 @@ def run_thermal_check(
     )
 
 
+def selected_device_from_result(result: ThermalCheckResult) -> Optional[ThermalDevice]:
+    for device in result.devices:
+        if device.device_path == result.selected_device:
+            return device
+    return None
+
+
+def validate_thermal_check_for_apply(result: ThermalCheckResult) -> None:
+    selected = selected_device_from_result(result)
+    if result.errors:
+        raise RuntimeError("Thermal check reported errors; fix those before applying thermal settings.")
+    if selected is None:
+        raise RuntimeError("Thermal check did not identify a selected device.")
+    if not selected.is_candidate:
+        raise RuntimeError("Selected device does not look like a PureThermal/Lepton candidate.")
+    if not result.selected_recommended_path:
+        raise RuntimeError("Thermal check did not produce a recommended stable device path.")
+    if not result.y16_probe_attempted:
+        raise RuntimeError("Thermal check did not attempt an explicit Y16 probe.")
+    if not result.y16_probe_opened or not result.y16_probe_frame_read:
+        raise RuntimeError("Thermal check did not successfully capture a frame with the explicit Y16 probe.")
+    if result.y16_raw16_layout not in {"uint16_mono16", "uint8_2ch_packed16"}:
+        raise RuntimeError(
+            "Thermal check did not produce a usable raw 16-bit layout. "
+            "Expected uint16_mono16 or uint8_2ch_packed16."
+        )
+
+
+def apply_detected_thermal_config(
+    config: Dict[str, Any],
+    result: ThermalCheckResult,
+) -> Dict[str, Any]:
+    validate_thermal_check_for_apply(result)
+    selected = selected_device_from_result(result)
+    if selected is None:
+        raise RuntimeError("Thermal check did not identify a selected device.")
+
+    updated = deepcopy(config)
+    thermal = updated.setdefault("thermal", {})
+    if not isinstance(thermal, dict):
+        raise RuntimeError("Config thermal section is malformed.")
+
+    thermal["enabled"] = True
+    thermal["device_path"] = str(result.selected_recommended_path).strip()
+    thermal["width"] = int(result.requested_width)
+    thermal["height"] = int(result.requested_height)
+    thermal["pixel_format"] = "y16"
+
+    existing_fps = thermal.get("fps_target", 8.7)
+    try:
+        thermal["fps_target"] = float(existing_fps)
+    except Exception:
+        thermal["fps_target"] = 8.7
+
+    expected_name = "PureThermal"
+    for candidate_text in (selected.label, selected.model, selected.vendor):
+        text = str(candidate_text or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if "purethermal" in lowered:
+            expected_name = "PureThermal"
+            break
+        if "lepton" in lowered:
+            expected_name = text
+            break
+    thermal["expected_name"] = expected_name
+    return updated
+
+
+def _decode_raw16_frame(frame: Any, raw16_layout: str) -> Any:
+    if raw16_layout == "uint16_mono16":
+        return frame.copy()
+    if raw16_layout == "uint8_2ch_packed16":
+        packed = frame.copy()
+        return packed.view("<u2").reshape(packed.shape[0], packed.shape[1])
+    raise ValueError(f"Unsupported raw16 layout: {raw16_layout}")
+
+
+def capture_thermal_snapshot(
+    config: Dict[str, Any],
+    *,
+    device_override: str | None = None,
+    width_override: int | None = None,
+    height_override: int | None = None,
+    output_dir: str | Path | None = None,
+) -> ThermalSnapshotResult:
+    thermal = _config_thermal(config)
+    requested_width = int(width_override or thermal.get("width", 160))
+    requested_height = int(height_override or thermal.get("height", 120))
+    preferred_device = _preferred_thermal_device(config, device_override=device_override)
+    devices = discover_thermal_devices()
+    selected = _select_device(devices, preferred_device=preferred_device)
+    if selected is None:
+        raise RuntimeError("No V4L2 video device was found for the thermal camera.")
+
+    capture_path = str(device_override).strip() if device_override else (selected.recommended_path or selected.device_path)
+    if selected.supports_y16:
+        _set_v4l2_y16_format(capture_path, requested_width, requested_height)
+    probe = _probe_capture(
+        device_path=capture_path,
+        width=requested_width,
+        height=requested_height,
+        request_fourcc="Y16 " if selected.supports_y16 else None,
+    )
+    if not probe["opened"]:
+        raise RuntimeError(probe["error"] or f"Could not open thermal device: {capture_path}")
+    if not probe["frame_read"] or probe["frame"] is None:
+        raise RuntimeError(probe["error"] or "Thermal device opened, but no frame was read.")
+    raw16_layout = probe["raw16_layout"]
+    if not raw16_layout:
+        raise RuntimeError(
+            "Thermal snapshot did not yield a raw 16-bit layout. "
+            "Re-run thermal-check and inspect the explicit Y16 probe section."
+        )
+
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:
+        raise RuntimeError(f"OpenCV/numpy are required for thermal snapshot saving: {exc}") from exc
+
+    raw16 = _decode_raw16_frame(probe["frame"], raw16_layout)
+    date_root = Path(config.get("system", {}).get("data_root", ".")).expanduser()
+    if output_dir is None:
+        output_root = date_root / datetime.now().strftime("%Y-%m-%d") / "thermal"
+    else:
+        output_root = Path(output_dir).expanduser()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    raw_npy_path = output_root / f"{stamp}_thermal_raw16.npy"
+    raw_png16_path = output_root / f"{stamp}_thermal_raw16.png"
+    preview_png_path = output_root / f"{stamp}_thermal_preview.png"
+    metadata_json_path = output_root / f"{stamp}_thermal_snapshot.json"
+
+    np.save(raw_npy_path, raw16)
+    if not cv2.imwrite(str(raw_png16_path), raw16):
+        raise RuntimeError(f"Failed to write 16-bit thermal PNG: {raw_png16_path}")
+    preview8 = cv2.normalize(raw16, None, 0, 255, cv2.NORM_MINMAX).astype("uint8")
+    preview_color = cv2.applyColorMap(preview8, cv2.COLORMAP_INFERNO)
+    if not cv2.imwrite(str(preview_png_path), preview_color):
+        raise RuntimeError(f"Failed to write thermal preview PNG: {preview_png_path}")
+
+    metadata = {
+        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "selected_device": selected.device_path,
+        "selected_recommended_path": capture_path,
+        "requested_width": requested_width,
+        "requested_height": requested_height,
+        "raw16_layout": raw16_layout,
+        "raw16_dtype": str(raw16.dtype),
+        "raw16_shape": list(raw16.shape),
+        "min_value": int(raw16.min()),
+        "max_value": int(raw16.max()),
+    }
+    metadata_json_path.write_text(json.dumps(metadata, indent=2))
+
+    return ThermalSnapshotResult(
+        selected_device=selected.device_path,
+        selected_recommended_path=capture_path,
+        requested_width=requested_width,
+        requested_height=requested_height,
+        raw16_layout=raw16_layout,
+        raw16_dtype=str(raw16.dtype),
+        raw16_shape="x".join(str(part) for part in raw16.shape),
+        raw_npy_path=str(raw_npy_path),
+        raw_png16_path=str(raw_png16_path),
+        preview_png_path=str(preview_png_path),
+        metadata_json_path=str(metadata_json_path),
+        min_value=int(raw16.min()),
+        max_value=int(raw16.max()),
+    )
+
+
 def format_thermal_check_result(result: ThermalCheckResult) -> str:
     lines = [
         "Thermal Camera Check",
@@ -561,7 +766,34 @@ def format_thermal_check_result(result: ThermalCheckResult) -> str:
     return "\n".join(lines)
 
 
+def format_thermal_snapshot_result(result: ThermalSnapshotResult) -> str:
+    return "\n".join(
+        [
+            "Thermal Snapshot",
+            "----------------",
+            f"Selected device: {result.selected_device}",
+            f"Capture path used: {result.selected_recommended_path}",
+            f"Requested size: {result.requested_width}x{result.requested_height}",
+            f"Raw layout: {result.raw16_layout}",
+            f"Raw dtype: {result.raw16_dtype}",
+            f"Raw shape: {result.raw16_shape}",
+            f"Min/Max value: {result.min_value} / {result.max_value}",
+            f"Raw NPY: {result.raw_npy_path}",
+            f"Raw 16-bit PNG: {result.raw_png16_path}",
+            f"Preview PNG: {result.preview_png_path}",
+            f"Metadata JSON: {result.metadata_json_path}",
+        ]
+    )
+
+
 def write_thermal_check_json(result: ThermalCheckResult, output_path: str | Path) -> Path:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(result), indent=2))
+    return path
+
+
+def write_thermal_snapshot_json(result: ThermalSnapshotResult, output_path: str | Path) -> Path:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(result), indent=2))
