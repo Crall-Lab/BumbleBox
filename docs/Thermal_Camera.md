@@ -17,6 +17,8 @@ Implemented now:
 - first-pass synchronized RGB + thermal recording in normal BumbleBox runs when `thermal.enabled: true`
   - RGB recording/tracking remains the primary pipeline
   - thermal outputs are saved alongside the RGB session with shared session naming and separate timestamp CSVs
+  - an automatic side-by-side RGB + thermal inspection video is also written
+  - thermal is upscaled with nearest-neighbor duplication so the pixel grid remains honest for inspection
 
 ```bash
 /Users/aec/Desktop/BumbleBox/bbx thermal-check
@@ -111,6 +113,7 @@ Notes:
 - shared session timing for RGB and thermal frames
 - separate timestamp CSVs for each stream
 - saved RGB outputs plus thermal raw stack / preview outputs
+- automatic side-by-side inspection video and midpoint PNG
 - tracking still runs from RGB only in this first pass
 
 ### Phase 4: pre-colony alignment

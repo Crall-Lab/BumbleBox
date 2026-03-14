@@ -83,6 +83,7 @@ sudo apt install python3-pyqt5 labelme
 - camera stack checks for HQ/Module3 workflows
 - USB thermal camera discovery/probe/snapshot path for PureThermal/Lepton-style devices (`thermal-check`, `thermal-snapshot`)
 - First-pass synchronized RGB + thermal recording when `thermal.enabled=true`
+- Automatic RGB + thermal side-by-side inspection video for synchronized thermal runs
 - camera setup tools for focus/framing and live tag-detection validation (`camera-preview`, `camera-test-tracking`)
 - explicit camera tuning selection: auto-resolve by camera model + IR/NoIR flag (Pi4 `vc4` / Pi5 `pisp`) with manual override via `camera.tuning_file`
 - flexible mode model (`record_only`, `track_only`, `record_and_track`, `mixed_schedule`)

@@ -47,6 +47,8 @@ class RunSummary:
     thermal_preview_video_path: Optional[str]
     thermal_preview_png_path: Optional[str]
     thermal_metadata_json_path: Optional[str]
+    thermal_side_by_side_video_path: Optional[str]
+    thermal_side_by_side_png_path: Optional[str]
     raw_csv_path: Optional[str]
     noid_csv_path: Optional[str]
     cleaned_csv_path: Optional[str]
@@ -97,6 +99,13 @@ class ThermalRecordingArtifacts:
     preview_video_path: Path
     preview_png_path: Optional[Path]
     metadata_json_path: Path
+
+
+@dataclass
+class ThermalSideBySideArtifacts:
+    frame_count: int
+    video_path: Path
+    midpoint_png_path: Optional[Path]
 
 
 def _now_iso() -> str:
@@ -598,7 +607,6 @@ def _capture_rgb_and_optional_thermal(
 
     fps = float(config["camera"]["fps_target"])
     duration = float(config["capture"]["recording_seconds"])
-    start_monotonic = time.perf_counter() + 0.20
 
     rgb_result: dict[str, Any] = {}
     thermal_result: dict[str, Any] = {}
@@ -642,6 +650,9 @@ def _capture_rgb_and_optional_thermal(
 
     with _PicameraCaptureSession(config) as rgb_session, _ThermalCaptureSession(config) as thermal_session:
         rgb_session.start()
+        # Choose the shared session start only after RGB warmup completes; otherwise both loops start late
+        # and then "catch up", which inflates the measured synchronized FPS.
+        start_monotonic = time.perf_counter() + 0.20
         rgb_thread = threading.Thread(target=rgb_worker, args=(rgb_session,), daemon=True)
         thermal_thread = threading.Thread(target=thermal_worker, args=(thermal_session,), daemon=True)
         rgb_thread.start()
@@ -749,6 +760,103 @@ def _write_thermal_recording_outputs(
         preview_video_path=preview_video_path,
         preview_png_path=preview_png_path,
         metadata_json_path=metadata_json_path,
+    )
+
+
+def _draw_preview_label(image: Any, text: str) -> Any:
+    try:
+        import cv2
+    except Exception:
+        return image
+
+    height = int(image.shape[0]) if getattr(image, "shape", None) is not None else 0
+    font_scale = max(0.7, min(2.0, float(height) / 1400.0))
+    thickness = max(1, int(round(font_scale * 2)))
+    origin = (18, max(28, int(round(42 * font_scale))))
+    cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+    cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    return image
+
+
+def _write_rgb_thermal_side_by_side_outputs(
+    *,
+    session_dir: Path,
+    session_name: str,
+    rgb_frames: List[Any],
+    rgb_timestamps: List[float],
+    thermal_frames: List[Any],
+    thermal_timestamps: List[float],
+    fps: float,
+) -> ThermalSideBySideArtifacts:
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:  # pragma: no cover - dependency/runtime
+        raise RuntimeError(f"OpenCV/numpy are required for RGB+thermal comparison outputs: {exc}") from exc
+
+    frame_count = min(len(rgb_frames), len(thermal_frames))
+    if frame_count <= 0:
+        raise RuntimeError("No overlapping RGB/thermal frames were available for side-by-side output.")
+
+    first_rgb = _frame_to_bgr(rgb_frames[0])
+    rgb_height, rgb_width = int(first_rgb.shape[0]), int(first_rgb.shape[1])
+    thermal_height, thermal_width = int(thermal_frames[0].shape[0]), int(thermal_frames[0].shape[1])
+    scaled_thermal_width = max(1, int(round(float(rgb_height) * float(thermal_width) / float(max(1, thermal_height)))))
+
+    global_min = int(min(int(frame.min()) for frame in thermal_frames[:frame_count]))
+    global_max = int(max(int(frame.max()) for frame in thermal_frames[:frame_count]))
+    range_value = max(1, global_max - global_min)
+
+    video_path = session_dir / f"{session_name}_rgb_thermal_side_by_side.avi"
+    writer = cv2.VideoWriter(
+        str(video_path),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        float(fps if fps > 0 else 1.0),
+        (rgb_width + scaled_thermal_width, rgb_height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open RGB+thermal side-by-side writer for {video_path}")
+
+    midpoint_png_path: Optional[Path] = None
+    midpoint_idx = max(0, min(frame_count - 1, frame_count // 2))
+    try:
+        for idx in range(frame_count):
+            rgb_bgr = _frame_to_bgr(rgb_frames[idx])
+            thermal_raw = thermal_frames[idx]
+            thermal_8 = (
+                ((thermal_raw.astype(np.float32) - float(global_min)) * (255.0 / float(range_value)))
+                .clip(0, 255)
+                .astype(np.uint8)
+            )
+            thermal_color = cv2.applyColorMap(thermal_8, cv2.COLORMAP_INFERNO)
+            thermal_scaled = cv2.resize(
+                thermal_color,
+                (scaled_thermal_width, rgb_height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+            rgb_time = rgb_timestamps[idx] if idx < len(rgb_timestamps) else float(idx) / max(float(fps), 1e-6)
+            thermal_time = (
+                thermal_timestamps[idx]
+                if idx < len(thermal_timestamps)
+                else float(idx) / max(float(fps), 1e-6)
+            )
+            delta_text = f" dt={thermal_time - rgb_time:+.3f}s"
+            rgb_bgr = _draw_preview_label(rgb_bgr, f"RGB #{idx} t={rgb_time:.3f}s")
+            thermal_scaled = _draw_preview_label(thermal_scaled, f"Thermal #{idx} t={thermal_time:.3f}s{delta_text}")
+
+            combined = np.concatenate([rgb_bgr, thermal_scaled], axis=1)
+            writer.write(combined)
+            if idx == midpoint_idx:
+                midpoint_png_path = session_dir / f"{session_name}_rgb_thermal_side_by_side_midframe.png"
+                cv2.imwrite(str(midpoint_png_path), combined)
+    finally:
+        writer.release()
+
+    return ThermalSideBySideArtifacts(
+        frame_count=frame_count,
+        video_path=video_path,
+        midpoint_png_path=midpoint_png_path,
     )
 
 
@@ -1540,6 +1648,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     recording_preview_png_path: Optional[Path] = None
     timestamp_path: Optional[Path] = None
     thermal_artifacts: Optional[ThermalRecordingArtifacts] = None
+    thermal_side_by_side_artifacts: Optional[ThermalSideBySideArtifacts] = None
     raw_csv: Optional[Path] = None
     noid_csv: Optional[Path] = None
     cleaned_csv: Optional[Path] = None
@@ -1584,9 +1693,22 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                             "RGB and thermal actual FPS differed during synchronized recording "
                             f"({actual_fps:.3f} RGB vs {thermal_artifacts.actual_fps:.3f} thermal)."
                         )
+                    try:
+                        thermal_side_by_side_artifacts = _write_rgb_thermal_side_by_side_outputs(
+                            session_dir=session_dir,
+                            session_name=session_name,
+                            rgb_frames=frames,
+                            rgb_timestamps=timestamps,
+                            thermal_frames=list(thermal_capture["frames"]),
+                            thermal_timestamps=list(thermal_capture["timestamps"]),
+                            fps=float(actual_fps if actual_fps > 0 else config["camera"]["fps_target"]),
+                        )
+                    except Exception as exc:
+                        warnings.append(f"RGB+thermal side-by-side preview write failed: {exc}")
                     del thermal_capture["frames"]
                 else:
                     thermal_artifacts = None
+                    thermal_side_by_side_artifacts = None
             else:
                 frames, timestamps, actual_fps = _capture_frames(config)
                 if should_track and _thermal_enabled_for_recording(config) and not should_record:
@@ -1690,6 +1812,16 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         thermal_preview_video_path=(str(thermal_artifacts.preview_video_path) if thermal_artifacts else None),
         thermal_preview_png_path=(str(thermal_artifacts.preview_png_path) if thermal_artifacts and thermal_artifacts.preview_png_path else None),
         thermal_metadata_json_path=(str(thermal_artifacts.metadata_json_path) if thermal_artifacts else None),
+        thermal_side_by_side_video_path=(
+            str(thermal_side_by_side_artifacts.video_path)
+            if thermal_side_by_side_artifacts
+            else None
+        ),
+        thermal_side_by_side_png_path=(
+            str(thermal_side_by_side_artifacts.midpoint_png_path)
+            if thermal_side_by_side_artifacts and thermal_side_by_side_artifacts.midpoint_png_path
+            else None
+        ),
         raw_csv_path=str(raw_csv) if raw_csv else None,
         noid_csv_path=str(noid_csv) if noid_csv else None,
         cleaned_csv_path=str(cleaned_csv) if cleaned_csv else None,
@@ -1728,6 +1860,8 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Thermal preview video: {summary.thermal_preview_video_path or 'none'}",
         f"Thermal midpoint PNG: {summary.thermal_preview_png_path or 'none'}",
         f"Thermal metadata JSON: {summary.thermal_metadata_json_path or 'none'}",
+        f"RGB+thermal side-by-side video: {summary.thermal_side_by_side_video_path or 'none'}",
+        f"RGB+thermal side-by-side PNG: {summary.thermal_side_by_side_png_path or 'none'}",
         f"Raw CSV: {summary.raw_csv_path or 'none'}",
         f"NoID CSV: {summary.noid_csv_path or 'none'}",
         f"Cleaned CSV: {summary.cleaned_csv_path or 'none'}",
