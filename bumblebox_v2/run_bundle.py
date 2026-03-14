@@ -273,7 +273,7 @@ def export_run_bundle(
             )
 
     if include_all_session_files and session_dir.exists():
-        for path in sorted(session_dir.glob(f"{session_name}*")):
+        for path in sorted(session_dir.iterdir()):
             if not path.is_file():
                 continue
             resolved = path.resolve()

@@ -19,6 +19,8 @@ from .tuning import resolve_camera_tuning_file
 CAMERA_REOPEN_RETRY_ATTEMPTS = 3
 CAMERA_REOPEN_RETRY_DELAY_SECONDS = 0.75
 CAMERA_RELEASE_SETTLE_SECONDS = 0.75
+SYNC_CAPTURE_START_DELAY_SECONDS = 0.20
+SYNC_CAPTURE_FLUSH_FRAMES = 4
 
 
 @dataclass
@@ -176,7 +178,9 @@ def _make_session_paths(config: Dict[str, Any]) -> Tuple[str, Path]:
     data_root = Path(config["system"]["data_root"])
     day_dir = data_root / datetime.now().strftime("%Y-%m-%d")
     day_dir.mkdir(parents=True, exist_ok=True)
-    return session_name, day_dir
+    session_dir = day_dir / session_name
+    session_dir.mkdir(parents=True, exist_ok=True)
+    return session_name, session_dir
 
 
 def _write_timestamps(timestamps: List[float], session_dir: Path, session_name: str) -> Path:
@@ -427,6 +431,24 @@ def _thermal_enabled_for_recording(config: Dict[str, Any]) -> bool:
     return isinstance(thermal, dict) and bool(thermal.get("enabled", False))
 
 
+def _flush_rgb_capture_queue(picam2: Any, frame_count: int) -> None:
+    for _ in range(max(0, int(frame_count))):
+        try:
+            picam2.capture_array()
+        except Exception:
+            break
+
+
+def _flush_thermal_capture_queue(capture: Any, frame_count: int) -> None:
+    for _ in range(max(0, int(frame_count))):
+        try:
+            ok, _frame = capture.read()
+        except Exception:
+            break
+        if not ok:
+            break
+
+
 def _infer_thermal_raw16_layout(frame: Any) -> Optional[str]:
     shape = getattr(frame, "shape", None)
     dtype = str(getattr(frame, "dtype", ""))
@@ -648,17 +670,20 @@ def _capture_rgb_and_optional_thermal(
         except Exception as exc:
             errors.append(f"Thermal synchronized capture failed: {exc}")
 
-    with _PicameraCaptureSession(config) as rgb_session, _ThermalCaptureSession(config) as thermal_session:
+    with _PicameraCaptureSession(config) as rgb_session:
         rgb_session.start()
-        # Choose the shared session start only after RGB warmup completes; otherwise both loops start late
-        # and then "catch up", which inflates the measured synchronized FPS.
-        start_monotonic = time.perf_counter() + 0.20
-        rgb_thread = threading.Thread(target=rgb_worker, args=(rgb_session,), daemon=True)
-        thermal_thread = threading.Thread(target=thermal_worker, args=(thermal_session,), daemon=True)
-        rgb_thread.start()
-        thermal_thread.start()
-        rgb_thread.join()
-        thermal_thread.join()
+        with _ThermalCaptureSession(config) as thermal_session:
+            # Flush queued frames immediately before the shared start so both streams begin from current data
+            # instead of buffered warmup frames.
+            _flush_rgb_capture_queue(rgb_session.picam2, SYNC_CAPTURE_FLUSH_FRAMES)
+            _flush_thermal_capture_queue(thermal_session.capture, SYNC_CAPTURE_FLUSH_FRAMES)
+            start_monotonic = time.perf_counter() + SYNC_CAPTURE_START_DELAY_SECONDS
+            rgb_thread = threading.Thread(target=rgb_worker, args=(rgb_session,), daemon=True)
+            thermal_thread = threading.Thread(target=thermal_worker, args=(thermal_session,), daemon=True)
+            rgb_thread.start()
+            thermal_thread.start()
+            rgb_thread.join()
+            thermal_thread.join()
 
     if errors:
         raise RuntimeError(" | ".join(errors))
@@ -794,7 +819,27 @@ def _write_rgb_thermal_side_by_side_outputs(
     except Exception as exc:  # pragma: no cover - dependency/runtime
         raise RuntimeError(f"OpenCV/numpy are required for RGB+thermal comparison outputs: {exc}") from exc
 
-    frame_count = min(len(rgb_frames), len(thermal_frames))
+    if not rgb_frames or not thermal_frames:
+        raise RuntimeError("No overlapping RGB/thermal frames were available for side-by-side output.")
+
+    thermal_times = list(thermal_timestamps)
+    if not thermal_times:
+        thermal_times = [float(i) / max(float(fps), 1e-6) for i in range(len(thermal_frames))]
+    rgb_times = list(rgb_timestamps)
+    if not rgb_times:
+        rgb_times = [float(i) / max(float(fps), 1e-6) for i in range(len(rgb_frames))]
+
+    matched_pairs: List[tuple[int, int, float, float]] = []
+    thermal_idx = 0
+    for rgb_idx, rgb_time in enumerate(rgb_times[: len(rgb_frames)]):
+        while (
+            thermal_idx + 1 < len(thermal_frames)
+            and abs(thermal_times[thermal_idx + 1] - rgb_time) <= abs(thermal_times[thermal_idx] - rgb_time)
+        ):
+            thermal_idx += 1
+        matched_pairs.append((rgb_idx, thermal_idx, rgb_time, thermal_times[thermal_idx]))
+
+    frame_count = len(matched_pairs)
     if frame_count <= 0:
         raise RuntimeError("No overlapping RGB/thermal frames were available for side-by-side output.")
 
@@ -820,9 +865,9 @@ def _write_rgb_thermal_side_by_side_outputs(
     midpoint_png_path: Optional[Path] = None
     midpoint_idx = max(0, min(frame_count - 1, frame_count // 2))
     try:
-        for idx in range(frame_count):
-            rgb_bgr = _frame_to_bgr(rgb_frames[idx])
-            thermal_raw = thermal_frames[idx]
+        for pair_index, (rgb_idx, thermal_idx, rgb_time, thermal_time) in enumerate(matched_pairs):
+            rgb_bgr = _frame_to_bgr(rgb_frames[rgb_idx])
+            thermal_raw = thermal_frames[thermal_idx]
             thermal_8 = (
                 ((thermal_raw.astype(np.float32) - float(global_min)) * (255.0 / float(range_value)))
                 .clip(0, 255)
@@ -835,19 +880,16 @@ def _write_rgb_thermal_side_by_side_outputs(
                 interpolation=cv2.INTER_NEAREST,
             )
 
-            rgb_time = rgb_timestamps[idx] if idx < len(rgb_timestamps) else float(idx) / max(float(fps), 1e-6)
-            thermal_time = (
-                thermal_timestamps[idx]
-                if idx < len(thermal_timestamps)
-                else float(idx) / max(float(fps), 1e-6)
-            )
             delta_text = f" dt={thermal_time - rgb_time:+.3f}s"
-            rgb_bgr = _draw_preview_label(rgb_bgr, f"RGB #{idx} t={rgb_time:.3f}s")
-            thermal_scaled = _draw_preview_label(thermal_scaled, f"Thermal #{idx} t={thermal_time:.3f}s{delta_text}")
+            rgb_bgr = _draw_preview_label(rgb_bgr, f"RGB #{rgb_idx} t={rgb_time:.3f}s")
+            thermal_scaled = _draw_preview_label(
+                thermal_scaled,
+                f"Thermal #{thermal_idx} t={thermal_time:.3f}s{delta_text}",
+            )
 
             combined = np.concatenate([rgb_bgr, thermal_scaled], axis=1)
             writer.write(combined)
-            if idx == midpoint_idx:
+            if pair_index == midpoint_idx:
                 midpoint_png_path = session_dir / f"{session_name}_rgb_thermal_side_by_side_midframe.png"
                 cv2.imwrite(str(midpoint_png_path), combined)
     finally:
@@ -1148,8 +1190,15 @@ def record_live_test_clip(
         test_config["capture"]["recording_seconds"] = float(recording_seconds)
 
     requested_recording_seconds = float(test_config["capture"]["recording_seconds"])
-    session_name, session_dir = _make_session_paths(test_config)
-    session_name = f"{session_name}_fps_test"
+    base_session_name, base_session_dir = _make_session_paths(test_config)
+    session_name = f"{base_session_name}_fps_test"
+    session_dir = base_session_dir.parent / session_name
+    session_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if base_session_dir != session_dir and base_session_dir.exists() and not any(base_session_dir.iterdir()):
+            base_session_dir.rmdir()
+    except Exception:
+        pass
 
     frames, timestamps, actual_fps = _capture_frames(test_config)
     timestamp_path: Optional[Path] = None
