@@ -8,6 +8,8 @@ Implemented now:
 
 - config placeholders for a thermal device (`thermal.*`)
 - USB/V4L2 thermal discovery and probe command:
+- stable-path recommendation (`/dev/v4l/by-id/...` when available)
+- explicit Y16 probe reporting for raw/radiometric-style capture checks
 
 ```bash
 /Users/aec/Desktop/BumbleBox/bbx thermal-check
@@ -25,6 +27,15 @@ lsusb
 v4l2-ctl --list-devices
 /Users/aec/Desktop/BumbleBox/bbx thermal-check
 ```
+
+Look for these lines in the report:
+
+- `Recommended stable path: ...`
+- `Explicit Y16 probe frame read: yes`
+- `Y16 raw layout: uint16_mono16` or `uint8_2ch_packed16`
+
+If BumbleBox reports `uint8_2ch_packed16`, that is still likely usable raw data; it means the 16-bit payload is
+arriving as two 8-bit channels and must be reinterpreted in code rather than used as a pre-converted OpenCV image.
 
 If `v4l2-ctl` is missing:
 
