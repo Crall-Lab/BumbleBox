@@ -38,6 +38,7 @@ VALID_CAMERA_MODELS = {
 }
 VALID_PREVIEW_WINDOWS = {"QTGL", "QT", "DRM"}
 VALID_CAMERA_CODECS = {"mp4", "mjpeg"}
+VALID_THERMAL_PIXEL_FORMATS = {"auto", "y16", "gray8", "rgb"}
 VALID_UI_THEME_MODES = {"dark", "light"}
 SERVICE_USER_AUTO_SENTINELS = {"", "auto", "current", "default", "pi", "root"}
 
@@ -118,6 +119,7 @@ def validate_config(config: Dict[str, Any]) -> None:
         [
             "system",
             "camera",
+            "thermal",
             "pipeline",
             "capture",
             "tracking",
@@ -278,6 +280,41 @@ def validate_config(config: Dict[str, Any]) -> None:
     mp4_codec = str(config["camera"].get("mp4_codec", "libx264")).strip()
     if not mp4_codec:
         raise ConfigError("camera.mp4_codec must be a non-empty string")
+
+    thermal = config.get("thermal", {})
+    if not isinstance(thermal, dict):
+        raise ConfigError("thermal must be a mapping/object")
+
+    thermal_enabled = thermal.get("enabled", False)
+    if not isinstance(thermal_enabled, bool):
+        raise ConfigError("thermal.enabled must be true or false")
+
+    thermal_device_path = thermal.get("device_path", "auto")
+    if thermal_device_path is not None and not isinstance(thermal_device_path, str):
+        raise ConfigError("thermal.device_path must be null or a string path")
+
+    thermal_width = int(thermal.get("width", 160))
+    if thermal_width <= 0:
+        raise ConfigError("thermal.width must be > 0")
+
+    thermal_height = int(thermal.get("height", 120))
+    if thermal_height <= 0:
+        raise ConfigError("thermal.height must be > 0")
+
+    thermal_fps = float(thermal.get("fps_target", 8.7))
+    if thermal_fps <= 0:
+        raise ConfigError("thermal.fps_target must be > 0")
+
+    thermal_pixel_format = str(thermal.get("pixel_format", "auto")).strip().lower()
+    if thermal_pixel_format not in VALID_THERMAL_PIXEL_FORMATS:
+        raise ConfigError(
+            "thermal.pixel_format must be one of "
+            f"{sorted(VALID_THERMAL_PIXEL_FORMATS)}, got: {thermal_pixel_format}"
+        )
+
+    thermal_expected_name = thermal.get("expected_name", "PureThermal")
+    if thermal_expected_name is not None and not isinstance(thermal_expected_name, str):
+        raise ConfigError("thermal.expected_name must be null or a string")
 
     ram_override = config["system"].get("ram_gb_override")
     if ram_override not in (None, "", 0):

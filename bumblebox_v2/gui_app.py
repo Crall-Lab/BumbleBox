@@ -2217,20 +2217,23 @@ class BumbleBoxV2GUI(tk.Tk):
         container = ttk.Frame(self.config_tab)
         container.pack(fill=tk.BOTH, expand=True)
 
-        top_row = ttk.Frame(container)
-        top_row.pack(fill=tk.X, pady=(0, 8))
+        path_row = ttk.Frame(container)
+        path_row.pack(fill=tk.X, pady=(0, 4))
 
-        source_frame = ttk.Frame(top_row)
-        source_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        source_frame = ttk.Frame(path_row)
+        source_frame.pack(fill=tk.X, expand=False)
         ttk.Label(source_frame, text="Config path").grid(row=0, column=0, sticky="w")
-        self.config_path_display = ttk.Entry(source_frame, textvariable=self.config_path_var, width=82, state="readonly")
+        self.config_path_display = ttk.Entry(source_frame, textvariable=self.config_path_var, width=58, state="readonly")
         self.config_path_display.grid(row=0, column=1, sticky="ew", padx=8, pady=3)
         self.config_action_button = ttk.Button(source_frame, text="", command=self._handle_config_path_action)
         self.config_action_button.grid(row=0, column=2, sticky="w")
         source_frame.columnconfigure(1, weight=1)
 
-        top_buttons = ttk.Frame(top_row)
-        top_buttons.pack(side=tk.RIGHT, padx=(8, 0))
+        action_row = ttk.Frame(container)
+        action_row.pack(fill=tk.X, pady=(0, 8))
+
+        top_buttons = ttk.Frame(action_row)
+        top_buttons.pack(anchor="e")
         ttk.Button(top_buttons, text="Load From File", command=self._load_config_into_editor).pack(side=tk.LEFT)
         self._make_help_button(
             top_buttons,

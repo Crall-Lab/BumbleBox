@@ -89,6 +89,11 @@ from .systemd_units import (
     run_systemd_action,
     write_systemd_units,
 )
+from .thermal_camera import (
+    format_thermal_check_result,
+    run_thermal_check,
+    write_thermal_check_json,
+)
 
 
 def _load_or_defaults(config_path: Path):
@@ -455,6 +460,37 @@ def _cmd_fps_sweep(args: argparse.Namespace) -> int:
             print(f"FPS sweep completed, but failed to write JSON report: {exc}")
             return 1
     return 1 if report.has_errors else 0
+
+
+def _cmd_thermal_check(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    try:
+        result = run_thermal_check(
+            config=config,
+            device_override=args.device,
+            width_override=args.width,
+            height_override=args.height,
+        )
+    except Exception as exc:
+        print(f"Thermal check failed: {exc}")
+        return 1
+
+    print(format_thermal_check_result(result))
+
+    if args.json_out:
+        try:
+            path = write_thermal_check_json(result, args.json_out)
+            print(f"\nJSON report saved: {path}")
+        except Exception as exc:
+            print(f"Thermal check completed, but failed to write JSON report: {exc}")
+            return 1
+    return 1 if result.errors else 0
 
 
 def _cmd_calibrate_manual(args: argparse.Namespace) -> int:
@@ -1344,6 +1380,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fps_sweep_parser.add_argument("--json-out", help="Optional path to save JSON sweep report.")
     fps_sweep_parser.set_defaults(func=_cmd_fps_sweep)
+
+    thermal_parser = subparsers.add_parser(
+        "thermal-check",
+        help=(
+            "Discover USB/V4L2 thermal camera devices, identify likely PureThermal/Lepton candidates, "
+            "and run a basic OpenCV probe without touching the Pi HQ camera stack."
+        ),
+    )
+    _add_common_config_arg(thermal_parser)
+    thermal_parser.add_argument(
+        "--device",
+        help="Optional explicit thermal device path (example: /dev/video2). Overrides thermal.device_path.",
+    )
+    thermal_parser.add_argument("--width", type=int, help="Optional probe width override.")
+    thermal_parser.add_argument("--height", type=int, help="Optional probe height override.")
+    thermal_parser.add_argument("--json-out", help="Optional path to save JSON report.")
+    thermal_parser.set_defaults(func=_cmd_thermal_check)
 
     run_once_parser = subparsers.add_parser(
         "run-once",

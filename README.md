@@ -18,6 +18,7 @@ This repository now includes a V2 foundation that keeps BumbleBox flexibility wh
 bash /Users/aec/Desktop/BumbleBox/start_bumblebox.sh
 /Users/aec/Desktop/BumbleBox/bbx init
 /Users/aec/Desktop/BumbleBox/bbx doctor
+/Users/aec/Desktop/BumbleBox/bbx thermal-check
 /Users/aec/Desktop/BumbleBox/bbx camera-preview --seconds 20
 /Users/aec/Desktop/BumbleBox/bbx camera-test-tracking --seconds 20
 /Users/aec/Desktop/BumbleBox/bbx roadmap
@@ -78,6 +79,7 @@ sudo apt install python3-pyqt5 labelme
 
 - Pi 4/5 compatibility checks (`doctor`)
 - camera stack checks for HQ/Module3 workflows
+- USB thermal camera discovery/probe path for PureThermal/Lepton-style devices (`thermal-check`)
 - camera setup tools for focus/framing and live tag-detection validation (`camera-preview`, `camera-test-tracking`)
 - explicit camera tuning selection: auto-resolve by camera model + IR/NoIR flag (Pi4 `vc4` / Pi5 `pisp`) with manual override via `camera.tuning_file`
 - flexible mode model (`record_only`, `track_only`, `record_and_track`, `mixed_schedule`)
@@ -149,4 +151,5 @@ sudo apt install python3-pyqt5 labelme
 - `/Users/aec/Desktop/BumbleBox/docs/Fleet_Management.md`
 - `/Users/aec/Desktop/BumbleBox/docs/GUI_Desktop_Launcher.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Nest_Labeling_On_Debian_Pi.md`
+- `/Users/aec/Desktop/BumbleBox/docs/Thermal_Camera.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Legacy_Function_Review.md`
