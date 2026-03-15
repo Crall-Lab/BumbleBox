@@ -1760,11 +1760,12 @@ class BumbleBoxV2GUI(tk.Tk):
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
         thermal_actions = ttk.Frame(thermal)
         thermal_actions.grid(row=2, column=0, columnspan=3, sticky="w")
-        ttk.Button(
+        self.thermal_check_button = ttk.Button(
             thermal_actions,
             text="Run Thermal Check",
             command=self._run_thermal_check_setup,
-        ).pack(side=tk.LEFT)
+        )
+        self.thermal_check_button.pack(side=tk.LEFT)
         self.thermal_apply_button = ttk.Button(
             thermal_actions,
             text="Apply Detected Thermal Settings",
@@ -2419,6 +2420,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     ("Shutter (us)", "camera.shutter_us", int, None, None),
                     ("IR lighting", "camera.infrared", bool, None, None),
                     ("Monochrome output", "camera.monochrome_output", bool, None, None),
+                    ("Use thermal camera", "thermal.enabled", bool, None, None),
                     ("Preview window", "camera.preview_window", str, ["QT"], None),
                     ("Tuning file", "camera.tuning_file", str, None, None),
                 ],
@@ -2528,6 +2530,10 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Force grayscale-looking RGB output for preview, recording, and calibration captures. "
                 "This is useful for NoIR cameras under IR lighting when you want black-and-white output "
                 "instead of the normal magenta/purple color cast."
+            ),
+            "thermal.enabled": (
+                "Enable or disable the thermal camera for recording runs. "
+                "Use Camera Setup Step C to detect and apply the correct PureThermal device path and Y16 settings."
             ),
             "camera.preview_window": "Preview backend used by camera preview (fixed to QT for stable GUI behavior).",
             "camera.tuning_file": (
@@ -2728,9 +2734,19 @@ class BumbleBoxV2GUI(tk.Tk):
             except Exception:
                 self._config_codec_trace_bound = False
 
+        thermal_binding = getattr(self, "_config_thermal_trace_bound", False)
+        thermal_field = self.config_fields.get("thermal.enabled")
+        if (not thermal_binding) and thermal_field is not None:
+            try:
+                thermal_field[0].trace_add("write", lambda *_args: self._refresh_thermal_controls_state())
+                self._config_thermal_trace_bound = True
+            except Exception:
+                self._config_thermal_trace_bound = False
+
         self._set_config_page(0)
         self._update_pipeline_tracking_hint()
         self._refresh_config_field_visibility()
+        self._refresh_thermal_controls_state()
 
     def _set_config_page(self, page_index: int) -> None:
         order = getattr(self, "_config_group_order", [])
@@ -2946,6 +2962,27 @@ class BumbleBoxV2GUI(tk.Tk):
             else:
                 camera_actions_row.grid_remove()
         self._update_pipeline_tracking_hint()
+
+    def _thermal_enabled_from_editor(self) -> bool:
+        field = self.config_fields.get("thermal.enabled")
+        if field is None:
+            return False
+        try:
+            return bool(field[0].get())
+        except Exception:
+            return False
+
+    def _refresh_thermal_controls_state(self) -> None:
+        thermal_enabled = self._thermal_enabled_from_editor()
+        thermal_check_button = getattr(self, "thermal_check_button", None)
+        thermal_apply_button = getattr(self, "thermal_apply_button", None)
+
+        if thermal_check_button is not None:
+            thermal_check_button.configure(state=tk.NORMAL if thermal_enabled else tk.DISABLED)
+
+        if thermal_apply_button is not None:
+            apply_enabled = thermal_enabled and self._thermal_check_can_apply()
+            thermal_apply_button.configure(state=tk.NORMAL if apply_enabled else tk.DISABLED)
 
     def _build_fps_tab(self) -> None:
         top = ttk.Frame(self.fps_tab)
@@ -4954,6 +4991,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 else:
                     variable.set("" if raw is None else str(raw))
             self._refresh_config_field_visibility()
+            self._refresh_thermal_controls_state()
             self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(
@@ -5695,6 +5733,13 @@ class BumbleBoxV2GUI(tk.Tk):
             self._show_error("Full camera setup check failed", str(exc))
 
     def _run_thermal_check_setup(self) -> None:
+        if not self._thermal_enabled_from_editor():
+            self._refresh_thermal_controls_state()
+            self._show_error(
+                "Thermal check disabled",
+                "Enable 'Use thermal camera' in Config Editor before running thermal camera actions.",
+            )
+            return
         try:
             config, _ = self._load_effective_action_config()
             self.camera_setup_output.delete("1.0", tk.END)
@@ -5708,17 +5753,17 @@ class BumbleBoxV2GUI(tk.Tk):
             self.camera_setup_output.delete("1.0", tk.END)
             self.camera_setup_output.insert(tk.END, format_thermal_check_result(result))
             if self._thermal_check_can_apply():
-                self.thermal_apply_button.configure(state=tk.NORMAL)
+                self._refresh_thermal_controls_state()
                 self.camera_setup_output.insert(
                     tk.END,
                     "\n\nThermal apply is available. Click 'Apply Detected Thermal Settings' to write the stable "
                     "path and Y16 settings into config.",
                 )
             else:
-                self.thermal_apply_button.configure(state=tk.DISABLED)
+                self._refresh_thermal_controls_state()
             self.notebook.select(self.camera_setup_tab)
         except Exception as exc:
-            self.thermal_apply_button.configure(state=tk.DISABLED)
+            self._refresh_thermal_controls_state()
             self._show_error("Thermal check failed", str(exc))
 
     def _thermal_check_can_apply(self) -> bool:
@@ -5731,6 +5776,13 @@ class BumbleBoxV2GUI(tk.Tk):
             return False
 
     def _apply_detected_thermal_settings_setup(self) -> None:
+        if not self._thermal_enabled_from_editor():
+            self._refresh_thermal_controls_state()
+            self._show_error(
+                "Thermal apply disabled",
+                "Enable 'Use thermal camera' in Config Editor before applying thermal settings.",
+            )
+            return
         if self._thermal_check_result is None:
             self._show_error("Apply thermal settings failed", "Run Thermal Check first.")
             return
@@ -5755,6 +5807,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     + (f"\n{history_note}" if history_note else "")
                 ),
             )
+            self._refresh_thermal_controls_state()
             self.notebook.select(self.camera_setup_tab)
         except Exception as exc:
             self._show_error("Apply thermal settings failed", str(exc))
