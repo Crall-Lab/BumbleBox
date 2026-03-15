@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -110,8 +110,36 @@ class ThermalSideBySideArtifacts:
     midpoint_png_path: Optional[Path]
 
 
+@dataclass(frozen=True)
+class FrameTimestampRecord:
+    time_s: float
+    captured_monotonic_s: float
+    captured_unix_s: float
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _to_iso_utc(unix_s: float) -> str:
+    return datetime.fromtimestamp(float(unix_s), tz=timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _to_iso_local(unix_s: float) -> str:
+    return datetime.fromtimestamp(float(unix_s)).astimezone().isoformat(timespec="milliseconds")
+
+
+def _build_timestamp_record(
+    *,
+    start_monotonic: float,
+    captured_monotonic_s: float,
+    monotonic_to_unix_offset_s: float,
+) -> FrameTimestampRecord:
+    return FrameTimestampRecord(
+        time_s=float(captured_monotonic_s - start_monotonic),
+        captured_monotonic_s=float(captured_monotonic_s),
+        captured_unix_s=float(captured_monotonic_s + monotonic_to_unix_offset_s),
+    )
 
 
 def _guard_fleet_queen_local_pipeline(config: Dict[str, Any]) -> None:
@@ -183,12 +211,28 @@ def _make_session_paths(config: Dict[str, Any]) -> Tuple[str, Path]:
     return session_name, session_dir
 
 
-def _write_timestamps(timestamps: List[float], session_dir: Path, session_name: str) -> Path:
+def _write_timestamps(
+    timestamps: List[float],
+    session_dir: Path,
+    session_name: str,
+    *,
+    timestamp_records: Optional[List[FrameTimestampRecord]] = None,
+) -> Path:
     path = session_dir / f"{session_name}_frame_timestamps.csv"
     with path.open("w") as f:
-        f.write("frame,time_s\n")
+        f.write(
+            "frame,time_s,captured_monotonic_s,captured_unix_s,captured_iso_local,captured_iso_utc\n"
+        )
+        records = list(timestamp_records or [])
         for i, value in enumerate(timestamps):
-            f.write(f"{i},{value:.6f}\n")
+            record = records[i] if i < len(records) else None
+            if record is None:
+                f.write(f"{i},{value:.6f},,,,\n")
+                continue
+            f.write(
+                f"{i},{record.time_s:.6f},{record.captured_monotonic_s:.6f},{record.captured_unix_s:.6f},"
+                f"{_to_iso_local(record.captured_unix_s)},{_to_iso_utc(record.captured_unix_s)}\n"
+            )
     return path
 
 
@@ -196,16 +240,28 @@ def _write_named_timestamps(
     timestamps: List[float],
     session_dir: Path,
     stem: str,
+    *,
+    timestamp_records: Optional[List[FrameTimestampRecord]] = None,
 ) -> Path:
     path = session_dir / f"{stem}.csv"
     with path.open("w") as f:
-        f.write("frame,time_s\n")
+        f.write(
+            "frame,time_s,captured_monotonic_s,captured_unix_s,captured_iso_local,captured_iso_utc\n"
+        )
+        records = list(timestamp_records or [])
         for i, value in enumerate(timestamps):
-            f.write(f"{i},{value:.6f}\n")
+            record = records[i] if i < len(records) else None
+            if record is None:
+                f.write(f"{i},{value:.6f},,,,\n")
+                continue
+            f.write(
+                f"{i},{record.time_s:.6f},{record.captured_monotonic_s:.6f},{record.captured_unix_s:.6f},"
+                f"{_to_iso_local(record.captured_unix_s)},{_to_iso_utc(record.captured_unix_s)}\n"
+            )
     return path
 
 
-def _mock_capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float]:
+def _mock_capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     try:
         import numpy as np
     except ImportError as exc:  # pragma: no cover - dependency/runtime
@@ -219,14 +275,25 @@ def _mock_capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float]
     frame_count = max(1, int(round(duration * fps)))
     frames = []
     timestamps = []
+    timestamp_records: List[FrameTimestampRecord] = []
+    start_monotonic = time.perf_counter()
+    monotonic_to_unix_offset_s = time.time() - time.perf_counter()
     for i in range(frame_count):
+        relative_s = i / fps
         frame = np.zeros((height * 3 // 2, width), dtype=np.uint8)
         frame[:height, :] = (i * 17) % 255
         frames.append(frame)
-        timestamps.append(i / fps)
+        timestamps.append(relative_s)
+        timestamp_records.append(
+            _build_timestamp_record(
+                start_monotonic=start_monotonic,
+                captured_monotonic_s=start_monotonic + relative_s,
+                monotonic_to_unix_offset_s=monotonic_to_unix_offset_s,
+            )
+        )
 
     actual_fps = frame_count / duration if duration > 0 else fps
-    return frames, timestamps, actual_fps
+    return frames, timestamps, actual_fps, timestamp_records
 
 
 def _capture_frames_from_started_picamera(
@@ -235,9 +302,10 @@ def _capture_frames_from_started_picamera(
     duration: float,
     *,
     start_monotonic: float | None = None,
-) -> Tuple[List[Any], List[float], float]:
+) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     frames: List[Any] = []
     timestamps: List[float] = []
+    timestamp_records: List[FrameTimestampRecord] = []
 
     if start_monotonic is None:
         start = time.perf_counter()
@@ -248,6 +316,7 @@ def _capture_frames_from_started_picamera(
             if now >= start:
                 break
             time.sleep(min(0.001, max(0.0, start - now)))
+    monotonic_to_unix_offset_s = time.time() - time.perf_counter()
     frame_index = 0
     target_interval = 1.0 / fps
     while (time.perf_counter() - start) < duration:
@@ -255,13 +324,20 @@ def _capture_frames_from_started_picamera(
         expected = start + frame_index * target_interval
         if now >= expected:
             yuv420 = picam2.capture_array()
+            captured_monotonic_s = time.perf_counter()
             frames.append(yuv420)
-            timestamps.append(now - start)
+            record = _build_timestamp_record(
+                start_monotonic=start,
+                captured_monotonic_s=captured_monotonic_s,
+                monotonic_to_unix_offset_s=monotonic_to_unix_offset_s,
+            )
+            timestamps.append(record.time_s)
+            timestamp_records.append(record)
             frame_index += 1
 
     elapsed = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else duration
     actual_fps = (len(timestamps) - 1) / elapsed if elapsed > 0 and len(timestamps) > 1 else float(len(frames)) / max(duration, 1e-6)
-    return frames, timestamps, actual_fps
+    return frames, timestamps, actual_fps, timestamp_records
 
 
 class _PicameraCaptureSession:
@@ -388,7 +464,7 @@ class _PicameraCaptureSession:
         fps: float,
         duration: float,
         start_monotonic: float | None = None,
-    ) -> Tuple[List[Any], List[float], float]:
+    ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
         self.start()
         return _capture_frames_from_started_picamera(
             self.picam2,
@@ -419,7 +495,7 @@ class _PicameraCaptureSession:
         self.close()
 
 
-def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float]:
+def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     fps = float(config["camera"]["fps_target"])
     duration = float(config["capture"]["recording_seconds"])
     with _PicameraCaptureSession(config) as session:
@@ -513,9 +589,10 @@ class _ThermalCaptureSession:
         fps: float,
         duration: float,
         start_monotonic: float | None = None,
-    ) -> Tuple[List[Any], List[float], float, str]:
+    ) -> Tuple[List[Any], List[float], float, str, List[FrameTimestampRecord]]:
         frames: List[Any] = []
         timestamps: List[float] = []
+        timestamp_records: List[FrameTimestampRecord] = []
 
         if start_monotonic is None:
             start = time.perf_counter()
@@ -526,6 +603,7 @@ class _ThermalCaptureSession:
                 if now >= start:
                     break
                 time.sleep(min(0.001, max(0.0, start - now)))
+        monotonic_to_unix_offset_s = time.time() - time.perf_counter()
 
         frame_index = 0
         target_interval = 1.0 / float(fps)
@@ -538,6 +616,7 @@ class _ThermalCaptureSession:
                 continue
 
             ok, frame = self.capture.read()
+            captured_monotonic_s = time.perf_counter()
             if not ok or frame is None:
                 if first_error is None:
                     first_error = "Thermal device opened, but frame reads failed during synchronized capture."
@@ -557,7 +636,13 @@ class _ThermalCaptureSession:
                 self.raw16_layout = layout
             decoded = _decode_thermal_raw16_frame(frame, layout)
             frames.append(decoded)
-            timestamps.append(now - start)
+            record = _build_timestamp_record(
+                start_monotonic=start,
+                captured_monotonic_s=captured_monotonic_s,
+                monotonic_to_unix_offset_s=monotonic_to_unix_offset_s,
+            )
+            timestamps.append(record.time_s)
+            timestamp_records.append(record)
             frame_index += 1
 
         if self.raw16_layout is None:
@@ -569,7 +654,7 @@ class _ThermalCaptureSession:
             if elapsed > 0 and len(timestamps) > 1
             else float(len(frames)) / max(float(duration), 1e-6)
         )
-        return frames, timestamps, float(actual_fps), self.raw16_layout
+        return frames, timestamps, float(actual_fps), self.raw16_layout, timestamp_records
 
     def close(self) -> None:
         try:
@@ -589,7 +674,8 @@ def _mock_capture_thermal_frames(
     *,
     timestamps: List[float],
     actual_fps: float,
-) -> Tuple[List[Any], List[float], float, str, str]:
+    timestamp_records: List[FrameTimestampRecord],
+) -> Tuple[List[Any], List[float], float, str, str, List[FrameTimestampRecord]]:
     try:
         import numpy as np
     except ImportError as exc:  # pragma: no cover - dependency/runtime
@@ -602,29 +688,31 @@ def _mock_capture_thermal_frames(
     for idx, _timestamp in enumerate(timestamps):
         base = np.full((height, width), 29000 + (idx % 97), dtype=np.uint16)
         frames.append(base)
-    return frames, list(timestamps), float(actual_fps), "uint16_mono16", "mock://thermal"
+    return frames, list(timestamps), float(actual_fps), "uint16_mono16", "mock://thermal", list(timestamp_records)
 
 
 def _capture_rgb_and_optional_thermal(
     config: Dict[str, Any],
-) -> Tuple[List[Any], List[float], float, Optional[dict[str, Any]]]:
+) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord], Optional[dict[str, Any]]]:
     if not _thermal_enabled_for_recording(config):
-        frames, timestamps, actual_fps = _capture_frames(config)
-        return frames, timestamps, actual_fps, None
+        frames, timestamps, actual_fps, timestamp_records = _capture_frames(config)
+        return frames, timestamps, actual_fps, timestamp_records, None
 
     if bool(config["runtime"].get("use_mock_camera", False)):
-        frames, timestamps, actual_fps = _capture_frames(config)
-        thermal_frames, thermal_timestamps, thermal_actual_fps, raw16_layout, device_path = _mock_capture_thermal_frames(
+        frames, timestamps, actual_fps, timestamp_records = _capture_frames(config)
+        thermal_frames, thermal_timestamps, thermal_actual_fps, raw16_layout, device_path, thermal_timestamp_records = _mock_capture_thermal_frames(
             config,
             timestamps=timestamps,
             actual_fps=actual_fps,
+            timestamp_records=timestamp_records,
         )
-        return frames, timestamps, actual_fps, {
+        return frames, timestamps, actual_fps, timestamp_records, {
             "device_path": device_path,
             "frames": thermal_frames,
             "timestamps": thermal_timestamps,
             "actual_fps": thermal_actual_fps,
             "raw16_layout": raw16_layout,
+            "timestamp_records": thermal_timestamp_records,
         }
 
     fps = float(config["camera"]["fps_target"])
@@ -636,7 +724,7 @@ def _capture_rgb_and_optional_thermal(
 
     def rgb_worker(session: _PicameraCaptureSession) -> None:
         try:
-            frames, timestamps, actual_fps = session.capture_for(
+            frames, timestamps, actual_fps, timestamp_records = session.capture_for(
                 fps=fps,
                 duration=duration,
                 start_monotonic=start_monotonic,
@@ -646,6 +734,7 @@ def _capture_rgb_and_optional_thermal(
                     "frames": frames,
                     "timestamps": timestamps,
                     "actual_fps": actual_fps,
+                    "timestamp_records": timestamp_records,
                 }
             )
         except Exception as exc:
@@ -653,7 +742,7 @@ def _capture_rgb_and_optional_thermal(
 
     def thermal_worker(session: _ThermalCaptureSession) -> None:
         try:
-            frames, timestamps, actual_fps, raw16_layout = session.capture_for(
+            frames, timestamps, actual_fps, raw16_layout, timestamp_records = session.capture_for(
                 fps=fps,
                 duration=duration,
                 start_monotonic=start_monotonic,
@@ -665,6 +754,7 @@ def _capture_rgb_and_optional_thermal(
                     "timestamps": timestamps,
                     "actual_fps": actual_fps,
                     "raw16_layout": raw16_layout,
+                    "timestamp_records": timestamp_records,
                 }
             )
         except Exception as exc:
@@ -691,6 +781,7 @@ def _capture_rgb_and_optional_thermal(
         rgb_result["frames"],
         rgb_result["timestamps"],
         float(rgb_result["actual_fps"]),
+        rgb_result["timestamp_records"],
         thermal_result or None,
     )
 
@@ -704,6 +795,7 @@ def _write_thermal_recording_outputs(
     timestamps: List[float],
     actual_fps: float,
     raw16_layout: str,
+    timestamp_records: Optional[List[FrameTimestampRecord]] = None,
 ) -> ThermalRecordingArtifacts:
     try:
         import cv2
@@ -722,6 +814,7 @@ def _write_thermal_recording_outputs(
         timestamps,
         session_dir,
         f"{session_name}_thermal_frame_timestamps",
+        timestamp_records=timestamp_records,
     ) if timestamps else None
 
     min_value = int(stack.min())
@@ -1020,7 +1113,7 @@ def reset_camera_runtime(
     )
 
 
-def _capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float]:
+def _capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     if bool(config["runtime"].get("use_mock_camera", False)):
         return _mock_capture_frames(config)
     return _capture_frames_picamera(config)
@@ -1046,7 +1139,7 @@ def capture_probe(
         probe_config["runtime"]["use_mock_camera"] = bool(use_mock_camera)
 
     start = time.perf_counter()
-    frames, _timestamps, actual_fps = _capture_frames(probe_config)
+    frames, _timestamps, actual_fps, _timestamp_records = _capture_frames(probe_config)
     elapsed = time.perf_counter() - start
     frame_count = len(frames)
     del frames
@@ -1128,7 +1221,7 @@ def mjpeg_record_probe(
 
     if bool(probe_config["runtime"].get("use_mock_camera", False)):
         start = time.perf_counter()
-        frames, _timestamps, actual_fps = _mock_capture_frames(probe_config)
+        frames, _timestamps, actual_fps, _timestamp_records = _mock_capture_frames(probe_config)
         capture_elapsed = time.perf_counter() - start
         try:
             import cv2
@@ -1200,12 +1293,17 @@ def record_live_test_clip(
     except Exception:
         pass
 
-    frames, timestamps, actual_fps = _capture_frames(test_config)
+    frames, timestamps, actual_fps, timestamp_records = _capture_frames(test_config)
     timestamp_path: Optional[Path] = None
     recording_preview_png_path: Optional[Path] = None
 
     if timestamps:
-        timestamp_path = _write_timestamps(timestamps, session_dir, session_name)
+        timestamp_path = _write_timestamps(
+            timestamps,
+            session_dir,
+            session_name,
+            timestamp_records=timestamp_records,
+        )
 
     requested_video_codec = _normalize_recording_codec(test_config)
     requested_mp4_codec = (
@@ -1688,6 +1786,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
 
     frames: List[Any] = []
     timestamps: List[float] = []
+    timestamp_records: List[FrameTimestampRecord] = []
     actual_fps = 0.0
     tracking_elapsed_seconds: Optional[float] = None
     tracking_frames_processed = 0
@@ -1720,7 +1819,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                         "Synchronized thermal recording follows camera.fps_target. "
                         f"thermal.fps_target={thermal_target_fps:.3f} was ignored for this run."
                     )
-                frames, timestamps, actual_fps, thermal_capture = _capture_rgb_and_optional_thermal(config)
+                frames, timestamps, actual_fps, timestamp_records, thermal_capture = _capture_rgb_and_optional_thermal(config)
                 if thermal_capture is not None:
                     thermal_artifacts = _write_thermal_recording_outputs(
                         session_dir=session_dir,
@@ -1730,6 +1829,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                         timestamps=list(thermal_capture["timestamps"]),
                         actual_fps=float(thermal_capture["actual_fps"]),
                         raw16_layout=str(thermal_capture["raw16_layout"]),
+                        timestamp_records=list(thermal_capture.get("timestamp_records") or []),
                     )
                     if thermal_artifacts.frames_captured != len(frames):
                         warnings.append(
@@ -1759,12 +1859,17 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                     thermal_artifacts = None
                     thermal_side_by_side_artifacts = None
             else:
-                frames, timestamps, actual_fps = _capture_frames(config)
+                frames, timestamps, actual_fps, timestamp_records = _capture_frames(config)
                 if should_track and _thermal_enabled_for_recording(config) and not should_record:
                     warnings.append("thermal.enabled is set, but thermal capture runs only during recording modes.")
 
         if bool(config["runtime"].get("save_frame_timestamps", True)) and timestamps:
-            timestamp_path = _write_timestamps(timestamps, session_dir, session_name)
+            timestamp_path = _write_timestamps(
+                timestamps,
+                session_dir,
+                session_name,
+                timestamp_records=timestamp_records,
+            )
 
         if should_record:
             video_codec = _normalize_recording_codec(config)

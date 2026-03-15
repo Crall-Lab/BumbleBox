@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import math
 from pathlib import Path
@@ -25,12 +26,29 @@ def _extract_float_tokens(line: str) -> List[float]:
 
 
 def load_timestamps(path: Path) -> List[float]:
-    timestamps: List[float] = []
-    for raw in path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
+    filtered_lines = [raw for raw in path.read_text().splitlines() if raw.strip() and not raw.strip().startswith("#")]
+    if not filtered_lines:
+        return []
 
+    header = filtered_lines[0].strip().lower()
+    if "time_s" in header and "," in header:
+        timestamps: List[float] = []
+        reader = csv.DictReader(filtered_lines)
+        for row in reader:
+            if not row:
+                continue
+            raw_value = row.get("time_s")
+            if raw_value is None:
+                continue
+            try:
+                timestamps.append(float(str(raw_value).strip()))
+            except ValueError:
+                continue
+        return timestamps
+
+    timestamps: List[float] = []
+    for raw in filtered_lines:
+        line = raw.strip()
         floats = _extract_float_tokens(line)
         if floats:
             timestamps.append(floats[-1])
