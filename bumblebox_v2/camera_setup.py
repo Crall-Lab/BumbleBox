@@ -165,6 +165,12 @@ def _apply_camera_controls(config: dict[str, Any], picam2: Any, notes: list[str]
     shutter_us = int(camera_cfg.get("shutter_us", 2500))
     picam2.set_controls({"ExposureTime": shutter_us})
 
+    if bool(camera_cfg.get("monochrome_output", False)):
+        try:
+            picam2.set_controls({"Saturation": 0.0})
+        except Exception:
+            notes.append("Could not apply camera.monochrome_output.")
+
     noise_reduction = str(camera_cfg.get("noise_reduction", "Auto"))
     if noise_reduction != "Auto":
         try:

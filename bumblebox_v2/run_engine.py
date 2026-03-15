@@ -32,6 +32,7 @@ class RunSummary:
     session_dir: str
     hostname: str
     camera_infrared: Optional[bool]
+    camera_monochrome_output: Optional[bool]
     resolved_tuning_file: Optional[str]
     frames_captured: int
     actual_fps: float
@@ -359,6 +360,7 @@ class _PicameraCaptureSession:
         self.height = int(config["camera"]["height"])
         self.shutter_us = int(config["camera"]["shutter_us"])
         self.digital_zoom = config["camera"].get("digital_zoom")
+        self.monochrome_output = bool(config["camera"].get("monochrome_output", False))
         self.noise_reduction = config["camera"].get("noise_reduction", "Auto")
         self.warmup_s = float(config["runtime"].get("camera_warmup_seconds", 2.0))
         self.resolved_tuning_file = resolve_camera_tuning_file(config)
@@ -441,6 +443,11 @@ class _PicameraCaptureSession:
             raise RuntimeError(f"Failed to configure capture stream: {exc}") from exc
 
         picam2.set_controls({"ExposureTime": self.shutter_us})
+        if self.monochrome_output:
+            try:
+                picam2.set_controls({"Saturation": 0.0})
+            except Exception:
+                pass
 
         if self.noise_reduction != "Auto":
             try:
@@ -507,6 +514,11 @@ def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[fl
 def _thermal_enabled_for_recording(config: Dict[str, Any]) -> bool:
     thermal = config.get("thermal", {})
     return isinstance(thermal, dict) and bool(thermal.get("enabled", False))
+
+
+def _camera_monochrome_output_enabled(config: Dict[str, Any]) -> bool:
+    camera = config.get("camera", {})
+    return isinstance(camera, dict) and bool(camera.get("monochrome_output", False))
 
 
 def _flush_rgb_capture_queue(picam2: Any, frame_count: int) -> None:
@@ -914,6 +926,7 @@ def _write_rgb_thermal_side_by_side_outputs(
     thermal_frames: List[Any],
     thermal_timestamps: List[float],
     fps: float,
+    monochrome_output: bool = False,
 ) -> ThermalSideBySideArtifacts:
     try:
         import cv2
@@ -945,7 +958,7 @@ def _write_rgb_thermal_side_by_side_outputs(
     if frame_count <= 0:
         raise RuntimeError("No overlapping RGB/thermal frames were available for side-by-side output.")
 
-    first_rgb = _frame_to_bgr(rgb_frames[0])
+    first_rgb = _frame_to_bgr(rgb_frames[0], monochrome_output=monochrome_output)
     rgb_height, rgb_width = int(first_rgb.shape[0]), int(first_rgb.shape[1])
     thermal_height, thermal_width = int(thermal_frames[0].shape[0]), int(thermal_frames[0].shape[1])
     scaled_thermal_width = max(1, int(round(float(rgb_height) * float(thermal_width) / float(max(1, thermal_height)))))
@@ -968,7 +981,7 @@ def _write_rgb_thermal_side_by_side_outputs(
     midpoint_idx = max(0, min(frame_count - 1, frame_count // 2))
     try:
         for pair_index, (rgb_idx, thermal_idx, rgb_time, thermal_time) in enumerate(matched_pairs):
-            rgb_bgr = _frame_to_bgr(rgb_frames[rgb_idx])
+            rgb_bgr = _frame_to_bgr(rgb_frames[rgb_idx], monochrome_output=monochrome_output)
             thermal_raw = thermal_frames[thermal_idx]
             thermal_8 = (
                 ((thermal_raw.astype(np.float32) - float(global_min)) * (255.0 / float(range_value)))
@@ -1164,6 +1177,7 @@ def _stream_mjpeg_from_started_picamera(
     width: int,
     height: int,
     output_path: Path,
+    monochrome_output: bool = False,
 ) -> Tuple[int, float, int]:
     try:
         import cv2
@@ -1189,7 +1203,7 @@ def _stream_mjpeg_from_started_picamera(
             expected = start + frame_count * target_interval
             if now >= expected:
                 yuv420 = picam2.capture_array()
-                writer.write(_frame_to_bgr(yuv420))
+                writer.write(_frame_to_bgr(yuv420, monochrome_output=monochrome_output))
                 timestamps.append(now - start)
                 frame_count += 1
     finally:
@@ -1246,7 +1260,12 @@ def mjpeg_record_probe(
             raise RuntimeError(f"Failed to open MJPEG probe writer for {output_path}")
         try:
             for frame in frames:
-                writer.write(_frame_to_bgr(frame))
+                writer.write(
+                    _frame_to_bgr(
+                        frame,
+                        monochrome_output=_camera_monochrome_output_enabled(probe_config),
+                    )
+                )
         finally:
             writer.release()
         frame_count = len(frames)
@@ -1264,6 +1283,7 @@ def mjpeg_record_probe(
             width=width,
             height=height,
             output_path=output_path,
+            monochrome_output=_camera_monochrome_output_enabled(probe_config),
         )
     else:
         with _PicameraCaptureSession(probe_config) as temp_session:
@@ -1275,6 +1295,7 @@ def mjpeg_record_probe(
                 width=width,
                 height=height,
                 output_path=output_path,
+                monochrome_output=_camera_monochrome_output_enabled(probe_config),
             )
     capture_elapsed = time.perf_counter() - start
     return int(frame_count), float(actual_fps), float(capture_elapsed), int(size_bytes)
@@ -1331,6 +1352,7 @@ def record_live_test_clip(
         height=int(test_config["camera"]["height"]),
         recording_codec=requested_video_codec,
         mp4_codec=str(test_config["camera"].get("mp4_codec", "libx264")),
+        monochrome_output=_camera_monochrome_output_enabled(test_config),
     )
 
     if not _video_file_is_readable(video_path):
@@ -1346,6 +1368,7 @@ def record_live_test_clip(
                 height=int(test_config["camera"]["height"]),
                 recording_codec="mjpeg",
                 mp4_codec=str(test_config["camera"].get("mp4_codec", "libx264")),
+                monochrome_output=_camera_monochrome_output_enabled(test_config),
             )
             if _video_file_is_readable(fallback_path):
                 video_codec = "mjpeg"
@@ -1368,7 +1391,12 @@ def record_live_test_clip(
             )
 
     preview_base_name = Path(video_path).stem
-    recording_preview_png_path = _write_midpoint_preview_png(frames, session_dir, preview_base_name)
+    recording_preview_png_path = _write_midpoint_preview_png(
+        frames,
+        session_dir,
+        preview_base_name,
+        monochrome_output=_camera_monochrome_output_enabled(test_config),
+    )
 
     if requested_video_codec == "mp4":
         sidecar = session_dir / f"{session_name}_actual_fps.txt"
@@ -1411,11 +1439,12 @@ def _write_recording_video(
     height: int,
     recording_codec: str,
     mp4_codec: str,
+    monochrome_output: bool = False,
 ) -> Path:
     actual_width = int(width)
     actual_height = int(height)
     if frames:
-        first_bgr = _frame_to_bgr(frames[0])
+        first_bgr = _frame_to_bgr(frames[0], monochrome_output=monochrome_output)
         actual_height = int(first_bgr.shape[0])
         actual_width = int(first_bgr.shape[1])
 
@@ -1433,7 +1462,7 @@ def _write_recording_video(
             raise RuntimeError(f"Failed to open VideoWriter for {output}")
 
         for frame in frames:
-            writer.write(_frame_to_bgr(frame))
+            writer.write(_frame_to_bgr(frame, monochrome_output=monochrome_output))
 
         writer.release()
         return output
@@ -1446,6 +1475,7 @@ def _write_recording_video(
         width=actual_width,
         height=actual_height,
         mp4_codec=mp4_codec,
+        monochrome_output=monochrome_output,
     )
 
 
@@ -1483,6 +1513,7 @@ def _write_mp4_video_with_ffmpeg(
     width: int,
     height: int,
     mp4_codec: str,
+    monochrome_output: bool = False,
 ) -> Path:
     ffmpeg_bin = _find_ffmpeg_binary()
     if not ffmpeg_bin:
@@ -1534,7 +1565,7 @@ def _write_mp4_video_with_ffmpeg(
         if process.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin for MP4 encoding.")
         for frame in frames:
-            process.stdin.write(_frame_to_bgr(frame).tobytes())
+            process.stdin.write(_frame_to_bgr(frame, monochrome_output=monochrome_output).tobytes())
     except BrokenPipeError as exc:
         stderr_bytes = b""
         if process.stderr is not None:
@@ -1567,13 +1598,17 @@ def _write_mp4_video_with_ffmpeg(
     return output
 
 
-def _frame_to_bgr(frame: Any) -> Any:
+def _frame_to_bgr(frame: Any, monochrome_output: bool = False) -> Any:
     try:
         import cv2
     except ImportError as exc:  # pragma: no cover - dependency/runtime
         raise RuntimeError("OpenCV is required for frame conversion.") from exc
 
-    return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+    bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+    if not monochrome_output:
+        return bgr
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
 
 def _video_file_is_readable(path: Path) -> bool:
@@ -1601,6 +1636,7 @@ def _write_midpoint_preview_png(
     frames: List[Any],
     session_dir: Path,
     session_name: str,
+    monochrome_output: bool = False,
 ) -> Optional[Path]:
     if not frames:
         return None
@@ -1611,7 +1647,7 @@ def _write_midpoint_preview_png(
 
     mid_idx = max(0, min(len(frames) - 1, len(frames) // 2))
     frame = frames[mid_idx]
-    bgr = _frame_to_bgr(frame)
+    bgr = _frame_to_bgr(frame, monochrome_output=monochrome_output)
     out = session_dir / f"{session_name}_midframe.png"
     ok = cv2.imwrite(str(out), bgr)
     if not ok:
@@ -1802,6 +1838,10 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     camera_cfg = config.get("camera", {}) if isinstance(config.get("camera", {}), dict) else {}
     raw_camera_infrared = camera_cfg.get("infrared")
     camera_infrared = raw_camera_infrared if isinstance(raw_camera_infrared, bool) else None
+    raw_camera_monochrome_output = camera_cfg.get("monochrome_output")
+    camera_monochrome_output = (
+        raw_camera_monochrome_output if isinstance(raw_camera_monochrome_output, bool) else None
+    )
     resolved_tuning_file = resolve_camera_tuning_file(config)
 
     frames: List[Any] = []
@@ -1871,6 +1911,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                             thermal_frames=list(thermal_capture["frames"]),
                             thermal_timestamps=list(thermal_capture["timestamps"]),
                             fps=float(actual_fps if actual_fps > 0 else config["camera"]["fps_target"]),
+                            monochrome_output=_camera_monochrome_output_enabled(config),
                         )
                     except Exception as exc:
                         warnings.append(f"RGB+thermal side-by-side preview write failed: {exc}")
@@ -1902,9 +1943,15 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                 height=int(config["camera"]["height"]),
                 recording_codec=video_codec,
                 mp4_codec=str(config["camera"].get("mp4_codec", "libx264")),
+                monochrome_output=_camera_monochrome_output_enabled(config),
             )
 
-            recording_preview_png_path = _write_midpoint_preview_png(frames, session_dir, session_name)
+            recording_preview_png_path = _write_midpoint_preview_png(
+                frames,
+                session_dir,
+                session_name,
+                monochrome_output=_camera_monochrome_output_enabled(config),
+            )
             if recording_preview_png_path is None:
                 warnings.append("Could not write midpoint preview PNG.")
 
@@ -1967,6 +2014,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         session_dir=str(session_dir),
         hostname=hostname,
         camera_infrared=camera_infrared,
+        camera_monochrome_output=camera_monochrome_output,
         resolved_tuning_file=resolved_tuning_file,
         frames_captured=len(frames),
         actual_fps=round(actual_fps, 6),
@@ -2019,6 +2067,7 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Session: {summary.session_name}",
         f"Directory: {summary.session_dir}",
         f"Camera IR setting: {summary.camera_infrared if summary.camera_infrared is not None else 'n/a'}",
+        f"Camera monochrome output: {summary.camera_monochrome_output if summary.camera_monochrome_output is not None else 'n/a'}",
         f"Resolved tuning file: {summary.resolved_tuning_file or 'default'}",
         f"Frames captured: {summary.frames_captured}",
         f"Actual FPS: {summary.actual_fps}",

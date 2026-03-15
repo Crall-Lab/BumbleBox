@@ -24,6 +24,17 @@ class CalibrationResult:
     notes: str = ""
 
 
+def _force_grayscale_image(path: Path) -> None:
+    if cv2 is None:
+        return
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        return
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    cv2.imwrite(str(path), gray_bgr)
+
+
 def parse_point(point_text: str) -> Tuple[float, float]:
     try:
         x_text, y_text = point_text.split(",", maxsplit=1)
@@ -251,6 +262,12 @@ def capture_calibration_image(
             raise RuntimeError(f"Failed to configure still capture: {exc}") from exc
         picam2.set_controls({"ExposureTime": shutter_us})
 
+        if bool(config.get("camera", {}).get("monochrome_output", False)):
+            try:
+                picam2.set_controls({"Saturation": 0.0})
+            except Exception:
+                pass
+
         if noise_reduction != "Auto":
             try:
                 mode = getattr(controls.draft.NoiseReductionModeEnum, noise_reduction)
@@ -268,6 +285,8 @@ def capture_calibration_image(
         started = True
         time.sleep(max(0.0, warmup_s))
         picam2.capture_file(str(output_path))
+        if bool(config.get("camera", {}).get("monochrome_output", False)):
+            _force_grayscale_image(output_path)
     finally:
         if started:
             try:

@@ -169,6 +169,43 @@ def _parse_comma_numeric_values(raw: str, *, label: str, value_type: str) -> lis
     return unique
 
 
+def _apply_camera_bool_override(
+    config: dict,
+    *,
+    key: str,
+    requested_value: bool | None,
+    context_label: str,
+) -> bool:
+    if requested_value is None:
+        return True
+
+    config.setdefault("camera", {})
+    saved_value = bool(config["camera"].get(key, False))
+    requested_bool = bool(requested_value)
+    if requested_bool != saved_value:
+        prompt = (
+            f"{context_label} is overriding saved camera.{key}={saved_value} "
+            f"with {requested_bool} for this run only. Continue? [y/N]: "
+        )
+        if not sys.stdin.isatty():
+            print(
+                f"Refusing to override saved camera.{key} in non-interactive mode. "
+                "Run interactively, change the config, or remove the override flag."
+            )
+            return False
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            print("Cancelled.")
+            return False
+        if answer not in {"y", "yes"}:
+            print("Cancelled.")
+            return False
+
+    config["camera"][key] = requested_bool
+    return True
+
+
 def _apply_infrared_override(
     config: dict,
     *,
@@ -186,30 +223,26 @@ def _apply_infrared_override(
             f"{explicit_tuning!r}; that manual tuning file still overrides auto IR/NoIR selection."
         )
 
-    saved_infrared = bool(config["camera"].get("infrared", False))
-    requested_bool = bool(requested_infrared)
-    if requested_bool != saved_infrared:
-        prompt = (
-            f"{context_label} is overriding saved camera.infrared={saved_infrared} "
-            f"with {requested_bool} for this run only. Continue? [y/N]: "
-        )
-        if not sys.stdin.isatty():
-            print(
-                "Refusing to override saved camera.infrared in non-interactive mode. "
-                "Run interactively, change the config, or remove the override flag."
-            )
-            return False
-        try:
-            answer = input(prompt).strip().lower()
-        except EOFError:
-            print("Cancelled.")
-            return False
-        if answer not in {"y", "yes"}:
-            print("Cancelled.")
-            return False
+    return _apply_camera_bool_override(
+        config,
+        key="infrared",
+        requested_value=requested_infrared,
+        context_label=context_label,
+    )
 
-    config["camera"]["infrared"] = requested_bool
-    return True
+
+def _apply_monochrome_output_override(
+    config: dict,
+    *,
+    requested_monochrome_output: bool | None,
+    context_label: str,
+) -> bool:
+    return _apply_camera_bool_override(
+        config,
+        key="monochrome_output",
+        requested_value=requested_monochrome_output,
+        context_label=context_label,
+    )
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -345,6 +378,12 @@ def _cmd_camera_preview(args: argparse.Namespace) -> int:
     if not _apply_infrared_override(
         config,
         requested_infrared=getattr(args, "infrared", None),
+        context_label="camera-preview",
+    ):
+        return 1
+    if not _apply_monochrome_output_override(
+        config,
+        requested_monochrome_output=getattr(args, "monochrome_output", None),
         context_label="camera-preview",
     ):
         return 1
@@ -733,6 +772,12 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
     if not _apply_infrared_override(
         config,
         requested_infrared=getattr(args, "infrared", None),
+        context_label="run-once",
+    ):
+        return 1
+    if not _apply_monochrome_output_override(
+        config,
+        requested_monochrome_output=getattr(args, "monochrome_output", None),
         context_label="run-once",
     ):
         return 1
@@ -1400,6 +1445,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Force standard non-IR camera tuning selection for this preview when no manual camera.tuning_file override is set.",
     )
     camera_preview_parser.set_defaults(infrared=None)
+    preview_monochrome_group = camera_preview_parser.add_mutually_exclusive_group()
+    preview_monochrome_group.add_argument(
+        "--monochrome-output",
+        dest="monochrome_output",
+        action="store_true",
+        help="Force grayscale RGB output for this preview when comparing IR footage or reducing the usual NoIR color cast.",
+    )
+    preview_monochrome_group.add_argument(
+        "--no-monochrome-output",
+        dest="monochrome_output",
+        action="store_false",
+        help="Force normal color RGB output for this preview.",
+    )
+    camera_preview_parser.set_defaults(monochrome_output=None)
     camera_preview_parser.set_defaults(func=_cmd_camera_preview)
 
     camera_reset_parser = subparsers.add_parser(
@@ -1577,6 +1636,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Force standard non-IR camera tuning selection for this run when no manual camera.tuning_file override is set.",
     )
     run_once_parser.set_defaults(infrared=None)
+    monochrome_group = run_once_parser.add_mutually_exclusive_group()
+    monochrome_group.add_argument(
+        "--monochrome-output",
+        dest="monochrome_output",
+        action="store_true",
+        help="Force grayscale RGB output for this run.",
+    )
+    monochrome_group.add_argument(
+        "--no-monochrome-output",
+        dest="monochrome_output",
+        action="store_false",
+        help="Force normal color RGB output for this run.",
+    )
+    run_once_parser.set_defaults(monochrome_output=None)
     run_once_parser.set_defaults(func=_cmd_run_once)
 
     fleet_parser = subparsers.add_parser(

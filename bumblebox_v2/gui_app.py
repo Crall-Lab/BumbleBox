@@ -2401,6 +2401,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     ("FPS target", "camera.fps_target", float, None, None),
                     ("Shutter (us)", "camera.shutter_us", int, None, None),
                     ("IR lighting", "camera.infrared", bool, None, None),
+                    ("Monochrome output", "camera.monochrome_output", bool, None, None),
                     ("Preview window", "camera.preview_window", str, ["QT"], None),
                     ("Tuning file", "camera.tuning_file", str, None, None),
                 ],
@@ -2504,6 +2505,11 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Use IR/NoIR sensor tuning when no manual tuning file is set. "
                 "When enabled, BumbleBox auto-resolves the camera's noir tuning file "
                 "(for example imx477_noir.json or imx708_noir.json) for preview, recording, and calibration."
+            ),
+            "camera.monochrome_output": (
+                "Force grayscale-looking RGB output for preview, recording, and calibration captures. "
+                "This is useful for NoIR cameras under IR lighting when you want black-and-white output "
+                "instead of the normal magenta/purple color cast."
             ),
             "camera.preview_window": "Preview backend used by camera preview (fixed to QT for stable GUI behavior).",
             "camera.tuning_file": (

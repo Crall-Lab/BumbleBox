@@ -13,6 +13,7 @@ camera:
   shutter_us: 2500
   codec: "mp4"
   infrared: true
+  monochrome_output: false
   noise_reduction: "Auto"
   preview_window: "QT"
   tuning_file: null
