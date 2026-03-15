@@ -679,6 +679,9 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
     if args.codec:
         config.setdefault("camera", {})
         config["camera"]["codec"] = str(args.codec).strip().lower()
+    if getattr(args, "infrared", None) is not None:
+        config.setdefault("camera", {})
+        config["camera"]["infrared"] = bool(args.infrared)
 
     try:
         summary = run_once(config=config, mode_override=args.mode)
@@ -1492,6 +1495,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["mp4", "mjpeg"],
         help="Optional one-run recording codec override (default from camera.codec in config).",
     )
+    infrared_group = run_once_parser.add_mutually_exclusive_group()
+    infrared_group.add_argument(
+        "--infrared",
+        dest="infrared",
+        action="store_true",
+        help="Force IR/NoIR camera tuning selection for this run when no manual camera.tuning_file override is set.",
+    )
+    infrared_group.add_argument(
+        "--no-infrared",
+        dest="infrared",
+        action="store_false",
+        help="Force standard non-IR camera tuning selection for this run when no manual camera.tuning_file override is set.",
+    )
+    run_once_parser.set_defaults(infrared=None)
     run_once_parser.set_defaults(func=_cmd_run_once)
 
     fleet_parser = subparsers.add_parser(

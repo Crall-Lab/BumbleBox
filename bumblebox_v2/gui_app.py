@@ -2648,6 +2648,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 )
                 actions = ttk.Frame(group_body)
                 actions.grid(row=row_index, column=0, sticky="w", pady=(8, 0))
+                self._camera_actions_row = actions
                 ttk.Button(
                     actions,
                     text="Use Max Resolution",
@@ -2903,10 +2904,19 @@ class BumbleBoxV2GUI(tk.Tk):
             should_show = allowed_roles is None or fleet_role in allowed_roles
             if key == "camera.mp4_codec":
                 should_show = should_show and codec_value == "mp4" and ui_mode == "advanced"
+            if key in {"camera.preview_window", "camera.tuning_file"}:
+                should_show = should_show and ui_mode == "advanced"
             if should_show:
                 row.grid()
             else:
                 row.grid_remove()
+
+        camera_actions_row = getattr(self, "_camera_actions_row", None)
+        if camera_actions_row is not None:
+            if ui_mode == "advanced":
+                camera_actions_row.grid()
+            else:
+                camera_actions_row.grid_remove()
         self._update_pipeline_tracking_hint()
 
     def _build_fps_tab(self) -> None:
