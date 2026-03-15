@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -168,6 +169,49 @@ def _parse_comma_numeric_values(raw: str, *, label: str, value_type: str) -> lis
     return unique
 
 
+def _apply_infrared_override(
+    config: dict,
+    *,
+    requested_infrared: bool | None,
+    context_label: str,
+) -> bool:
+    if requested_infrared is None:
+        return True
+
+    config.setdefault("camera", {})
+    explicit_tuning = config["camera"].get("tuning_file")
+    if explicit_tuning not in (None, ""):
+        print(
+            "Note: camera.tuning_file is explicitly set to "
+            f"{explicit_tuning!r}; that manual tuning file still overrides auto IR/NoIR selection."
+        )
+
+    saved_infrared = bool(config["camera"].get("infrared", False))
+    requested_bool = bool(requested_infrared)
+    if requested_bool != saved_infrared:
+        prompt = (
+            f"{context_label} is overriding saved camera.infrared={saved_infrared} "
+            f"with {requested_bool} for this run only. Continue? [y/N]: "
+        )
+        if not sys.stdin.isatty():
+            print(
+                "Refusing to override saved camera.infrared in non-interactive mode. "
+                "Run interactively, change the config, or remove the override flag."
+            )
+            return False
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            print("Cancelled.")
+            return False
+        if answer not in {"y", "yes"}:
+            print("Cancelled.")
+            return False
+
+    config["camera"]["infrared"] = requested_bool
+    return True
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     try:
@@ -296,6 +340,13 @@ def _cmd_camera_preview(args: argparse.Namespace) -> int:
         config = _load_or_defaults(config_path)
     except (FileNotFoundError, ConfigError, RuntimeError) as exc:
         print(f"Config error: {exc}")
+        return 1
+
+    if not _apply_infrared_override(
+        config,
+        requested_infrared=getattr(args, "infrared", None),
+        context_label="camera-preview",
+    ):
         return 1
 
     try:
@@ -679,9 +730,12 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
     if args.codec:
         config.setdefault("camera", {})
         config["camera"]["codec"] = str(args.codec).strip().lower()
-    if getattr(args, "infrared", None) is not None:
-        config.setdefault("camera", {})
-        config["camera"]["infrared"] = bool(args.infrared)
+    if not _apply_infrared_override(
+        config,
+        requested_infrared=getattr(args, "infrared", None),
+        context_label="run-once",
+    ):
+        return 1
 
     try:
         summary = run_once(config=config, mode_override=args.mode)
@@ -1332,6 +1386,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     camera_preview_parser.add_argument("--width", type=int, help="Optional preview width override in pixels.")
     camera_preview_parser.add_argument("--height", type=int, help="Optional preview height override in pixels.")
+    preview_infrared_group = camera_preview_parser.add_mutually_exclusive_group()
+    preview_infrared_group.add_argument(
+        "--infrared",
+        dest="infrared",
+        action="store_true",
+        help="Force IR/NoIR camera tuning selection for this preview when no manual camera.tuning_file override is set.",
+    )
+    preview_infrared_group.add_argument(
+        "--no-infrared",
+        dest="infrared",
+        action="store_false",
+        help="Force standard non-IR camera tuning selection for this preview when no manual camera.tuning_file override is set.",
+    )
+    camera_preview_parser.set_defaults(infrared=None)
     camera_preview_parser.set_defaults(func=_cmd_camera_preview)
 
     camera_reset_parser = subparsers.add_parser(

@@ -31,6 +31,8 @@ class RunSummary:
     session_name: str
     session_dir: str
     hostname: str
+    camera_infrared: Optional[bool]
+    resolved_tuning_file: Optional[str]
     frames_captured: int
     actual_fps: float
     tracking_elapsed_seconds: Optional[float]
@@ -1790,6 +1792,10 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
 
     session_name, session_dir = _make_session_paths(config)
     hostname = socket.gethostname()
+    camera_cfg = config.get("camera", {}) if isinstance(config.get("camera", {}), dict) else {}
+    raw_camera_infrared = camera_cfg.get("infrared")
+    camera_infrared = raw_camera_infrared if isinstance(raw_camera_infrared, bool) else None
+    resolved_tuning_file = resolve_camera_tuning_file(config)
 
     frames: List[Any] = []
     timestamps: List[float] = []
@@ -1953,6 +1959,8 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         session_name=session_name,
         session_dir=str(session_dir),
         hostname=hostname,
+        camera_infrared=camera_infrared,
+        resolved_tuning_file=resolved_tuning_file,
         frames_captured=len(frames),
         actual_fps=round(actual_fps, 6),
         tracking_elapsed_seconds=round(tracking_elapsed_seconds, 6) if tracking_elapsed_seconds is not None else None,
@@ -2003,6 +2011,8 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Run mode: {summary.mode}",
         f"Session: {summary.session_name}",
         f"Directory: {summary.session_dir}",
+        f"Camera IR setting: {summary.camera_infrared if summary.camera_infrared is not None else 'n/a'}",
+        f"Resolved tuning file: {summary.resolved_tuning_file or 'default'}",
         f"Frames captured: {summary.frames_captured}",
         f"Actual FPS: {summary.actual_fps}",
         f"Tracking elapsed (s): {summary.tracking_elapsed_seconds if summary.tracking_elapsed_seconds is not None else 'n/a'}",

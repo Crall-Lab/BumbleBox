@@ -59,13 +59,16 @@ def _detect_sensor_from_resolution(width: Any, height: Any) -> Optional[str]:
 
 
 def _is_noir_variant(model: Any, infrared: Any) -> bool:
+    infrared_bool = _parse_bool(infrared)
+    if infrared_bool is not None:
+        return bool(infrared_bool)
+
     model_text = str(model or "").strip().lower()
     if model_text in {"hq_noir", "module3_noir"}:
         return True
     if model_text in {"hq", "module3", "module3_standard", "module3_wide"}:
         return False
-    infrared_bool = _parse_bool(infrared)
-    return bool(infrared_bool) if infrared_bool is not None else False
+    return False
 
 
 def _find_tuning_file(candidate: str) -> Optional[Path]:
