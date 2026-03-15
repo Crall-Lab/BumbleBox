@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import colorsys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -47,6 +48,25 @@ def _normalize_tracking_columns(df: pd.DataFrame) -> pd.DataFrame:
     if rename_map:
         out = out.rename(columns=rename_map)
     return out
+
+
+def _stable_id_color(id_value: float) -> tuple[int, int, int]:
+    if not math.isfinite(id_value):
+        return (0, 200, 255)
+    # Use a deterministic hue by tag ID so the same tag keeps the same color.
+    hue = ((int(id_value) * 37) % 360) / 360.0
+    red, green, blue = colorsys.hsv_to_rgb(hue, 0.78, 1.0)
+    return (int(blue * 255), int(green * 255), int(red * 255))
+
+
+def _overlay_metrics(width: int, height: int) -> tuple[int, int, int, float, int]:
+    base = max(1.0, min(width, height) / 1800.0)
+    line_thickness = max(3, int(round(base * 3)))
+    dot_radius = max(6, int(round(base * 5)))
+    front_radius = max(4, int(round(base * 3.5)))
+    label_scale = max(0.9, min(1.6, base * 1.15))
+    label_thickness = max(2, int(round(base * 2.0)))
+    return line_thickness, dot_radius, front_radius, label_scale, label_thickness
 
 
 def render_tracking_video(
@@ -121,6 +141,7 @@ def render_tracking_video(
     frames_read = 0
     frames_written = 0
     detections_drawn = 0
+    line_thickness, dot_radius, front_radius, label_scale, label_thickness = _overlay_metrics(width, height)
     try:
         while True:
             if max_frames is not None and frames_read >= max_frames:
@@ -138,8 +159,13 @@ def render_tracking_video(
                         continue
                     cx = int(round(x))
                     cy = int(round(y))
-                    cv2.circle(frame, (cx, cy), 3, (0, 255, 0), -1)
                     detections_drawn += 1
+
+                    dot_color = (0, 200, 255)
+                    if hasattr(row, "ID"):
+                        id_value = float(getattr(row, "ID"))
+                        if math.isfinite(id_value):
+                            dot_color = _stable_id_color(id_value)
 
                     if draw_front and hasattr(row, "frontX") and hasattr(row, "frontY"):
                         fx = float(getattr(row, "frontX"))
@@ -147,21 +173,42 @@ def render_tracking_video(
                         if math.isfinite(fx) and math.isfinite(fy):
                             fxi = int(round(fx))
                             fyi = int(round(fy))
-                            cv2.line(frame, (cx, cy), (fxi, fyi), (255, 180, 0), 1)
-                            cv2.circle(frame, (fxi, fyi), 2, (255, 180, 0), -1)
+                            cv2.circle(frame, (fxi, fyi), front_radius + 2, (0, 0, 0), -1)
+                            cv2.circle(frame, (fxi, fyi), front_radius, (0, 255, 0), -1)
+
+                    cv2.circle(frame, (cx, cy), dot_radius + 2, (0, 0, 0), -1)
+                    cv2.circle(frame, (cx, cy), dot_radius, dot_color, -1)
 
                     if draw_labels and hasattr(row, "ID"):
                         id_value = float(getattr(row, "ID"))
                         if math.isfinite(id_value):
                             label = str(int(id_value))
+                            (text_w, text_h), baseline = cv2.getTextSize(
+                                label,
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                label_scale,
+                                label_thickness,
+                            )
+                            text_x = max(0, min(width - text_w, cx - (text_w // 2)))
+                            text_y = max(text_h + 4, cy - dot_radius - 10)
                             cv2.putText(
                                 frame,
                                 label,
-                                (cx + 4, cy - 4),
+                                (text_x, text_y),
                                 cv2.FONT_HERSHEY_SIMPLEX,
-                                0.35,
-                                (255, 255, 255),
-                                1,
+                                label_scale,
+                                (0, 0, 0),
+                                label_thickness + 3,
+                                cv2.LINE_AA,
+                            )
+                            cv2.putText(
+                                frame,
+                                label,
+                                (text_x, text_y),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                label_scale,
+                                dot_color,
+                                label_thickness,
                                 cv2.LINE_AA,
                             )
 
