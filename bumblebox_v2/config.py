@@ -267,6 +267,9 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ConfigError(
             f"camera.model must be one of {sorted(VALID_CAMERA_MODELS)}, got: {camera_model}"
         )
+    camera_infrared = config["camera"].get("infrared", False)
+    if not isinstance(camera_infrared, bool):
+        raise ConfigError("camera.infrared must be true or false")
     preview_window = str(config["camera"].get("preview_window", "QT")).upper()
     if preview_window not in VALID_PREVIEW_WINDOWS:
         raise ConfigError(

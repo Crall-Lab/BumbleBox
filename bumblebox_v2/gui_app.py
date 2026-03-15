@@ -2400,6 +2400,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     ("Height (px)", "camera.height", int, None, None),
                     ("FPS target", "camera.fps_target", float, None, None),
                     ("Shutter (us)", "camera.shutter_us", int, None, None),
+                    ("IR lighting", "camera.infrared", bool, None, None),
                     ("Preview window", "camera.preview_window", str, ["QT"], None),
                     ("Tuning file", "camera.tuning_file", str, None, None),
                 ],
@@ -2499,8 +2500,16 @@ class BumbleBoxV2GUI(tk.Tk):
             "camera.height": "Capture height in pixels. Higher values increase detail and resource usage.",
             "camera.fps_target": "Requested capture framerate. Real framerate can differ; verify with FPS Report.",
             "camera.shutter_us": "Exposure time in microseconds. Longer exposure can brighten image but increase motion blur.",
+            "camera.infrared": (
+                "Use IR/NoIR sensor tuning when no manual tuning file is set. "
+                "When enabled, BumbleBox auto-resolves the camera's noir tuning file "
+                "(for example imx477_noir.json or imx708_noir.json) for preview, recording, and calibration."
+            ),
             "camera.preview_window": "Preview backend used by camera preview (fixed to QT for stable GUI behavior).",
-            "camera.tuning_file": "Optional libcamera tuning JSON file for sensor-specific imaging tuning.",
+            "camera.tuning_file": (
+                "Optional manual libcamera tuning JSON override. "
+                "Leave this blank to let BumbleBox auto-select standard or IR/NoIR tuning from camera model + IR lighting."
+            ),
             "pipeline.mode": "Main run mode: record only, track only, record+track, or mixed schedule lanes.",
             "pipeline.tracking_source": "Track from in-memory frames (ram) or saved video files (video).",
             "pipeline.defer_tracking_until_after_recording": "When enabled, tracking runs after recording to reduce runtime contention.",
