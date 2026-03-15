@@ -1412,6 +1412,13 @@ def _write_recording_video(
     recording_codec: str,
     mp4_codec: str,
 ) -> Path:
+    actual_width = int(width)
+    actual_height = int(height)
+    if frames:
+        first_bgr = _frame_to_bgr(frames[0])
+        actual_height = int(first_bgr.shape[0])
+        actual_width = int(first_bgr.shape[1])
+
     codec_name = str(recording_codec).strip().lower()
     if codec_name == "mjpeg":
         try:
@@ -1421,7 +1428,7 @@ def _write_recording_video(
 
         output = session_dir / f"{session_name}.mjpeg"
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(str(output), fourcc, fps, (width, height))
+        writer = cv2.VideoWriter(str(output), fourcc, fps, (actual_width, actual_height))
         if not writer.isOpened():
             raise RuntimeError(f"Failed to open VideoWriter for {output}")
 
@@ -1436,8 +1443,8 @@ def _write_recording_video(
         frames=frames,
         output=output,
         fps=fps,
-        width=width,
-        height=height,
+        width=actual_width,
+        height=actual_height,
         mp4_codec=mp4_codec,
     )
 
