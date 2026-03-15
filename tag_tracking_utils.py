@@ -39,10 +39,10 @@ def trackTagsFromVid(filepath, todays_folder_path, filename, tag_dictionary, box
     #Optimized custom BumbleBox parameters:  
     if box_type == 'custom':
         parameters.minMarkerPerimeterRate = 0.02
-        parameters.adaptiveThreshWinSizeMin = 3
-        parameters.adaptiveThreshWinSizeMax = 31
+        parameters.adaptiveThreshWinSizeMin = 5
+        parameters.adaptiveThreshWinSizeMax = 29
         parameters.adaptiveThreshWinSizeStep = 3
-        parameters.polygonalApproxAccuracyRate = 0.08
+        parameters.polygonalApproxAccuracyRate = 0.06
 
     elif box_type == 'koppert':
         print("Note: 'koppert' box_type selected, but no presets defined yet.")
@@ -134,10 +134,10 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
     #Optimized custom BumbleBox parameters:  
     if box_type == 'custom':
         parameters.minMarkerPerimeterRate = 0.02
-        parameters.adaptiveThreshWinSizeMin = 3
-        parameters.adaptiveThreshWinSizeMax = 31
+        parameters.adaptiveThreshWinSizeMin = 5
+        parameters.adaptiveThreshWinSizeMax = 29
         parameters.adaptiveThreshWinSizeStep = 3
-        parameters.polygonalApproxAccuracyRate = 0.08
+        parameters.polygonalApproxAccuracyRate = 0.06
 
     elif box_type == 'koppert':
         print("Note: 'koppert' box_type selected, but no presets defined yet.")
@@ -273,10 +273,10 @@ def trackTagsFromRAM_parallel(filename, todays_folder_path, frames_list, tag_dic
     #Optimized custom BumbleBox parameters:  
     if box_type == 'custom':
         parameters.minMarkerPerimeterRate = 0.02
-        parameters.adaptiveThreshWinSizeMin = 3
-        parameters.adaptiveThreshWinSizeMax = 31
+        parameters.adaptiveThreshWinSizeMin = 5
+        parameters.adaptiveThreshWinSizeMax = 29
         parameters.adaptiveThreshWinSizeStep = 3
-        parameters.polygonalApproxAccuracyRate = 0.08
+        parameters.polygonalApproxAccuracyRate = 0.06
 
     if aruco_params:
         print("Applying user-defined ArUco parameters:")

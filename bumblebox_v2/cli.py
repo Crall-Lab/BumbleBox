@@ -78,10 +78,13 @@ from .run_bundle import (
 from .run_engine import format_run_summary, reset_camera_runtime, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
 from .storage_manager import (
+    build_storage_mount_sudo_command,
     build_storage_setup_sudo_command,
+    format_storage_mount_result,
     format_storage_setup_result,
     format_storage_status_report,
     get_storage_status,
+    mount_storage_device_now,
     setup_storage_auto_mount,
 )
 from .systemd_units import (
@@ -399,6 +402,69 @@ def _cmd_storage_setup(args: argparse.Namespace) -> int:
             save_config(config_path, config)
         except Exception as exc:
             print(f"\nStorage setup succeeded, but config save failed: {exc}")
+            return 1
+        print(f"\nUpdated config data_root: {config_path}")
+    return 0 if result.mounted_now or args.dry_run else 1
+
+
+def _cmd_storage_mount(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    mount_point = str(args.mount_point or config.get("system", {}).get("data_root") or "").strip()
+    if not mount_point:
+        mount_point = "/mnt/bumblebox/data"
+
+    status = get_storage_status(config=config, mount_point=mount_point)
+    if status.mounted and status.writable and (
+        not args.device or status.device_path == args.device
+    ):
+        print(format_storage_status_report(status))
+        if args.apply_config and not args.dry_run:
+            config.setdefault("system", {})
+            config["system"]["data_root"] = mount_point
+            try:
+                save_config(config_path, config)
+            except Exception as exc:
+                print(f"\nStorage is mounted, but config save failed: {exc}")
+                return 1
+            print(f"\nUpdated config data_root: {config_path}")
+        return 0
+
+    try:
+        result = mount_storage_device_now(
+            mount_point=mount_point,
+            device_path=args.device,
+            dry_run=bool(args.dry_run),
+        )
+    except PermissionError as exc:
+        print(f"Storage mount needs elevated privileges: {exc}")
+        sudo_cmd = build_storage_mount_sudo_command(
+            config_path=str(config_path),
+            mount_point=mount_point,
+            device_path=args.device,
+            apply_config=bool(args.apply_config),
+            dry_run=bool(args.dry_run),
+        )
+        print("\nRun this command on the Pi:")
+        print(sudo_cmd)
+        return 1
+    except Exception as exc:
+        print(f"Storage mount failed: {exc}")
+        return 1
+
+    print(format_storage_mount_result(result))
+    if args.apply_config and not args.dry_run:
+        config.setdefault("system", {})
+        config["system"]["data_root"] = mount_point
+        try:
+            save_config(config_path, config)
+        except Exception as exc:
+            print(f"\nStorage mount succeeded, but config save failed: {exc}")
             return 1
         print(f"\nUpdated config data_root: {config_path}")
     return 0 if result.mounted_now or args.dry_run else 1
@@ -1439,6 +1505,27 @@ def build_parser() -> argparse.ArgumentParser:
     storage_set_mount.add_argument("--mount-point", required=True, help="New mount point path.")
     storage_set_mount.add_argument("--dry-run", action="store_true", help="Print change without writing config.")
     storage_set_mount.set_defaults(func=_cmd_storage_set_mount_point)
+
+    storage_mount = storage_sub.add_parser(
+        "mount",
+        help="Mount a storage device at the chosen mount point without editing /etc/fstab.",
+    )
+    _add_common_config_arg(storage_mount)
+    storage_mount.add_argument(
+        "--mount-point",
+        help="Mount point to use now (default: system.data_root from config).",
+    )
+    storage_mount.add_argument(
+        "--device",
+        help="Optional specific device path/name (example /dev/sda1).",
+    )
+    storage_mount.add_argument(
+        "--apply-config",
+        action="store_true",
+        help="Also save mount point into system.data_root in config.",
+    )
+    storage_mount.add_argument("--dry-run", action="store_true", help="Show actions without running mount.")
+    storage_mount.set_defaults(func=_cmd_storage_mount)
 
     storage_setup = storage_sub.add_parser(
         "setup",

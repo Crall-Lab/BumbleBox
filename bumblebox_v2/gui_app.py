@@ -75,11 +75,14 @@ from .run_bundle import export_run_bundle, format_bundle_export_result
 from .run_engine import format_run_summary, record_live_test_clip, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
 from .storage_manager import (
+    build_storage_mount_sudo_command,
     build_storage_setup_sudo_command,
     discover_storage_devices,
+    format_storage_mount_result,
     format_storage_setup_result,
     format_storage_status_report,
     get_storage_status,
+    mount_storage_device_now,
     setup_storage_auto_mount,
 )
 from .status_history import list_recent_run_records, load_run_summary
@@ -1475,6 +1478,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self.storage_mount_point_var = tk.StringVar(value="/mnt/bumblebox/data")
         self.storage_device_var = tk.StringVar(value="Auto (recommended)")
         self._storage_device_display_to_path: dict[str, str] = {}
+        default_storage_path = str((Path.home() / "Desktop" / "BumbleBoxData").expanduser())
 
         settings = ttk.LabelFrame(top, text="Storage Configuration", padding=10)
         settings.pack(fill=tk.X)
@@ -1483,11 +1487,12 @@ class BumbleBoxV2GUI(tk.Tk):
             settings,
             row=0,
             column=0,
-            text="Mount point",
-            help_title="Mount Point",
+            text="Step 1: Data folder path",
+            help_title="Step 1: Data Folder Path",
             help_details=(
-                "Directory where BumbleBox writes videos and outputs. "
-                "Example: /mnt/bumblebox/data. This path should be writable."
+                "Choose which folder you want to mount your storage device to. "
+                "Your data will be saved there, even though it is being written to the mounted storage device. "
+                f"Default for this machine: {default_storage_path}"
             ),
         )
         ttk.Entry(settings, textvariable=self.storage_mount_point_var, width=48).grid(
@@ -1495,7 +1500,7 @@ class BumbleBoxV2GUI(tk.Tk):
         )
         ttk.Button(
             settings,
-            text="Save Mount Point To Config",
+            text="Save Data Folder Path",
             command=self._save_storage_mount_point_to_config,
         ).grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
 
@@ -1503,11 +1508,12 @@ class BumbleBoxV2GUI(tk.Tk):
             settings,
             row=1,
             column=0,
-            text="Storage device",
-            help_title="Storage Device",
+            text="Step 2: Storage device",
+            help_title="Step 2: Storage Device",
             help_details=(
                 "Choose Auto to let BumbleBox select a detected partition, or pick a specific "
-                "/dev/... device when you want explicit control."
+                "/dev/... device when you want explicit control. Then click Mount Device to mount it "
+                "to the folder you chose in Step 1."
             ),
         )
         self.storage_device_combo = ttk.Combobox(
@@ -1517,11 +1523,18 @@ class BumbleBoxV2GUI(tk.Tk):
             width=60,
         )
         self.storage_device_combo.grid(row=1, column=1, sticky="ew", padx=10, pady=4)
+        device_actions = ttk.Frame(settings)
+        device_actions.grid(row=1, column=2, sticky="w", pady=4)
         ttk.Button(
-            settings,
+            device_actions,
+            text="Mount Device",
+            command=self._mount_storage_device,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            device_actions,
             text="Refresh Devices",
             command=self._refresh_storage_device_choices,
-        ).grid(row=1, column=2, sticky="w", pady=4)
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
         actions = ttk.Frame(settings)
         actions.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 2))
@@ -1544,14 +1557,18 @@ class BumbleBoxV2GUI(tk.Tk):
             actions,
             title="Setup Storage Auto-Mount",
             details=(
-                "Creates/updates persistent mount setup so the selected storage is mounted automatically "
-                "at boot to your configured mount point."
+                "Optional Step 3. Creates/updates persistent mount setup so the selected storage is mounted "
+                "automatically at boot to your configured mount point. If you only want a temporary mount "
+                "for this session, stop after Step 2."
             ),
         ).pack(side=tk.LEFT, padx=(4, 0))
 
         info = (
-            "Select Auto to let BumbleBox choose the best detected partition, or select a specific /dev/... device "
-            "to force setup on that partition."
+            "Workflow:\n"
+            "1. Choose the mount point.\n"
+            "2. Choose the storage device and click Mount Device.\n"
+            "3. If you want this to survive reboot and be used repeatedly during experiments, click "
+            "Setup Storage Auto-Mount. Otherwise stop after Step 2 for a temporary mount."
         )
         ttk.Label(settings, text=info, wraplength=860, justify=tk.LEFT).grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(8, 2)
@@ -5173,7 +5190,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self.storage_output.delete("1.0", tk.END)
             self.storage_output.insert(
                 tk.END,
-                f"Saved mount point to config:\n- system.data_root: {mount_point}\n- config: {config_path}",
+                f"Saved data folder path to config:\n- system.data_root: {mount_point}\n- config: {config_path}",
             )
             history_note = self._format_config_history_note(snapshot_path, history_warning)
             if history_note:
@@ -5181,7 +5198,7 @@ class BumbleBoxV2GUI(tk.Tk):
             self._refresh_storage_device_choices()
             self._refresh_storage_status()
         except Exception as exc:
-            self._show_error("Save mount point failed", str(exc))
+            self._show_error("Save data folder path failed", str(exc))
 
     def _refresh_storage_status(self) -> None:
         try:
@@ -5247,6 +5264,126 @@ class BumbleBoxV2GUI(tk.Tk):
             ),
         )
         return False
+
+    def _run_pkexec_storage_mount(self, config_path: Path, mount_point: str, device_path: str | None) -> bool:
+        if os.name != "posix":
+            return False
+        if shutil.which("pkexec") is None:
+            return False
+
+        repo_root = Path(__file__).resolve().parents[1]
+        bbx_path = repo_root / "bbx.py"
+        command = [
+            "pkexec",
+            sys.executable,
+            str(bbx_path),
+            "storage",
+            "mount",
+            "--config",
+            str(config_path),
+            "--mount-point",
+            mount_point,
+            "--apply-config",
+        ]
+        if device_path:
+            command.extend(["--device", device_path])
+
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=build_camera_safe_env(include_qt=True),
+        )
+        self.storage_output.delete("1.0", tk.END)
+        if proc.returncode == 0:
+            text = (proc.stdout or "").strip() or "Storage mount completed with pkexec."
+            self.storage_output.insert(tk.END, text)
+            return True
+
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        self.storage_output.insert(
+            tk.END,
+            (
+                "pkexec storage mount failed.\n"
+                f"stdout:\n{out or '(empty)'}\n\n"
+                f"stderr:\n{err or '(empty)'}"
+            ),
+        )
+        return False
+
+    def _mount_storage_device(self) -> None:
+        mount_point = self.storage_mount_point_var.get().strip()
+        if not mount_point:
+            self._show_error("Invalid mount point", "Mount point cannot be empty.")
+            return
+
+        try:
+            config, config_path = self._load_config_or_defaults()
+            device_path = self._selected_storage_device_path()
+            status = get_storage_status(config=config, mount_point=mount_point)
+            if status.mounted and status.writable and (
+                device_path is None or status.device_path == device_path
+            ):
+                self.storage_output.delete("1.0", tk.END)
+                self.storage_output.insert(tk.END, format_storage_status_report(status))
+                if str(config.get("system", {}).get("data_root", "")).strip() != mount_point:
+                    config.setdefault("system", {})
+                    config["system"]["data_root"] = mount_point
+                    snapshot_path, history_warning = self._save_config_with_history(
+                        config_path,
+                        config,
+                        reason="storage_mount_device",
+                    )
+                    self.storage_output.insert(tk.END, f"\n\nUpdated config: {config_path}")
+                    history_note = self._format_config_history_note(snapshot_path, history_warning)
+                    if history_note:
+                        self.storage_output.insert(tk.END, f"\n{history_note}")
+                return
+
+            try:
+                result = mount_storage_device_now(mount_point=mount_point, device_path=device_path)
+                self.storage_output.delete("1.0", tk.END)
+                self.storage_output.insert(tk.END, format_storage_mount_result(result))
+                config.setdefault("system", {})
+                config["system"]["data_root"] = mount_point
+                snapshot_path, history_warning = self._save_config_with_history(
+                    config_path,
+                    config,
+                    reason="storage_mount_device",
+                )
+                self.storage_output.insert(tk.END, f"\n\nUpdated config: {config_path}")
+                history_note = self._format_config_history_note(snapshot_path, history_warning)
+                if history_note:
+                    self.storage_output.insert(tk.END, f"\n{history_note}")
+            except PermissionError:
+                if self._run_pkexec_storage_mount(
+                    config_path=config_path,
+                    mount_point=mount_point,
+                    device_path=device_path,
+                ):
+                    self._refresh_storage_status()
+                    return
+
+                sudo_cmd = build_storage_mount_sudo_command(
+                    config_path=str(config_path),
+                    mount_point=mount_point,
+                    device_path=device_path,
+                    apply_config=True,
+                )
+                self.storage_output.insert(
+                    tk.END,
+                    (
+                        "\n\nStorage mount needs root privileges.\n"
+                        "Run this in terminal on the Pi:\n"
+                        f"{sudo_cmd}"
+                    ),
+                )
+                return
+
+        except Exception as exc:
+            self._show_error("Storage mount failed", str(exc))
 
     def _setup_storage_auto_mount(self) -> None:
         mount_point = self.storage_mount_point_var.get().strip()

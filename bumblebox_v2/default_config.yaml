@@ -48,10 +48,10 @@ tracking:
   box_preset: "custom"
   aruco_params:
     minMarkerPerimeterRate: 0.02
-    adaptiveThreshWinSizeMin: 3
-    adaptiveThreshWinSizeMax: 31
+    adaptiveThreshWinSizeMin: 5
+    adaptiveThreshWinSizeMax: 29
     adaptiveThreshWinSizeStep: 3
-    polygonalApproxAccuracyRate: 0.08
+    polygonalApproxAccuracyRate: 0.06
 
 cleaning:
   drop_unresolvable_duplicates: true

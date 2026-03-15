@@ -78,6 +78,20 @@ class StorageSetupResult:
     notes: List[str]
 
 
+@dataclass
+class StorageMountResult:
+    mount_point: str
+    device_name: str
+    device_path: str
+    device_uuid: str
+    fstype: str
+    mounted_now: bool
+    used_bind_mount: bool
+    source_mountpoint: Optional[str]
+    message: str
+    notes: List[str]
+
+
 def _run_command(args: List[str]) -> Optional[subprocess.CompletedProcess[str]]:
     try:
         return subprocess.run(args, capture_output=True, text=True, check=False)
@@ -136,6 +150,16 @@ def _findmnt_target(path: Path) -> Optional[Tuple[str, str]]:
     if len(fields) < 2:
         return None
     return fields[0], fields[1]
+
+
+def _normalize_mount_path(path_text: str) -> str:
+    return os.path.abspath(os.path.expanduser(str(path_text).strip()))
+
+
+def _is_exact_mount_target(resolved_target: Optional[str], expected_target: str) -> bool:
+    if not resolved_target:
+        return False
+    return _normalize_mount_path(resolved_target) == _normalize_mount_path(expected_target)
 
 
 def _read_fstab() -> str:
@@ -251,6 +275,12 @@ def _fstab_options(fstype: str, uid: int, gid: int) -> str:
     return base
 
 
+def _runtime_mount_options(fstype: str, uid: int, gid: int) -> Optional[str]:
+    if fstype.lower() in _WINDOWS_LIKE_FSTYPES:
+        return f"uid={uid},gid={gid},umask=0002"
+    return None
+
+
 def build_fstab_entry(device: StorageDevice, mount_point: str, *, uid: int, gid: int) -> str:
     if not device.uuid:
         raise ValueError("Selected storage device has no UUID; cannot create stable fstab entry.")
@@ -324,18 +354,31 @@ def get_storage_status(config: Dict[str, Any], *, mount_point: Optional[str] = N
     resolved = _findmnt_target(Path(target_mount_point))
     fstab_line = _fstab_entry_for_mount(target_mount_point)
     notes: List[str] = []
-    mounted = resolved is not None
+    mounted = False
     writable = os.access(target_mount_point, os.W_OK) if Path(target_mount_point).exists() else False
 
     if resolved is not None:
         source, target = resolved
         source_device = _resolve_source_device(source, devices)
-        device_name = _device_name_for_message(source_device, source)
-        message = f"Writing data to {device_name} storage, you can find it at {target_mount_point}"
-        status = "PASS" if writable else "WARN"
-        if source.startswith("/dev/sd"):
+        if _is_exact_mount_target(target, target_mount_point):
+            mounted = True
+            device_name = _device_name_for_message(source_device, source)
+            message = f"Writing data to {device_name} storage, you can find it at {target_mount_point}"
+            status = "PASS" if writable else "WARN"
+            if source.startswith("/dev/sd"):
+                notes.append(
+                    "Mounted source uses /dev/sdX naming. UUID-based fstab is recommended to avoid boot-time device-name drift."
+                )
+        else:
+            device_name = _device_name_for_message(source_device, source)
+            message = (
+                f"No dedicated storage is mounted at {target_mount_point}. "
+                f"The path currently lives on {device_name} mounted at {target}."
+            )
+            status = "WARN"
             notes.append(
-                "Mounted source uses /dev/sdX naming. UUID-based fstab is recommended to avoid boot-time device-name drift."
+                f"{target_mount_point} is not its own active mount point yet. "
+                "Saving the path in config does not mount external storage by itself."
             )
     else:
         source = None
@@ -425,7 +468,8 @@ def setup_storage_auto_mount(
 
     mounted_now = False
     current = _findmnt_target(mount_dir)
-    if current is None and not dry_run:
+    current_exact = current is not None and _is_exact_mount_target(current[1], mount_point)
+    if not current_exact and not dry_run:
         proc = _run_command(["mount", mount_point])
         if proc is None:
             notes.append("Failed to run mount command (mount utility missing).")
@@ -434,7 +478,7 @@ def setup_storage_auto_mount(
             stdout = (proc.stdout or "").strip()
             notes.append(f"mount returned non-zero exit status: {stderr or stdout or 'unknown error'}")
     resolved = _findmnt_target(mount_dir)
-    if resolved is not None:
+    if resolved is not None and _is_exact_mount_target(resolved[1], mount_point):
         mounted_now = True
 
     message = (
@@ -454,6 +498,112 @@ def setup_storage_auto_mount(
         fstab_updated=changed and not dry_run,
         mounted_now=mounted_now,
         fstab_backup_path=fstab_backup_path,
+        message=message,
+        notes=notes,
+    )
+
+
+def mount_storage_device_now(
+    mount_point: str,
+    *,
+    device_path: Optional[str] = None,
+    uid: Optional[int] = None,
+    gid: Optional[int] = None,
+    dry_run: bool = False,
+) -> StorageMountResult:
+    mount_point = str(mount_point).strip() or "/mnt/bumblebox/data"
+    devices = discover_storage_devices()
+    selected = choose_storage_device(devices, mount_point=mount_point, device_path=device_path)
+    if selected is None:
+        raise RuntimeError("No suitable storage partition was detected to mount.")
+    if not selected.path:
+        raise RuntimeError("Selected storage device has no device path.")
+    if not selected.fstype:
+        raise RuntimeError(f"Selected device {selected.path} has no detected filesystem type.")
+
+    owner_uid = int(uid if uid is not None else os.getuid())
+    owner_gid = int(gid if gid is not None else os.getgid())
+    notes: List[str] = []
+
+    if not dry_run and not _is_root_user():
+        raise PermissionError("Mounting storage needs root privileges.")
+
+    mount_dir = Path(mount_point)
+    mount_dir.mkdir(parents=True, exist_ok=True)
+
+    current = _findmnt_target(mount_dir)
+    current_exact = current is not None and _is_exact_mount_target(current[1], mount_point)
+    if current_exact:
+        current_source = current[0]
+        if current_source == selected.path or current_source == f"UUID={selected.uuid}":
+            return StorageMountResult(
+                mount_point=mount_point,
+                device_name=selected.name or selected.display_name,
+                device_path=selected.path,
+                device_uuid=selected.uuid,
+                fstype=selected.fstype,
+                mounted_now=True,
+                used_bind_mount=False,
+                source_mountpoint=selected.mountpoint or None,
+                message=f"Storage device is already mounted at {mount_point}.",
+                notes=notes,
+            )
+        raise RuntimeError(
+            f"{mount_point} is already occupied by {current_source}. Unmount it first or choose a different mount point."
+        )
+
+    used_bind_mount = False
+    source_mountpoint: Optional[str] = None
+
+    if selected.mountpoint and _normalize_mount_path(selected.mountpoint) != _normalize_mount_path(mount_point):
+        used_bind_mount = True
+        source_mountpoint = selected.mountpoint
+        if not dry_run:
+            proc = _run_command(["mount", "--bind", selected.mountpoint, mount_point])
+            if proc is None:
+                notes.append("Failed to run mount command (mount utility missing).")
+            elif proc.returncode != 0:
+                stderr = (proc.stderr or "").strip()
+                stdout = (proc.stdout or "").strip()
+                raise RuntimeError(stderr or stdout or "bind mount failed")
+    else:
+        args = ["mount"]
+        mount_opts = _runtime_mount_options(selected.fstype, owner_uid, owner_gid)
+        if mount_opts:
+            args.extend(["-o", mount_opts])
+        args.extend([selected.path, mount_point])
+        if not dry_run:
+            proc = _run_command(args)
+            if proc is None:
+                notes.append("Failed to run mount command (mount utility missing).")
+            elif proc.returncode != 0:
+                stderr = (proc.stderr or "").strip()
+                stdout = (proc.stdout or "").strip()
+                raise RuntimeError(stderr or stdout or "mount failed")
+
+    resolved = _findmnt_target(mount_dir)
+    mounted_now = bool(dry_run) or (
+        resolved is not None and _is_exact_mount_target(resolved[1], mount_point)
+    )
+    if used_bind_mount and source_mountpoint:
+        message = (
+            f"Mounted {selected.path} at {mount_point} by bind-mounting the existing filesystem "
+            f"from {source_mountpoint}."
+        )
+    else:
+        message = f"Mounted {selected.path} at {mount_point}."
+    if dry_run:
+        notes.append("Dry run: no mount command was executed.")
+
+    return StorageMountResult(
+        mount_point=mount_point,
+        device_name=selected.name or selected.display_name,
+        device_path=selected.path,
+        device_uuid=selected.uuid,
+        fstype=selected.fstype,
+        mounted_now=mounted_now,
+        used_bind_mount=used_bind_mount,
+        source_mountpoint=source_mountpoint,
         message=message,
         notes=notes,
     )
@@ -498,6 +648,23 @@ def format_storage_setup_result(result: StorageSetupResult) -> str:
     return "\n".join(lines)
 
 
+def format_storage_mount_result(result: StorageMountResult) -> str:
+    lines = [
+        "Storage Mount",
+        "-------------",
+        f"Mount point: {result.mount_point}",
+        f"Device: {result.device_path} (name={result.device_name}, uuid={result.device_uuid or 'missing'}, fstype={result.fstype})",
+        f"Mounted now: {result.mounted_now}",
+        f"Bind mount used: {result.used_bind_mount}",
+    ]
+    if result.source_mountpoint:
+        lines.append(f"Existing source mount: {result.source_mountpoint}")
+    lines.append(result.message)
+    for note in result.notes:
+        lines.append(f"- {note}")
+    return "\n".join(lines)
+
+
 def build_storage_setup_sudo_command(
     *,
     config_path: str,
@@ -514,6 +681,36 @@ def build_storage_setup_sudo_command(
         str(bbx_path),
         "storage",
         "setup",
+        "--config",
+        str(config_path),
+        "--mount-point",
+        str(mount_point),
+    ]
+    if device_path:
+        args.extend(["--device", str(device_path)])
+    if apply_config:
+        args.append("--apply-config")
+    if dry_run:
+        args.append("--dry-run")
+    return " ".join(shlex.quote(str(part)) for part in args)
+
+
+def build_storage_mount_sudo_command(
+    *,
+    config_path: str,
+    mount_point: str,
+    device_path: Optional[str] = None,
+    apply_config: bool = True,
+    dry_run: bool = False,
+) -> str:
+    repo_root = Path(__file__).resolve().parents[1]
+    bbx_path = repo_root / "bbx.py"
+    args = [
+        "sudo",
+        "python3",
+        str(bbx_path),
+        "storage",
+        "mount",
         "--config",
         str(config_path),
         "--mount-point",

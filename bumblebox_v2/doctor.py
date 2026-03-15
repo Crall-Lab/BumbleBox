@@ -322,6 +322,10 @@ def _findmnt_target(path: Path) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
+def _normalize_mount_path(path_text: str) -> str:
+    return os.path.abspath(os.path.expanduser(str(path_text).strip()))
+
+
 def _data_root_mount_check(data_root: str) -> CheckResult:
     path = Path(data_root)
     if not path.exists():
@@ -341,6 +345,15 @@ def _data_root_mount_check(data_root: str) -> CheckResult:
         return CheckResult("Data root mount", "WARN", "Could not resolve mount source with findmnt.")
 
     source, target = mount
+    if _normalize_mount_path(target) != _normalize_mount_path(str(path)):
+        return CheckResult(
+            "Data root mount",
+            "WARN",
+            (
+                f"{path} currently resides on {source} mounted at {target}. "
+                "That does not mean the chosen data root is its own active mount point."
+            ),
+        )
     if source.startswith("/dev/sd"):
         return CheckResult(
             "Data root mount",

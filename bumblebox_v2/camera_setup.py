@@ -73,17 +73,17 @@ def _normalize_box_preset(box_preset: Any) -> Optional[str]:
 def _apply_preset_aruco_params(parameters: Any, box_preset: Optional[str]) -> None:
     if box_preset == "custom":
         parameters.minMarkerPerimeterRate = 0.02
-        parameters.adaptiveThreshWinSizeMin = 3
-        parameters.adaptiveThreshWinSizeMax = 31
+        parameters.adaptiveThreshWinSizeMin = 5
+        parameters.adaptiveThreshWinSizeMax = 29
         parameters.adaptiveThreshWinSizeStep = 3
-        parameters.polygonalApproxAccuracyRate = 0.08
+        parameters.polygonalApproxAccuracyRate = 0.06
     elif box_preset == "koppert":
         # Koppert preset remains aligned with custom until a dedicated profile is finalized.
         parameters.minMarkerPerimeterRate = 0.02
-        parameters.adaptiveThreshWinSizeMin = 3
-        parameters.adaptiveThreshWinSizeMax = 31
+        parameters.adaptiveThreshWinSizeMin = 5
+        parameters.adaptiveThreshWinSizeMax = 29
         parameters.adaptiveThreshWinSizeStep = 3
-        parameters.polygonalApproxAccuracyRate = 0.08
+        parameters.polygonalApproxAccuracyRate = 0.06
 
 
 def _apply_custom_aruco_params(parameters: Any, aruco_params: Any, notes: list[str]) -> None:
