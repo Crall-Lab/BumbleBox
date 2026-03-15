@@ -369,6 +369,7 @@ def _select_device(devices: List[ThermalDevice], preferred_device: str | None) -
         for device in devices:
             if _resolve_preferred_path_match(device, preferred_device):
                 return device
+        return None
     for device in devices:
         if device.is_candidate:
             return device
@@ -377,7 +378,8 @@ def _select_device(devices: List[ThermalDevice], preferred_device: str | None) -
 
 def resolve_thermal_device_path(config: Dict[str, Any], device_override: str | None = None) -> Optional[str]:
     devices = discover_thermal_devices()
-    selected = _select_device(devices, preferred_device=_preferred_thermal_device(config, device_override))
+    preferred_device = _preferred_thermal_device(config, device_override)
+    selected = _select_device(devices, preferred_device=preferred_device)
     if selected is None:
         return None
     if device_override:
@@ -617,6 +619,8 @@ def capture_thermal_snapshot(
     devices = discover_thermal_devices()
     selected = _select_device(devices, preferred_device=preferred_device)
     if selected is None:
+        if preferred_device:
+            raise RuntimeError(f"Configured thermal device was not found: {preferred_device}")
         raise RuntimeError("No V4L2 video device was found for the thermal camera.")
 
     capture_path = str(device_override).strip() if device_override else (selected.recommended_path or selected.device_path)

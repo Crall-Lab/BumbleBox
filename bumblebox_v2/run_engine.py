@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .thermal_camera import resolve_thermal_device_path
+from .thermal_camera import resolve_thermal_device_path, _set_v4l2_y16_format
 from .tuning import resolve_camera_tuning_file
 
 CAMERA_REOPEN_RETRY_ATTEMPTS = 3
@@ -570,12 +570,19 @@ class _ThermalCaptureSession:
             raise RuntimeError("OpenCV is required for thermal capture.") from exc
 
         self._cv2 = cv2
+        if self.pixel_format in {"auto", "y16"}:
+            try:
+                _set_v4l2_y16_format(self.device_path, self.width, self.height)
+            except Exception:
+                pass
         self.capture = cv2.VideoCapture(self.device_path, cv2.CAP_V4L2)
         if not self.capture.isOpened():
             raise RuntimeError(f"Could not open thermal device for synchronized recording: {self.device_path}")
 
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+            self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if hasattr(cv2, "CAP_PROP_CONVERT_RGB"):
             self.capture.set(cv2.CAP_PROP_CONVERT_RGB, 0)
         if hasattr(cv2, "CAP_PROP_FOURCC"):
