@@ -362,6 +362,9 @@ def validate_config(config: Dict[str, Any]) -> None:
     warmup = float(config["runtime"].get("camera_warmup_seconds", 0))
     if warmup < 0:
         raise ConfigError("runtime.camera_warmup_seconds must be >= 0")
+    render_tracking_video = config["runtime"].get("render_tracking_video", False)
+    if not isinstance(render_tracking_video, bool):
+        raise ConfigError("runtime.render_tracking_video must be true or false")
 
     ui_theme_mode = str(config["runtime"].get("ui_theme_mode", "dark")).strip().lower()
     if ui_theme_mode not in VALID_UI_THEME_MODES:

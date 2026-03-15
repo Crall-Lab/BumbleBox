@@ -206,6 +206,43 @@ def _apply_camera_bool_override(
     return True
 
 
+def _apply_runtime_bool_override(
+    config: dict,
+    *,
+    key: str,
+    requested_value: bool | None,
+    context_label: str,
+) -> bool:
+    if requested_value is None:
+        return True
+
+    config.setdefault("runtime", {})
+    saved_value = bool(config["runtime"].get(key, False))
+    requested_bool = bool(requested_value)
+    if requested_bool != saved_value:
+        prompt = (
+            f"{context_label} is overriding saved runtime.{key}={saved_value} "
+            f"with {requested_bool} for this run only. Continue? [y/N]: "
+        )
+        if not sys.stdin.isatty():
+            print(
+                f"Refusing to override saved runtime.{key} in non-interactive mode. "
+                "Run interactively, change the config, or remove the override flag."
+            )
+            return False
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            print("Cancelled.")
+            return False
+        if answer not in {"y", "yes"}:
+            print("Cancelled.")
+            return False
+
+    config["runtime"][key] = requested_bool
+    return True
+
+
 def _apply_infrared_override(
     config: dict,
     *,
@@ -778,6 +815,13 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
     if not _apply_monochrome_output_override(
         config,
         requested_monochrome_output=getattr(args, "monochrome_output", None),
+        context_label="run-once",
+    ):
+        return 1
+    if not _apply_runtime_bool_override(
+        config,
+        key="render_tracking_video",
+        requested_value=getattr(args, "visualization", None),
         context_label="run-once",
     ):
         return 1
@@ -1650,6 +1694,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Force normal color RGB output for this run.",
     )
     run_once_parser.set_defaults(monochrome_output=None)
+    visualization_group = run_once_parser.add_mutually_exclusive_group()
+    visualization_group.add_argument(
+        "--visualization",
+        dest="visualization",
+        action="store_true",
+        help="Render a tracked overlay video after tracking. If thermal recording is enabled, also render a tracked RGB+thermal side-by-side video.",
+    )
+    visualization_group.add_argument(
+        "--no-visualization",
+        dest="visualization",
+        action="store_false",
+        help="Do not render tracked overlay video artifacts for this run.",
+    )
+    run_once_parser.set_defaults(visualization=None)
     run_once_parser.set_defaults(func=_cmd_run_once)
 
     fleet_parser = subparsers.add_parser(

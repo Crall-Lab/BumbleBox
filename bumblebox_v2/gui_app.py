@@ -2422,6 +2422,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     ("Scheduler scope", "scheduling.scope", str, ["system", "user"], None),
                     ("Save frame timestamps", "runtime.save_frame_timestamps", bool, None, None),
                     ("FPS report each recording", "runtime.fps_report_on_each_recording", bool, None, None),
+                    ("Render tracked video", "runtime.render_tracking_video", bool, None, None),
                     ("Queen local pipeline", "fleet.queen_local_pipeline_enabled", bool, None, {"queen"}),
                     ("Queen media enabled", "fleet.queen_media_schedule.enabled", bool, None, {"queen"}),
                     ("Queen pull interval (min)", "fleet.queen_media_schedule.pull_interval_minutes", int, None, {"queen"}),
@@ -2528,6 +2529,10 @@ class BumbleBoxV2GUI(tk.Tk):
             "scheduling.scope": "System scope runs regardless of user login; user scope runs per-user session.",
             "runtime.save_frame_timestamps": "Write frame timestamp sidecars for real-FPS and timing analysis.",
             "runtime.fps_report_on_each_recording": "Automatically emit FPS summary after each recording.",
+            "runtime.render_tracking_video": (
+                "After tracking finishes, render a tagged overlay video from the tracking CSV. "
+                "When thermal recording is also enabled, BumbleBox will also render a tracked RGB+thermal side-by-side comparison."
+            ),
             "fleet.queen_local_pipeline_enabled": "When false, queen acts as interface/orchestrator without running local bbox pipeline.",
             "fleet.queen_media_schedule.enabled": "Enable queen media pull/track schedule from workers.",
             "fleet.queen_media_schedule.pull_interval_minutes": "How often queen pulls latest worker videos.",

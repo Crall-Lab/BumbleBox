@@ -119,6 +119,17 @@ def _expected_artifacts(
         ("thermal_metadata_json", session_dir / f"{session_name}_thermal_metadata.json", False),
         ("rgb_thermal_side_by_side_video", session_dir / f"{session_name}_rgb_thermal_side_by_side.avi", False),
         ("rgb_thermal_side_by_side_png", session_dir / f"{session_name}_rgb_thermal_side_by_side_midframe.png", False),
+        ("tracked_video_mp4", session_dir / f"{session_name}_tracked.mp4", False),
+        (
+            "tracked_rgb_thermal_side_by_side_video",
+            session_dir / f"{session_name}_tracked_rgb_thermal_side_by_side.avi",
+            False,
+        ),
+        (
+            "tracked_rgb_thermal_side_by_side_png",
+            session_dir / f"{session_name}_tracked_rgb_thermal_side_by_side_midframe.png",
+            False,
+        ),
         ("tracking_raw_csv", session_dir / f"{session_name}_raw.csv", False),
         ("tracking_noid_csv", session_dir / f"{session_name}_noID.csv", False),
         ("tracking_cleaned_csv", session_dir / f"{session_name}_cleaned.csv", False),

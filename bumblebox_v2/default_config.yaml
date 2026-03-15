@@ -84,6 +84,7 @@ runtime:
   speed_cutoff_seconds: 4
   save_frame_timestamps: true
   fps_report_on_each_recording: true
+  render_tracking_video: false
   save_mp4_sidecar_fps_txt: true
   ui_theme_mode: "dark"
 
