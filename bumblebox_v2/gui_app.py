@@ -147,6 +147,9 @@ class BumbleBoxV2GUI(tk.Tk):
         self._advanced_widgets: list[tuple[tk.Widget, str, dict[str, object]]] = []
         self._advanced_widget_ids: set[str] = set()
         self._run_history_paths: dict[str, str] = {}
+        self._run_history_thread: threading.Thread | None = None
+        self._run_history_error: str | None = None
+        self._run_history_records = None
         self._nest_label_pid: int | None = None
         self._calibration_label_pid: int | None = None
         self._optimize_thread: threading.Thread | None = None
@@ -3255,7 +3258,31 @@ class BumbleBoxV2GUI(tk.Tk):
         )
 
     def _build_calibration_tab(self) -> None:
-        top = ttk.Frame(self.calibration_tab)
+        container = ttk.Frame(self.calibration_tab)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(
+            container,
+            highlightthickness=0,
+            bg=self._palette["panel_bg"],
+            bd=0,
+        )
+        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+        scroll_body = ttk.Frame(canvas)
+        scroll_body.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        scroll_window = canvas.create_window((0, 0), window=scroll_body, anchor="nw")
+        canvas.bind(
+            "<Configure>",
+            lambda event, item=scroll_window, widget=canvas: widget.itemconfigure(item, width=max(1, int(event.width))),
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        top = ttk.Frame(scroll_body)
         top.pack(fill=tk.X)
 
         self.manual_point_a = tk.StringVar(value="0,0")
@@ -3494,7 +3521,7 @@ class BumbleBoxV2GUI(tk.Tk):
         top.columnconfigure(1, weight=1)
 
         self.calibration_output = self._create_results_section(
-            self.calibration_tab,
+            scroll_body,
             title="Calibration Results",
             text_height=11,
             default_visible=False,
@@ -4931,7 +4958,12 @@ class BumbleBoxV2GUI(tk.Tk):
 
         history_frame = ttk.LabelFrame(self.run_tab, text="Recent Runs", padding=8)
         history_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-        ttk.Button(history_frame, text="Refresh Run History", command=self._refresh_run_history).pack(anchor=tk.W)
+        self.run_history_refresh_btn = ttk.Button(
+            history_frame,
+            text="Refresh Run History",
+            command=self._refresh_run_history,
+        )
+        self.run_history_refresh_btn.pack(anchor=tk.W)
 
         self.bundle_output_dir_var = tk.StringVar(value=str(Path.cwd() / "bundles"))
         self.bundle_skip_video_var = tk.BooleanVar(value=False)
@@ -4973,8 +5005,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._style_output_text(self.run_history_detail)
         self._set_run_history_detail_text("")
         self._register_advanced_widget(export_controls)
-        self._refresh_runtime_alerts()
-        self._refresh_run_history()
+        self.after(100, self._refresh_run_history)
 
     def _load_config_or_defaults(self):
         config_path = Path(self.config_path_var.get()).expanduser()
@@ -6888,35 +6919,80 @@ class BumbleBoxV2GUI(tk.Tk):
             self.runtime_alert_output.delete("1.0", tk.END)
             self.runtime_alert_output.insert(tk.END, f"[FAIL] Runtime alerts failed: {exc}")
 
+    def _apply_run_history_records(self, records) -> None:
+        self._run_history_paths.clear()
+
+        for item in self.run_history_tree.get_children():
+            self.run_history_tree.delete(item)
+
+        for index, record in enumerate(records):
+            iid = str(index)
+            self._run_history_paths[iid] = str(record.summary_path)
+            self.run_history_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    record.started_at,
+                    record.mode,
+                    f"{record.actual_fps:.3f}",
+                    "yes" if record.success else "no",
+                    record.warning_count,
+                    record.error_count,
+                    record.session_name,
+                ),
+            )
+        self._set_run_history_detail_text("")
+
+    def _poll_run_history_refresh(self) -> None:
+        thread = self._run_history_thread
+        if thread is not None and thread.is_alive():
+            self.after(100, self._poll_run_history_refresh)
+            return
+
+        button = getattr(self, "run_history_refresh_btn", None)
+        if button is not None:
+            button.configure(state=tk.NORMAL)
+
+        error = self._run_history_error
+        records = self._run_history_records or []
+        self._run_history_thread = None
+        self._run_history_error = None
+        self._run_history_records = None
+
+        if error:
+            self._set_run_history_detail_text("")
+            self._show_error("Run history failed", error)
+            return
+
+        self._apply_run_history_records(records)
+
     def _refresh_run_history(self) -> None:
         try:
             config, _ = self._load_config_or_defaults()
             data_root = config["system"]["data_root"]
-            records = list_recent_run_records(data_root, limit=40)
-            self._run_history_paths.clear()
-
-            for item in self.run_history_tree.get_children():
-                self.run_history_tree.delete(item)
-
-            for index, record in enumerate(records):
-                iid = str(index)
-                self._run_history_paths[iid] = str(record.summary_path)
-                self.run_history_tree.insert(
-                    "",
-                    "end",
-                    iid=iid,
-                    values=(
-                        record.started_at,
-                        record.mode,
-                        f"{record.actual_fps:.3f}",
-                        "yes" if record.success else "no",
-                        record.warning_count,
-                        record.error_count,
-                        record.session_name,
-                    ),
-                )
-            self._set_run_history_detail_text("")
             self._refresh_runtime_alerts()
+
+            existing = self._run_history_thread
+            if existing is not None and existing.is_alive():
+                return
+
+            button = getattr(self, "run_history_refresh_btn", None)
+            if button is not None:
+                button.configure(state=tk.DISABLED)
+
+            self._run_history_error = None
+            self._run_history_records = None
+
+            def _worker() -> None:
+                try:
+                    self._run_history_records = list_recent_run_records(data_root, limit=40)
+                except Exception as exc:
+                    self._run_history_error = str(exc)
+
+            self._run_history_thread = threading.Thread(target=_worker, daemon=True)
+            self._run_history_thread.start()
+            self.after(100, self._poll_run_history_refresh)
         except Exception as exc:
             self._show_error("Run history failed", str(exc))
 
