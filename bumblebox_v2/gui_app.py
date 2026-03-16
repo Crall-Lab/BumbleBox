@@ -3454,7 +3454,8 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Label(
             thermal_reg,
             text=(
-                "Pick corresponding points on one RGB frame and one thermal frame to build an approximate 2D warp. "
+                "Pick corresponding points side by side on one RGB frame and one thermal frame to build an approximate 2D warp. "
+                "You will place one pair at a time and can drag points to fine-tune them before finishing. "
                 "This helps align the two cameras for visualization, but it does not fully correct the 3D nest geometry."
             ),
             wraplength=860,
@@ -3510,9 +3511,10 @@ class BumbleBoxV2GUI(tk.Tk):
             reg_actions,
             title="Thermal Registration",
             details=(
-                "You will click matching points on the RGB image first, then on the thermal image in the same order. "
-                "At least 4 point pairs are required. BumbleBox then saves a homography, warped thermal preview, "
-                "overlay preview, and registration JSON."
+                "RGB and thermal frames open side by side in one window. Click the next point on the highlighted image, "
+                "then click the matching point on the other image. Existing points can be dragged to adjust them, "
+                "and right-clicking near a point deletes that pair. At least 4 point pairs are required. "
+                "BumbleBox then saves a homography, warped thermal preview, overlay preview, and registration JSON."
             ),
         ).pack(side=tk.LEFT)
         thermal_reg.columnconfigure(1, weight=1)

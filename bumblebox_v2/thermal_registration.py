@@ -58,19 +58,42 @@ def _fit_scale(width: int, height: int, *, max_width: int = 1400, max_height: in
     return min(1.0, max_width / max(1, width), max_height / max(1, height))
 
 
+def _fit_pair_scales(
+    rgb_width: int,
+    rgb_height: int,
+    thermal_width: int,
+    thermal_height: int,
+    *,
+    max_width: int = 1500,
+    max_height: int = 860,
+    gap: int = 28,
+) -> tuple[float, float]:
+    rgb_scale = min(1.0, max_height / max(1, rgb_height))
+    thermal_scale = min(1.0, max_height / max(1, thermal_height))
+    total_width = (rgb_width * rgb_scale) + (thermal_width * thermal_scale) + gap
+    if total_width > max_width:
+        usable_width = max(1.0, float(max_width - gap))
+        shrink = usable_width / max(1.0, (rgb_width * rgb_scale) + (thermal_width * thermal_scale))
+        rgb_scale *= shrink
+        thermal_scale *= shrink
+    return rgb_scale, thermal_scale
+
+
 def _draw_point_annotations(
     image: np.ndarray,
     points: Sequence[Point],
     *,
     scale: float = 1.0,
     footer_lines: Optional[Sequence[str]] = None,
+    active_index: Optional[int] = None,
 ) -> np.ndarray:
     out = image.copy()
     for idx, (x, y) in enumerate(points, start=1):
         px = int(round(x * scale))
         py = int(round(y * scale))
+        fill_color = (0, 255, 255) if active_index != idx - 1 else (0, 180, 255)
         cv2.circle(out, (px, py), 8, (0, 0, 0), -1)
-        cv2.circle(out, (px, py), 6, (0, 255, 255), -1)
+        cv2.circle(out, (px, py), 6, fill_color, -1)
         label = str(idx)
         cv2.putText(out, label, (px + 10, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(out, label, (px + 10, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
@@ -86,43 +109,250 @@ def _draw_point_annotations(
     return out
 
 
-def pick_points_on_image(
-    image_path: str | Path,
+def _pending_side(rgb_points: Sequence[Point], thermal_points: Sequence[Point]) -> str:
+    return "rgb" if len(rgb_points) == len(thermal_points) else "thermal"
+
+
+def _delete_pair_at_index(rgb_points: List[Point], thermal_points: List[Point], index: int) -> None:
+    if 0 <= index < len(rgb_points):
+        rgb_points.pop(index)
+    if 0 <= index < len(thermal_points):
+        thermal_points.pop(index)
+
+
+def _undo_last(rgb_points: List[Point], thermal_points: List[Point]) -> None:
+    if len(rgb_points) > len(thermal_points):
+        rgb_points.pop()
+        return
+    if thermal_points:
+        thermal_points.pop()
+    if rgb_points:
+        rgb_points.pop()
+
+
+def _find_nearest_point_index(
+    points: Sequence[Point],
+    *,
+    scale: float,
+    mouse_x: int,
+    mouse_y: int,
+    threshold_px: float = 16.0,
+) -> Optional[int]:
+    best_index: Optional[int] = None
+    best_distance = threshold_px
+    for idx, (x, y) in enumerate(points):
+        px = float(x * scale)
+        py = float(y * scale)
+        distance = float(((px - mouse_x) ** 2 + (py - mouse_y) ** 2) ** 0.5)
+        if distance <= best_distance:
+            best_distance = distance
+            best_index = idx
+    return best_index
+
+
+def _clamp_point(x: float, y: float, width: int, height: int) -> Point:
+    return (
+        min(max(0.0, x), max(0.0, float(width - 1))),
+        min(max(0.0, y), max(0.0, float(height - 1))),
+    )
+
+
+def pick_point_pairs_on_images(
+    rgb_image: np.ndarray,
+    thermal_image: np.ndarray,
     *,
     window_title: str,
     min_points: int = 4,
-) -> List[Point]:
-    image = _load_image(image_path)
-    display = _to_display_bgr(image)
-    height, width = display.shape[:2]
-    scale = _fit_scale(width, height)
-    if scale < 1.0:
-        shown = cv2.resize(display, (int(round(width * scale)), int(round(height * scale))), interpolation=cv2.INTER_AREA)
-    else:
-        shown = display.copy()
+) -> tuple[List[Point], List[Point]]:
+    rgb_display = _to_display_bgr(rgb_image)
+    thermal_display = _to_display_bgr(thermal_image)
+    rgb_height, rgb_width = rgb_display.shape[:2]
+    thermal_height, thermal_width = thermal_display.shape[:2]
 
-    points: List[Point] = []
-    instructions = [
-        "Left click: add point",
-        "u/backspace: undo last point",
-        "r: reset",
-        f"enter/space: finish when >= {min_points} points",
-        "esc: cancel",
-    ]
+    gap = 28
+    border = 4
+    header_height = 42
+    pad_x = 10
+    pad_y = 10
+    line_height = 24
 
-    def _redraw() -> np.ndarray:
-        return _draw_point_annotations(shown, points, scale=scale, footer_lines=instructions)
+    rgb_scale, thermal_scale = _fit_pair_scales(
+        rgb_width,
+        rgb_height,
+        thermal_width,
+        thermal_height,
+        gap=gap,
+    )
+    rgb_shown = cv2.resize(
+        rgb_display,
+        (max(1, int(round(rgb_width * rgb_scale))), max(1, int(round(rgb_height * rgb_scale)))),
+        interpolation=cv2.INTER_AREA if rgb_scale < 1.0 else cv2.INTER_LINEAR,
+    )
+    thermal_shown = cv2.resize(
+        thermal_display,
+        (max(1, int(round(thermal_width * thermal_scale))), max(1, int(round(thermal_height * thermal_scale)))),
+        interpolation=cv2.INTER_AREA if thermal_scale < 1.0 else cv2.INTER_LINEAR,
+    )
 
-    state = {"frame": _redraw()}
+    rgb_panel_w = rgb_shown.shape[1] + (border * 2)
+    rgb_panel_h = rgb_shown.shape[0] + (border * 2)
+    thermal_panel_w = thermal_shown.shape[1] + (border * 2)
+    thermal_panel_h = thermal_shown.shape[0] + (border * 2)
+    panels_top = header_height + pad_y
+    rgb_panel_x = pad_x
+    rgb_panel_y = panels_top
+    thermal_panel_x = rgb_panel_x + rgb_panel_w + gap
+    thermal_panel_y = panels_top
+    rgb_image_x = rgb_panel_x + border
+    rgb_image_y = rgb_panel_y + border
+    thermal_image_x = thermal_panel_x + border
+    thermal_image_y = thermal_panel_y + border
+
+    rgb_points: List[Point] = []
+    thermal_points: List[Point] = []
+    state: Dict[str, Any] = {
+        "frame": None,
+        "dragging": None,
+    }
+
+    def _layout_for_point(point: Point, *, pane: str) -> tuple[int, int]:
+        scale = rgb_scale if pane == "rgb" else thermal_scale
+        return int(round(point[0] * scale)), int(round(point[1] * scale))
+
+    def _pane_at(x: int, y: int) -> tuple[Optional[str], Optional[tuple[float, float]]]:
+        if (
+            rgb_image_x <= x < rgb_image_x + rgb_shown.shape[1]
+            and rgb_image_y <= y < rgb_image_y + rgb_shown.shape[0]
+        ):
+            return "rgb", ((x - rgb_image_x) / rgb_scale, (y - rgb_image_y) / rgb_scale)
+        if (
+            thermal_image_x <= x < thermal_image_x + thermal_shown.shape[1]
+            and thermal_image_y <= y < thermal_image_y + thermal_shown.shape[0]
+        ):
+            return "thermal", ((x - thermal_image_x) / thermal_scale, (y - thermal_image_y) / thermal_scale)
+        return None, None
+
+    def _redraw(active_drag: Optional[tuple[str, int]] = None) -> np.ndarray:
+        pending = _pending_side(rgb_points, thermal_points)
+        complete_pairs = min(len(rgb_points), len(thermal_points))
+        next_pair_index = max(len(rgb_points), len(thermal_points)) + (1 if len(rgb_points) == len(thermal_points) else 0)
+        instructions = [
+            f"Complete pairs: {complete_pairs}    Next pair: {next_pair_index} -> click {pending.upper()} image",
+            "Left click: add next point on the highlighted image, or drag an existing point to adjust it",
+            "Right click near a point: delete that pair    u/backspace: undo last    r: reset    enter/space: finish    esc: cancel",
+        ]
+        footer_height = (len(instructions) * line_height) + 16
+        frame_h = panels_top + max(rgb_panel_h, thermal_panel_h) + footer_height + pad_y
+        frame_w = thermal_panel_x + thermal_panel_w + pad_x
+        frame = np.full((frame_h, frame_w, 3), 24, dtype=np.uint8)
+
+        rgb_active_index = active_drag[1] if active_drag and active_drag[0] == "rgb" else None
+        thermal_active_index = active_drag[1] if active_drag and active_drag[0] == "thermal" else None
+        rgb_marked = _draw_point_annotations(rgb_shown, rgb_points, scale=rgb_scale, active_index=rgb_active_index)
+        thermal_marked = _draw_point_annotations(
+            thermal_shown,
+            thermal_points,
+            scale=thermal_scale,
+            active_index=thermal_active_index,
+        )
+
+        rgb_border_color = (70, 170, 70) if pending == "rgb" else (78, 78, 78)
+        thermal_border_color = (70, 170, 70) if pending == "thermal" else (78, 78, 78)
+        rgb_panel = cv2.copyMakeBorder(rgb_marked, border, border, border, border, cv2.BORDER_CONSTANT, value=rgb_border_color)
+        thermal_panel = cv2.copyMakeBorder(
+            thermal_marked,
+            border,
+            border,
+            border,
+            border,
+            cv2.BORDER_CONSTANT,
+            value=thermal_border_color,
+        )
+
+        frame[rgb_panel_y : rgb_panel_y + rgb_panel.shape[0], rgb_panel_x : rgb_panel_x + rgb_panel.shape[1]] = rgb_panel
+        frame[
+            thermal_panel_y : thermal_panel_y + thermal_panel.shape[0],
+            thermal_panel_x : thermal_panel_x + thermal_panel.shape[1],
+        ] = thermal_panel
+
+        rgb_title = "RGB" + ("  <- click next point here" if pending == "rgb" else "")
+        thermal_title = "Thermal" + ("  <- click matching point here" if pending == "thermal" else "")
+        cv2.putText(frame, rgb_title, (rgb_panel_x, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            thermal_title,
+            (thermal_panel_x, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.82,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        footer_y = panels_top + max(rgb_panel_h, thermal_panel_h) + 28
+        for line in instructions:
+            cv2.putText(frame, line, (pad_x, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (240, 240, 240), 1, cv2.LINE_AA)
+            footer_y += line_height
+        return frame
 
     def _mouse_callback(event: int, x: int, y: int, _flags: int, _userdata: Any) -> None:
-        if event != cv2.EVENT_LBUTTONDOWN:
+        pane, local = _pane_at(x, y)
+        if pane is None or local is None:
+            if event == cv2.EVENT_LBUTTONUP:
+                state["dragging"] = None
+                state["frame"] = _redraw()
             return
-        if y >= shown.shape[0]:
-            return
-        points.append((x / scale, y / scale))
-        state["frame"] = _redraw()
 
+        source_x, source_y = local
+        points = rgb_points if pane == "rgb" else thermal_points
+        scale = rgb_scale if pane == "rgb" else thermal_scale
+        width = rgb_width if pane == "rgb" else thermal_width
+        height = rgb_height if pane == "rgb" else thermal_height
+        display_x, display_y = _layout_for_point((source_x, source_y), pane=pane)
+        nearest_idx = _find_nearest_point_index(points, scale=scale, mouse_x=display_x, mouse_y=display_y)
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if nearest_idx is not None:
+                state["dragging"] = (pane, nearest_idx)
+                state["frame"] = _redraw(active_drag=state["dragging"])
+                return
+
+            if pane != _pending_side(rgb_points, thermal_points):
+                return
+
+            points.append(_clamp_point(source_x, source_y, width, height))
+            state["frame"] = _redraw()
+            return
+
+        if event == cv2.EVENT_MOUSEMOVE and state["dragging"] is not None:
+            drag_pane, drag_idx = state["dragging"]
+            drag_points = rgb_points if drag_pane == "rgb" else thermal_points
+            drag_width = rgb_width if drag_pane == "rgb" else thermal_width
+            drag_height = rgb_height if drag_pane == "rgb" else thermal_height
+            if pane != drag_pane:
+                return
+            drag_points[drag_idx] = _clamp_point(source_x, source_y, drag_width, drag_height)
+            state["frame"] = _redraw(active_drag=state["dragging"])
+            return
+
+        if event == cv2.EVENT_LBUTTONUP:
+            if state["dragging"] is not None:
+                drag_pane, drag_idx = state["dragging"]
+                if pane == drag_pane:
+                    drag_points = rgb_points if drag_pane == "rgb" else thermal_points
+                    drag_width = rgb_width if drag_pane == "rgb" else thermal_width
+                    drag_height = rgb_height if drag_pane == "rgb" else thermal_height
+                    drag_points[drag_idx] = _clamp_point(source_x, source_y, drag_width, drag_height)
+            state["dragging"] = None
+            state["frame"] = _redraw()
+            return
+
+        if event == cv2.EVENT_RBUTTONDOWN and nearest_idx is not None:
+            _delete_pair_at_index(rgb_points, thermal_points, nearest_idx)
+            state["dragging"] = None
+            state["frame"] = _redraw()
+
+    state["frame"] = _redraw()
     cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(window_title, _mouse_callback)
     try:
@@ -130,23 +360,26 @@ def pick_points_on_image(
             cv2.imshow(window_title, state["frame"])
             key = cv2.waitKey(20) & 0xFF
             if key in (13, 10, 32):
-                if len(points) >= min_points:
+                if len(rgb_points) == len(thermal_points) and len(rgb_points) >= min_points:
                     break
             elif key in (27,):
-                raise RuntimeError(f"Point picking canceled for {window_title}.")
+                raise RuntimeError("Thermal registration point picking was canceled.")
             elif key in (8, 127, ord("u"), ord("U")):
-                if points:
-                    points.pop()
+                if rgb_points or thermal_points:
+                    _undo_last(rgb_points, thermal_points)
+                    state["dragging"] = None
                     state["frame"] = _redraw()
             elif key in (ord("r"), ord("R")):
-                points.clear()
+                rgb_points.clear()
+                thermal_points.clear()
+                state["dragging"] = None
                 state["frame"] = _redraw()
 
             if cv2.getWindowProperty(window_title, cv2.WND_PROP_VISIBLE) < 1:
                 raise RuntimeError(f"Point picking window closed before completion: {window_title}")
     finally:
         cv2.destroyWindow(window_title)
-    return points
+    return rgb_points, thermal_points
 
 
 def _create_correspondence_preview(
@@ -210,11 +443,11 @@ def register_rgb_thermal_pair(
     rgb_display = _to_display_bgr(rgb_image)
     thermal_display = _to_display_bgr(thermal_image)
 
-    rgb_points = pick_points_on_image(rgb_path, window_title="RGB Registration Points", min_points=min_points)
-    thermal_points = pick_points_on_image(
-        thermal_path,
+    rgb_points, thermal_points = pick_point_pairs_on_images(
+        rgb_image,
+        thermal_image,
         window_title="Thermal Registration Points",
-        min_points=len(rgb_points),
+        min_points=min_points,
     )
 
     if len(rgb_points) != len(thermal_points):
