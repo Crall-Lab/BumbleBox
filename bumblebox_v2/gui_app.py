@@ -3512,7 +3512,9 @@ class BumbleBoxV2GUI(tk.Tk):
             title="Thermal Registration",
             details=(
                 "RGB and thermal frames open side by side in one window. Click the next point on the highlighted image, "
-                "then click the matching point on the other image. Existing points can be dragged to adjust them, "
+                "then click the matching point on the other image. The thermal pane is upscaled for easier point placement, "
+                "but BumbleBox converts those clicks back to native thermal coordinates before fitting the warp. "
+                "Existing points can be dragged to adjust them, mouse wheel zoom changes the display scale, "
                 "and right-clicking near a point deletes that pair. At least 4 point pairs are required. "
                 "BumbleBox then saves a homography, warped thermal preview, overlay preview, and registration JSON."
             ),

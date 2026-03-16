@@ -67,16 +67,19 @@ def _fit_pair_scales(
     max_width: int = 1500,
     max_height: int = 860,
     gap: int = 28,
+    zoom: float = 1.0,
 ) -> tuple[float, float]:
-    rgb_scale = min(1.0, max_height / max(1, rgb_height))
-    thermal_scale = min(1.0, max_height / max(1, thermal_height))
+    target_height = min(float(max_height), float(max(1, rgb_height)))
+    rgb_scale = min(1.0, target_height / max(1, rgb_height))
+    thermal_scale = target_height / max(1, thermal_height)
     total_width = (rgb_width * rgb_scale) + (thermal_width * thermal_scale) + gap
     if total_width > max_width:
         usable_width = max(1.0, float(max_width - gap))
         shrink = usable_width / max(1.0, (rgb_width * rgb_scale) + (thermal_width * thermal_scale))
         rgb_scale *= shrink
         thermal_scale *= shrink
-    return rgb_scale, thermal_scale
+    zoom = max(0.2, float(zoom))
+    return rgb_scale * zoom, thermal_scale * zoom
 
 
 def _draw_point_annotations(
@@ -176,70 +179,56 @@ def pick_point_pairs_on_images(
     pad_y = 10
     line_height = 24
 
-    rgb_scale, thermal_scale = _fit_pair_scales(
-        rgb_width,
-        rgb_height,
-        thermal_width,
-        thermal_height,
-        gap=gap,
-    )
-    rgb_shown = cv2.resize(
-        rgb_display,
-        (max(1, int(round(rgb_width * rgb_scale))), max(1, int(round(rgb_height * rgb_scale)))),
-        interpolation=cv2.INTER_AREA if rgb_scale < 1.0 else cv2.INTER_LINEAR,
-    )
-    thermal_shown = cv2.resize(
-        thermal_display,
-        (max(1, int(round(thermal_width * thermal_scale))), max(1, int(round(thermal_height * thermal_scale)))),
-        interpolation=cv2.INTER_AREA if thermal_scale < 1.0 else cv2.INTER_LINEAR,
-    )
-
-    rgb_panel_w = rgb_shown.shape[1] + (border * 2)
-    rgb_panel_h = rgb_shown.shape[0] + (border * 2)
-    thermal_panel_w = thermal_shown.shape[1] + (border * 2)
-    thermal_panel_h = thermal_shown.shape[0] + (border * 2)
-    panels_top = header_height + pad_y
-    rgb_panel_x = pad_x
-    rgb_panel_y = panels_top
-    thermal_panel_x = rgb_panel_x + rgb_panel_w + gap
-    thermal_panel_y = panels_top
-    rgb_image_x = rgb_panel_x + border
-    rgb_image_y = rgb_panel_y + border
-    thermal_image_x = thermal_panel_x + border
-    thermal_image_y = thermal_panel_y + border
-
     rgb_points: List[Point] = []
     thermal_points: List[Point] = []
     state: Dict[str, Any] = {
         "frame": None,
         "dragging": None,
+        "zoom": 1.0,
+        "view": {},
     }
 
-    def _layout_for_point(point: Point, *, pane: str) -> tuple[int, int]:
-        scale = rgb_scale if pane == "rgb" else thermal_scale
-        return int(round(point[0] * scale)), int(round(point[1] * scale))
+    def _build_view(*, active_drag: Optional[tuple[str, int]] = None) -> tuple[np.ndarray, Dict[str, Any]]:
+        rgb_scale, thermal_scale = _fit_pair_scales(
+            rgb_width,
+            rgb_height,
+            thermal_width,
+            thermal_height,
+            gap=gap,
+            zoom=state["zoom"],
+        )
+        rgb_shown = cv2.resize(
+            rgb_display,
+            (max(1, int(round(rgb_width * rgb_scale))), max(1, int(round(rgb_height * rgb_scale)))),
+            interpolation=cv2.INTER_AREA if rgb_scale < 1.0 else cv2.INTER_LINEAR,
+        )
+        thermal_shown = cv2.resize(
+            thermal_display,
+            (max(1, int(round(thermal_width * thermal_scale))), max(1, int(round(thermal_height * thermal_scale)))),
+            interpolation=cv2.INTER_AREA if thermal_scale < 1.0 else cv2.INTER_NEAREST,
+        )
 
-    def _pane_at(x: int, y: int) -> tuple[Optional[str], Optional[tuple[float, float]]]:
-        if (
-            rgb_image_x <= x < rgb_image_x + rgb_shown.shape[1]
-            and rgb_image_y <= y < rgb_image_y + rgb_shown.shape[0]
-        ):
-            return "rgb", ((x - rgb_image_x) / rgb_scale, (y - rgb_image_y) / rgb_scale)
-        if (
-            thermal_image_x <= x < thermal_image_x + thermal_shown.shape[1]
-            and thermal_image_y <= y < thermal_image_y + thermal_shown.shape[0]
-        ):
-            return "thermal", ((x - thermal_image_x) / thermal_scale, (y - thermal_image_y) / thermal_scale)
-        return None, None
+        rgb_panel_w = rgb_shown.shape[1] + (border * 2)
+        rgb_panel_h = rgb_shown.shape[0] + (border * 2)
+        thermal_panel_w = thermal_shown.shape[1] + (border * 2)
+        thermal_panel_h = thermal_shown.shape[0] + (border * 2)
+        panels_top = header_height + pad_y
+        rgb_panel_x = pad_x
+        rgb_panel_y = panels_top
+        thermal_panel_x = rgb_panel_x + rgb_panel_w + gap
+        thermal_panel_y = panels_top
+        rgb_image_x = rgb_panel_x + border
+        rgb_image_y = rgb_panel_y + border
+        thermal_image_x = thermal_panel_x + border
+        thermal_image_y = thermal_panel_y + border
 
-    def _redraw(active_drag: Optional[tuple[str, int]] = None) -> np.ndarray:
         pending = _pending_side(rgb_points, thermal_points)
         complete_pairs = min(len(rgb_points), len(thermal_points))
         next_pair_index = max(len(rgb_points), len(thermal_points)) + (1 if len(rgb_points) == len(thermal_points) else 0)
         instructions = [
-            f"Complete pairs: {complete_pairs}    Next pair: {next_pair_index} -> click {pending.upper()} image",
+            f"Complete pairs: {complete_pairs}    Next pair: {next_pair_index} -> click {pending.upper()} image    Zoom: {state['zoom']:.2f}x",
             "Left click: add next point on the highlighted image, or drag an existing point to adjust it",
-            "Right click near a point: delete that pair    u/backspace: undo last    r: reset    enter/space: finish    esc: cancel",
+            "Mouse wheel: zoom    Right click near a point: delete that pair    u/backspace: undo last    r: reset    enter/space: finish    esc: cancel",
         ]
         footer_height = (len(instructions) * line_height) + 16
         frame_h = panels_top + max(rgb_panel_h, thermal_panel_h) + footer_height + pad_y
@@ -293,9 +282,69 @@ def pick_point_pairs_on_images(
         for line in instructions:
             cv2.putText(frame, line, (pad_x, footer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (240, 240, 240), 1, cv2.LINE_AA)
             footer_y += line_height
+
+        view = {
+            "rgb_scale": rgb_scale,
+            "thermal_scale": thermal_scale,
+            "rgb_width": rgb_width,
+            "rgb_height": rgb_height,
+            "thermal_width": thermal_width,
+            "thermal_height": thermal_height,
+            "rgb_image_x": rgb_image_x,
+            "rgb_image_y": rgb_image_y,
+            "thermal_image_x": thermal_image_x,
+            "thermal_image_y": thermal_image_y,
+            "rgb_shown_w": rgb_shown.shape[1],
+            "rgb_shown_h": rgb_shown.shape[0],
+            "thermal_shown_w": thermal_shown.shape[1],
+            "thermal_shown_h": thermal_shown.shape[0],
+        }
+        return frame, view
+
+    def _pane_at(x: int, y: int) -> tuple[Optional[str], Optional[tuple[float, float]]]:
+        view = state["view"]
+        rgb_image_x = int(view["rgb_image_x"])
+        rgb_image_y = int(view["rgb_image_y"])
+        thermal_image_x = int(view["thermal_image_x"])
+        thermal_image_y = int(view["thermal_image_y"])
+        rgb_shown_w = int(view["rgb_shown_w"])
+        rgb_shown_h = int(view["rgb_shown_h"])
+        thermal_shown_w = int(view["thermal_shown_w"])
+        thermal_shown_h = int(view["thermal_shown_h"])
+        rgb_scale = float(view["rgb_scale"])
+        thermal_scale = float(view["thermal_scale"])
+        if (
+            rgb_image_x <= x < rgb_image_x + rgb_shown_w
+            and rgb_image_y <= y < rgb_image_y + rgb_shown_h
+        ):
+            return "rgb", ((x - rgb_image_x) / rgb_scale, (y - rgb_image_y) / rgb_scale)
+        if (
+            thermal_image_x <= x < thermal_image_x + thermal_shown_w
+            and thermal_image_y <= y < thermal_image_y + thermal_shown_h
+        ):
+            return "thermal", ((x - thermal_image_x) / thermal_scale, (y - thermal_image_y) / thermal_scale)
+        return None, None
+
+    def _redraw(active_drag: Optional[tuple[str, int]] = None) -> np.ndarray:
+        frame, view = _build_view(active_drag=active_drag)
+        state["view"] = view
         return frame
 
     def _mouse_callback(event: int, x: int, y: int, _flags: int, _userdata: Any) -> None:
+        if event == cv2.EVENT_MOUSEWHEEL:
+            delta = 0
+            if hasattr(cv2, "getMouseWheelDelta"):
+                try:
+                    delta = int(cv2.getMouseWheelDelta(_flags))
+                except Exception:
+                    delta = 0
+            if delta == 0:
+                delta = 1 if _flags > 0 else -1
+            factor = 1.12 if delta > 0 else (1.0 / 1.12)
+            state["zoom"] = min(4.0, max(0.45, float(state["zoom"]) * factor))
+            state["frame"] = _redraw(active_drag=state["dragging"])
+            return
+
         pane, local = _pane_at(x, y)
         if pane is None or local is None:
             if event == cv2.EVENT_LBUTTONUP:
@@ -305,10 +354,12 @@ def pick_point_pairs_on_images(
 
         source_x, source_y = local
         points = rgb_points if pane == "rgb" else thermal_points
-        scale = rgb_scale if pane == "rgb" else thermal_scale
-        width = rgb_width if pane == "rgb" else thermal_width
-        height = rgb_height if pane == "rgb" else thermal_height
-        display_x, display_y = _layout_for_point((source_x, source_y), pane=pane)
+        view = state["view"]
+        scale = float(view["rgb_scale"] if pane == "rgb" else view["thermal_scale"])
+        width = int(view["rgb_width"] if pane == "rgb" else view["thermal_width"])
+        height = int(view["rgb_height"] if pane == "rgb" else view["thermal_height"])
+        display_x = int(round(source_x * scale))
+        display_y = int(round(source_y * scale))
         nearest_idx = _find_nearest_point_index(points, scale=scale, mouse_x=display_x, mouse_y=display_y)
 
         if event == cv2.EVENT_LBUTTONDOWN:
