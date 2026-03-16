@@ -98,6 +98,7 @@ from .thermal_camera import (
     run_thermal_check,
 )
 from .thermal_registration import (
+    annotate_registration_overlay_with_session_tracking,
     apply_thermal_registration_to_config,
     format_thermal_registration,
     register_rgb_thermal_pair,
@@ -173,6 +174,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._fps_camera_reset_result = None
         self._fps_camera_reset_source: str | None = None
         self._thermal_check_result = None
+        self._thermal_registration_summary_path: str | None = None
         self._config_form_canvas: tk.Canvas | None = None
         self._config_form_window: int | None = None
         self._theme_knob: tk.Scale | None = None
@@ -6691,6 +6693,7 @@ class BumbleBoxV2GUI(tk.Tk):
         )
         if not selected:
             return
+        self._thermal_registration_summary_path = None
         self.thermal_registration_rgb_image_var.set(selected)
 
     def _browse_thermal_registration_thermal_image(self) -> None:
@@ -6705,6 +6708,7 @@ class BumbleBoxV2GUI(tk.Tk):
         )
         if not selected:
             return
+        self._thermal_registration_summary_path = None
         self.thermal_registration_thermal_image_var.set(selected)
 
     def _load_latest_thermal_registration_frames(self) -> None:
@@ -6742,6 +6746,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
             self.thermal_registration_rgb_image_var.set(str(rgb_path))
             self.thermal_registration_thermal_image_var.set(str(thermal_path))
+            self._thermal_registration_summary_path = str(chosen_summary_path)
 
             session_name = str(chosen_payload.get("session_name", "")).strip() or chosen_summary_path.stem
             self.calibration_output.delete("1.0", tk.END)
@@ -6793,6 +6798,23 @@ class BumbleBoxV2GUI(tk.Tk):
                 output_dir=output_dir,
                 min_points=4,
             )
+            tracking_overlay_note = None
+            summary_path_text = str(getattr(self, "_thermal_registration_summary_path", "") or "").strip()
+            if summary_path_text:
+                try:
+                    run_summary = load_run_summary(summary_path_text)
+                    summary_rgb = str(run_summary.get("recording_preview_png_path") or "").strip()
+                    summary_thermal = str(run_summary.get("thermal_preview_png_path") or "").strip()
+                    if summary_rgb and summary_thermal:
+                        summary_rgb_path = Path(summary_rgb).expanduser().resolve()
+                        summary_thermal_path = Path(summary_thermal).expanduser().resolve()
+                        if summary_rgb_path == rgb_path and summary_thermal_path == thermal_path:
+                            registration, tracking_overlay_note = annotate_registration_overlay_with_session_tracking(
+                                registration=registration,
+                                run_summary=run_summary,
+                            )
+                except Exception as exc:
+                    tracking_overlay_note = f"Tracked temperature overlay skipped: {exc}"
             updated = apply_thermal_registration_to_config(config, registration)
             snapshot_path, history_warning = self._save_config_with_history(
                 config_path,
@@ -6802,6 +6824,8 @@ class BumbleBoxV2GUI(tk.Tk):
 
             self.calibration_output.delete("1.0", tk.END)
             self.calibration_output.insert(tk.END, format_thermal_registration(registration))
+            if tracking_overlay_note:
+                self.calibration_output.insert(tk.END, f"\n\nTracking overlay note: {tracking_overlay_note}")
             history_note = self._format_config_history_note(snapshot_path, history_warning)
             if history_note:
                 self.calibration_output.insert(tk.END, f"\n\n{history_note}")

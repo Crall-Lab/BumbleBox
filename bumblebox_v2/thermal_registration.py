@@ -27,6 +27,8 @@ class ThermalRegistrationResult:
     overlay_png_path: str
     correspondence_png_path: str
     registration_json_path: str
+    overlay_with_tracking_png_path: Optional[str]
+    tracking_annotation_count: int
     notes: str
 
 
@@ -95,8 +97,8 @@ def _draw_point_annotations(
         px = int(round(x * scale))
         py = int(round(y * scale))
         fill_color = (0, 255, 255) if active_index != idx - 1 else (0, 180, 255)
-        cv2.circle(out, (px, py), 8, (0, 0, 0), -1)
-        cv2.circle(out, (px, py), 6, fill_color, -1)
+        cv2.circle(out, (px, py), 4, (0, 0, 0), -1)
+        cv2.circle(out, (px, py), 3, fill_color, -1)
         label = str(idx)
         cv2.putText(out, label, (px + 10, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(out, label, (px + 10, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
@@ -475,6 +477,175 @@ def _create_correspondence_preview(
     return combined
 
 
+def _raw16_to_apparent_celsius(raw_value: float) -> float:
+    # Lepton radiometric/TLinear frames are typically centi-Kelvin.
+    return (float(raw_value) / 100.0) - 273.15
+
+
+def _sample_apparent_temperature_c(
+    thermal_frame: np.ndarray,
+    *,
+    x: float,
+    y: float,
+    radius: int = 2,
+) -> Optional[float]:
+    if thermal_frame.ndim != 2:
+        return None
+    if not np.isfinite(x) or not np.isfinite(y):
+        return None
+    xi = int(round(x))
+    yi = int(round(y))
+    if xi < 0 or yi < 0 or xi >= int(thermal_frame.shape[1]) or yi >= int(thermal_frame.shape[0]):
+        return None
+    x0 = max(0, xi - radius)
+    x1 = min(int(thermal_frame.shape[1]), xi + radius + 1)
+    y0 = max(0, yi - radius)
+    y1 = min(int(thermal_frame.shape[0]), yi + radius + 1)
+    region = thermal_frame[y0:y1, x0:x1]
+    if region.size == 0:
+        return None
+    return _raw16_to_apparent_celsius(float(region.max()))
+
+
+def annotate_registration_overlay_with_session_tracking(
+    *,
+    registration: ThermalRegistrationResult,
+    run_summary: Dict[str, Any],
+) -> tuple[ThermalRegistrationResult, Optional[str]]:
+    tracking_csv_path = str(run_summary.get("raw_csv_path") or "").strip()
+    thermal_raw_npy_path = str(run_summary.get("thermal_raw_npy_path") or "").strip()
+    if not tracking_csv_path:
+        return registration, "No raw tracking CSV was found for the selected session."
+    if not thermal_raw_npy_path:
+        return registration, "No thermal raw stack was found for the selected session."
+
+    tracking_csv = Path(tracking_csv_path).expanduser().resolve()
+    thermal_raw_npy = Path(thermal_raw_npy_path).expanduser().resolve()
+    if not tracking_csv.exists():
+        return registration, f"Tracking CSV not found: {tracking_csv}"
+    if not thermal_raw_npy.exists():
+        return registration, f"Thermal raw stack not found: {thermal_raw_npy}"
+
+    try:
+        import pandas as pd
+    except Exception as exc:
+        return registration, f"pandas is required for tracked thermal overlay annotations: {exc}"
+
+    try:
+        frame_count = int(run_summary.get("frames_captured", 0) or 0)
+        thermal_frame_count = int(run_summary.get("thermal_frames_captured", 0) or 0)
+    except Exception as exc:
+        return registration, f"Could not determine midpoint frame index from run summary: {exc}"
+    if frame_count <= 0 or thermal_frame_count <= 0:
+        return registration, "Selected session did not report RGB and thermal frame counts."
+
+    rgb_mid_idx = max(0, min(frame_count - 1, frame_count // 2))
+    thermal_mid_idx = max(0, min(thermal_frame_count - 1, thermal_frame_count // 2))
+
+    df = pd.read_csv(tracking_csv)
+    required = {"frame", "centroidX", "centroidY"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        return registration, "Tracking CSV is missing required columns: " + ", ".join(missing)
+
+    work = df.copy()
+    work["frame"] = pd.to_numeric(work["frame"], errors="coerce")
+    work["centroidX"] = pd.to_numeric(work["centroidX"], errors="coerce")
+    work["centroidY"] = pd.to_numeric(work["centroidY"], errors="coerce")
+    if "ID" in work.columns:
+        work["ID"] = pd.to_numeric(work["ID"], errors="coerce")
+    frame_rows = work.loc[work["frame"] == rgb_mid_idx].copy()
+    frame_rows = frame_rows.dropna(subset=["centroidX", "centroidY"])
+    if frame_rows.empty:
+        return registration, f"No tracked detections were found on midpoint RGB frame {rgb_mid_idx}."
+
+    thermal_stack = np.load(thermal_raw_npy, mmap_mode="r")
+    if getattr(thermal_stack, "ndim", 0) != 3:
+        return registration, "Thermal raw stack did not have the expected 3D shape."
+    thermal_frame = thermal_stack[thermal_mid_idx]
+
+    homography = np.array(registration.homography, dtype=np.float64)
+    try:
+        rgb_to_thermal = np.linalg.inv(homography)
+    except Exception as exc:
+        return registration, f"Could not invert homography for thermal sampling: {exc}"
+
+    overlay_path = Path(registration.overlay_png_path).expanduser().resolve()
+    overlay = cv2.imread(str(overlay_path), cv2.IMREAD_COLOR)
+    if overlay is None:
+        return registration, f"Could not load overlay image for tracking annotation: {overlay_path}"
+
+    annotations_drawn = 0
+    for row in frame_rows.itertuples(index=False):
+        rgb_x = float(getattr(row, "centroidX"))
+        rgb_y = float(getattr(row, "centroidY"))
+        rgb_point = np.array([[[rgb_x, rgb_y]]], dtype=np.float32)
+        thermal_point = cv2.perspectiveTransform(rgb_point, rgb_to_thermal)[0, 0]
+        temperature_c = _sample_apparent_temperature_c(
+            thermal_frame,
+            x=float(thermal_point[0]),
+            y=float(thermal_point[1]),
+        )
+        if temperature_c is None:
+            continue
+
+        cx = int(round(rgb_x))
+        cy = int(round(rgb_y))
+        cv2.circle(overlay, (cx, cy), 5, (0, 0, 0), -1)
+        cv2.circle(overlay, (cx, cy), 3, (0, 220, 255), -1)
+
+        label_parts = []
+        if hasattr(row, "ID"):
+            id_value = getattr(row, "ID")
+            if pd.notna(id_value):
+                label_parts.append(str(int(float(id_value))))
+        label_parts.append(f"{temperature_c:.1f}C")
+        label = " ".join(label_parts)
+        text_x = max(0, cx + 8)
+        text_y = max(12, cy - 8)
+        cv2.putText(
+            overlay,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        annotations_drawn += 1
+
+    if annotations_drawn <= 0:
+        return registration, "Tracked detections were found, but no thermal temperatures could be sampled."
+
+    output_path = overlay_path.with_name(f"{overlay_path.stem}_with_tracking.png")
+    if not cv2.imwrite(str(output_path), overlay):
+        return registration, f"Could not write tracked thermal overlay image: {output_path}"
+
+    registration.overlay_with_tracking_png_path = str(output_path)
+    registration.tracking_annotation_count = int(annotations_drawn)
+    try:
+        json_path = Path(registration.registration_json_path).expanduser().resolve()
+        if json_path.exists():
+            payload = json.loads(json_path.read_text())
+            payload["overlay_with_tracking_png_path"] = registration.overlay_with_tracking_png_path
+            payload["tracking_annotation_count"] = registration.tracking_annotation_count
+            json_path.write_text(json.dumps(payload, indent=2))
+    except Exception:
+        pass
+    return registration, None
+
+
 def register_rgb_thermal_pair(
     *,
     rgb_image_path: str | Path,
@@ -520,7 +691,7 @@ def register_rgb_thermal_pair(
         homography,
         (rgb_display.shape[1], rgb_display.shape[0]),
     )
-    overlay = cv2.addWeighted(rgb_display, 0.68, warped_thermal, 0.42, 0.0)
+    overlay = cv2.addWeighted(rgb_display, 0.68, warped_thermal, 0.84, 0.0)
     correspondence = _create_correspondence_preview(rgb_image, thermal_image, rgb_points, thermal_points)
 
     warped_path = output_root / "warped_thermal.png"
@@ -546,6 +717,8 @@ def register_rgb_thermal_pair(
         "warped_thermal_png_path": str(warped_path),
         "overlay_png_path": str(overlay_path),
         "correspondence_png_path": str(correspondence_path),
+        "overlay_with_tracking_png_path": None,
+        "tracking_annotation_count": 0,
         "notes": (
             "Approximate 2D registration from manually selected correspondence points. "
             "This does not model full 3D nest structure."
@@ -567,6 +740,8 @@ def register_rgb_thermal_pair(
         overlay_png_path=str(overlay_path),
         correspondence_png_path=str(correspondence_path),
         registration_json_path=str(json_path),
+        overlay_with_tracking_png_path=None,
+        tracking_annotation_count=0,
         notes=str(payload["notes"]),
     )
 
@@ -590,6 +765,8 @@ def apply_thermal_registration_to_config(
     registration_cfg["overlay_png_path"] = registration.overlay_png_path
     registration_cfg["correspondence_png_path"] = registration.correspondence_png_path
     registration_cfg["registration_json_path"] = registration.registration_json_path
+    registration_cfg["overlay_with_tracking_png_path"] = registration.overlay_with_tracking_png_path
+    registration_cfg["tracking_annotation_count"] = int(registration.tracking_annotation_count)
     registration_cfg["notes"] = registration.notes
     return updated
 
@@ -608,6 +785,9 @@ def format_thermal_registration(registration: ThermalRegistrationResult) -> str:
         f"Correspondence PNG: {registration.correspondence_png_path}",
         f"Registration JSON: {registration.registration_json_path}",
     ]
+    if registration.overlay_with_tracking_png_path:
+        lines.append(f"Overlay PNG with tracked temperatures: {registration.overlay_with_tracking_png_path}")
+        lines.append(f"Tracked annotations: {registration.tracking_annotation_count}")
     if registration.notes:
         lines.append(f"Notes: {registration.notes}")
     return "\n".join(lines)
