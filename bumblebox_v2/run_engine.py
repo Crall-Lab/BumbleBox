@@ -1934,6 +1934,37 @@ def _run_cleaning(config: Dict[str, Any], df: Any, actual_fps: float) -> Any:
     return out
 
 
+def _excluded_tracking_tag_ids(config: Dict[str, Any]) -> set[int]:
+    raw_ids = config.get("tracking", {}).get("excluded_tag_ids", [])
+    if not isinstance(raw_ids, list):
+        return set()
+    out: set[int] = set()
+    for raw_id in raw_ids:
+        try:
+            out.add(int(raw_id))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _apply_tracking_id_exclusions(df: Any, excluded_ids: set[int]) -> tuple[Any, int]:
+    if not excluded_ids:
+        return df, 0
+    if getattr(df, "empty", True):
+        return df, 0
+    if "ID" not in getattr(df, "columns", []):
+        return df, 0
+
+    import pandas as pd
+
+    work = df.copy()
+    numeric_ids = pd.to_numeric(work["ID"], errors="coerce")
+    keep_mask = ~numeric_ids.isin(list(excluded_ids))
+    filtered = work.loc[keep_mask].copy()
+    removed = int(len(work) - len(filtered))
+    return filtered, removed
+
+
 def _run_metrics(config: Dict[str, Any], df: Any, actual_fps: float, session_dir: Path, session_name: str, warnings: List[str]) -> None:
     if not bool(config["pipeline"].get("calculate_behavior_metrics", False)):
         return
@@ -2170,6 +2201,16 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
 
             raw_csv = session_dir / f"{session_name}_raw.csv"
             noid_csv = session_dir / f"{session_name}_noID.csv"
+            excluded_tag_ids = _excluded_tracking_tag_ids(config)
+            df, removed_rows = _apply_tracking_id_exclusions(df, excluded_tag_ids)
+            if removed_rows > 0:
+                warnings.append(
+                    "Excluded tracking IDs were removed from outputs: "
+                    + ", ".join(str(tag_id) for tag_id in sorted(excluded_tag_ids))
+                    + f" ({removed_rows} rows dropped)."
+                )
+            df.to_csv(raw_csv, index=False)
+            df2.to_csv(noid_csv, index=False)
 
             if not df.empty:
                 df_clean = _run_cleaning(config, df, actual_fps if actual_fps > 0 else float(config["camera"]["fps_target"]))

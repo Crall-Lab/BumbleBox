@@ -46,6 +46,9 @@ capture:
 tracking:
   tag_dictionary: "4X4_50"
   box_preset: "custom"
+  excluded_tag_ids:
+    - 17
+    - 37
   aruco_params:
     minMarkerPerimeterRate: 0.02
     adaptiveThreshWinSizeMin: 5

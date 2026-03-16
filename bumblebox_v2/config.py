@@ -145,6 +145,17 @@ def validate_config(config: Dict[str, Any]) -> None:
             f"got: {tracking_source}"
         )
 
+    excluded_tag_ids = config.get("tracking", {}).get("excluded_tag_ids", [])
+    if not isinstance(excluded_tag_ids, list):
+        raise ConfigError("tracking.excluded_tag_ids must be a list of tag IDs")
+    for idx, tag_id in enumerate(excluded_tag_ids):
+        try:
+            int(tag_id)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"tracking.excluded_tag_ids[{idx}] must be an integer-like tag ID"
+            ) from exc
+
     backend = config["scheduling"].get("backend")
     if backend not in VALID_SCHED_BACKENDS:
         raise ConfigError(

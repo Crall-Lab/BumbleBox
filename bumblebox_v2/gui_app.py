@@ -97,6 +97,11 @@ from .thermal_camera import (
     format_thermal_check_result,
     run_thermal_check,
 )
+from .thermal_registration import (
+    apply_thermal_registration_to_config,
+    format_thermal_registration,
+    register_rgb_thermal_pair,
+)
 
 OCEAN_SLATE_PALETTE = {
     "app_bg": "#2B3A42",
@@ -3258,6 +3263,8 @@ class BumbleBoxV2GUI(tk.Tk):
         self.manual_distance_cm = tk.StringVar(value="10.0")
         self.calibration_labelme_image_path_var = tk.StringVar(value="")
         self.calibration_labelme_json_path_var = tk.StringVar(value="")
+        self.thermal_registration_rgb_image_var = tk.StringVar(value="")
+        self.thermal_registration_thermal_image_var = tk.StringVar(value="")
 
         self.aruco_image = tk.StringVar()
         self.aruco_marker_size_mm = tk.StringVar(value="5.0")
@@ -3414,6 +3421,74 @@ class BumbleBoxV2GUI(tk.Tk):
         )
         aruco.columnconfigure(1, weight=1)
         self._register_advanced_widget(aruco)
+
+        thermal_reg = ttk.LabelFrame(top, text="Thermal Registration (Approximate 2D)", padding=8)
+        thermal_reg.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(
+            thermal_reg,
+            text=(
+                "Pick corresponding points on one RGB frame and one thermal frame to build an approximate 2D warp. "
+                "This helps align the two cameras for visualization, but it does not fully correct the 3D nest geometry."
+            ),
+            wraplength=860,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        self._grid_help_label(
+            thermal_reg,
+            row=1,
+            column=0,
+            text="RGB image",
+            help_title="RGB Registration Image",
+            help_details="RGB frame used as the reference target for thermal registration.",
+        )
+        ttk.Entry(thermal_reg, textvariable=self.thermal_registration_rgb_image_var, width=72).grid(
+            row=1, column=1, sticky="ew", padx=8, pady=3
+        )
+        ttk.Button(
+            thermal_reg,
+            text="Browse RGB",
+            command=self._browse_thermal_registration_rgb_image,
+        ).grid(row=1, column=2, sticky="w", padx=(0, 6), pady=3)
+
+        self._grid_help_label(
+            thermal_reg,
+            row=2,
+            column=0,
+            text="Thermal image",
+            help_title="Thermal Registration Image",
+            help_details="Thermal frame that shows the same scene as the RGB image.",
+        )
+        ttk.Entry(thermal_reg, textvariable=self.thermal_registration_thermal_image_var, width=72).grid(
+            row=2, column=1, sticky="ew", padx=8, pady=3
+        )
+        ttk.Button(
+            thermal_reg,
+            text="Browse Thermal",
+            command=self._browse_thermal_registration_thermal_image,
+        ).grid(row=2, column=2, sticky="w", padx=(0, 6), pady=3)
+
+        reg_actions = ttk.Frame(thermal_reg)
+        reg_actions.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Button(
+            reg_actions,
+            text="Use Latest Session Midframes",
+            command=self._load_latest_thermal_registration_frames,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            reg_actions,
+            text="Pick Points + Register + Save",
+            command=self._register_thermal_from_images,
+        ).pack(side=tk.LEFT, padx=8)
+        self._make_help_button(
+            reg_actions,
+            title="Thermal Registration",
+            details=(
+                "You will click matching points on the RGB image first, then on the thermal image in the same order. "
+                "At least 4 point pairs are required. BumbleBox then saves a homography, warped thermal preview, "
+                "overlay preview, and registration JSON."
+            ),
+        ).pack(side=tk.LEFT)
+        thermal_reg.columnconfigure(1, weight=1)
 
         top.columnconfigure(0, weight=1)
         top.columnconfigure(1, weight=1)
@@ -6568,6 +6643,136 @@ class BumbleBoxV2GUI(tk.Tk):
                 self.calibration_output.insert(tk.END, f"\n\n{history_note}")
         except Exception as exc:
             self._show_error("ArUco calibration failed", str(exc))
+
+    def _browse_thermal_registration_rgb_image(self) -> None:
+        initial_dir = str(Path(self.config_path_var.get()).expanduser().parent)
+        selected = filedialog.askopenfilename(
+            title="Select RGB registration image",
+            initialdir=initial_dir,
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not selected:
+            return
+        self.thermal_registration_rgb_image_var.set(selected)
+
+    def _browse_thermal_registration_thermal_image(self) -> None:
+        initial_dir = str(Path(self.config_path_var.get()).expanduser().parent)
+        selected = filedialog.askopenfilename(
+            title="Select thermal registration image",
+            initialdir=initial_dir,
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not selected:
+            return
+        self.thermal_registration_thermal_image_var.set(selected)
+
+    def _load_latest_thermal_registration_frames(self) -> None:
+        try:
+            config, _ = self._load_config_or_defaults()
+            data_root_text = str(config.get("system", {}).get("data_root", "")).strip()
+            if not data_root_text:
+                raise ValueError("system.data_root is empty in config.")
+            data_root = Path(data_root_text).expanduser()
+
+            records = list_recent_run_records(data_root, limit=60)
+            chosen_payload = None
+            chosen_summary_path = None
+            for record in records:
+                payload = load_run_summary(record.summary_path)
+                rgb_path = str(payload.get("recording_preview_png_path") or "").strip()
+                thermal_path = str(payload.get("thermal_preview_png_path") or "").strip()
+                if rgb_path and thermal_path:
+                    chosen_payload = payload
+                    chosen_summary_path = record.summary_path
+                    break
+
+            if chosen_payload is None or chosen_summary_path is None:
+                raise RuntimeError(
+                    "No recent run summary contained both an RGB midpoint PNG and a thermal midpoint PNG. "
+                    "Run a thermal-enabled recording first, then try again."
+                )
+
+            rgb_path = Path(str(chosen_payload.get("recording_preview_png_path", "")).strip()).expanduser().resolve()
+            thermal_path = Path(str(chosen_payload.get("thermal_preview_png_path", "")).strip()).expanduser().resolve()
+            if not rgb_path.exists():
+                raise FileNotFoundError(f"RGB midpoint PNG not found: {rgb_path}")
+            if not thermal_path.exists():
+                raise FileNotFoundError(f"Thermal midpoint PNG not found: {thermal_path}")
+
+            self.thermal_registration_rgb_image_var.set(str(rgb_path))
+            self.thermal_registration_thermal_image_var.set(str(thermal_path))
+
+            session_name = str(chosen_payload.get("session_name", "")).strip() or chosen_summary_path.stem
+            self.calibration_output.delete("1.0", tk.END)
+            self.calibration_output.insert(
+                tk.END,
+                (
+                    "Loaded latest session midframes for thermal registration.\n"
+                    f"Session: {session_name}\n"
+                    f"Run summary: {chosen_summary_path}\n"
+                    f"RGB image: {rgb_path}\n"
+                    f"Thermal image: {thermal_path}\n\n"
+                    "Next step: click 'Pick Points + Register + Save' and mark the same landmarks in the same order."
+                ),
+            )
+        except Exception as exc:
+            self._show_error("Load thermal registration frames failed", str(exc))
+
+    def _register_thermal_from_images(self) -> None:
+        try:
+            config, config_path = self._load_config_or_defaults()
+            rgb_path_text = self.thermal_registration_rgb_image_var.get().strip()
+            thermal_path_text = self.thermal_registration_thermal_image_var.get().strip()
+            if not rgb_path_text:
+                raise ValueError("Choose an RGB registration image first.")
+            if not thermal_path_text:
+                raise ValueError("Choose a thermal registration image first.")
+
+            rgb_path = Path(rgb_path_text).expanduser().resolve()
+            thermal_path = Path(thermal_path_text).expanduser().resolve()
+            if not rgb_path.exists():
+                raise FileNotFoundError(f"RGB registration image not found: {rgb_path}")
+            if not thermal_path.exists():
+                raise FileNotFoundError(f"Thermal registration image not found: {thermal_path}")
+
+            data_root_text = str(config.get("system", {}).get("data_root", "")).strip()
+            if not data_root_text:
+                raise ValueError("system.data_root is empty in config.")
+            data_root = Path(data_root_text).expanduser()
+            output_dir = (
+                data_root.resolve()
+                / "calibration"
+                / "thermal_registration"
+                / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            )
+
+            registration = register_rgb_thermal_pair(
+                rgb_image_path=rgb_path,
+                thermal_image_path=thermal_path,
+                output_dir=output_dir,
+                min_points=4,
+            )
+            updated = apply_thermal_registration_to_config(config, registration)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                updated,
+                reason="thermal_registration_manual",
+            )
+
+            self.calibration_output.delete("1.0", tk.END)
+            self.calibration_output.insert(tk.END, format_thermal_registration(registration))
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            if history_note:
+                self.calibration_output.insert(tk.END, f"\n\n{history_note}")
+            self.notebook.select(self.calibration_tab)
+        except Exception as exc:
+            self._show_error("Thermal registration failed", str(exc))
 
     def _run_once_now(self) -> None:
         try:
