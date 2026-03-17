@@ -93,7 +93,7 @@ runtime:
 
 scheduling:
   backend: "systemd"
-  scope: "system"
+  scope: "user"
   unit_prefix: "bumblebox-v2"
   service_user: "auto"
   enabled: false

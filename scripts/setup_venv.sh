@@ -21,6 +21,7 @@ Options:
   --label-venv-dir <path>   Dedicated labeling env path (default: <repo>/.venvs/bbx-label)
   --label-python <bin>      Python interpreter for dedicated labeling env (default: --python value)
   --skip-system-deps        Do not auto-install apt dependencies (Pi)
+  --skip-enable-linger     Do not auto-enable lingering for the BumbleBox user
   --skip-pip-upgrade        Skip pip/setuptools/wheel upgrade
   --skip-gui-shortcut       Do not auto-install Desktop GUI launcher/icon at end of setup
   --no-smoke-check          Skip import smoke checks
@@ -43,12 +44,14 @@ SETUP_LABEL_ENV=1
 LABEL_VENV_DIR="${REPO_ROOT}/.venvs/bbx-label"
 LABEL_PYTHON_BIN=""
 AUTO_SYSTEM_DEPS=1
+AUTO_ENABLE_LINGER=1
 SKIP_PIP_UPGRADE=0
 INSTALL_GUI_SHORTCUT=1
 RUN_SMOKE_CHECK=1
 PI_MODEL=""
 SKIPPED_PIP_NEST_LABEL_ON_PI=0
 SKIPPED_PIP_PICAMERA2_ON_PI=0
+LINGER_RESULT=""
 
 detect_pi_model() {
   local model=""
@@ -191,6 +194,54 @@ maybe_install_apt_packages() {
   return 0
 }
 
+linger_target_user() {
+  if [[ ${EUID:-$(id -u)} -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    printf "%s\n" "${SUDO_USER}"
+    return 0
+  fi
+  id -un
+}
+
+ensure_user_linger() {
+  local target_user
+  target_user="$(linger_target_user)"
+  if [[ -z "$target_user" ]]; then
+    LINGER_RESULT="[BumbleBox] Note: Could not determine which user should get linger enabled."
+    return 0
+  fi
+
+  if ! command -v loginctl >/dev/null 2>&1; then
+    LINGER_RESULT="[BumbleBox] Note: loginctl is not available on this system. User timers will only run while ${target_user} is logged in."
+    return 0
+  fi
+
+  local current_state=""
+  current_state="$(loginctl show-user "$target_user" -p Linger --value 2>/dev/null || true)"
+  if [[ "$current_state" == "yes" ]]; then
+    LINGER_RESULT="[BumbleBox] User lingering already enabled for ${target_user}."
+    return 0
+  fi
+
+  echo "[BumbleBox] Enabling user lingering for ${target_user} so user-scope scheduled recordings can continue after logout"
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    if loginctl enable-linger "$target_user"; then
+      LINGER_RESULT="[BumbleBox] Enabled user lingering for ${target_user}."
+      return 0
+    fi
+  elif command -v sudo >/dev/null 2>&1; then
+    if sudo loginctl enable-linger "$target_user"; then
+      LINGER_RESULT="[BumbleBox] Enabled user lingering for ${target_user}."
+      return 0
+    fi
+  else
+    LINGER_RESULT="[BumbleBox] WARNING: Could not enable user lingering for ${target_user} automatically because sudo is unavailable."
+    return 0
+  fi
+
+  LINGER_RESULT="[BumbleBox] WARNING: Failed to enable user lingering for ${target_user}. User timers will still work while logged in."
+  return 0
+}
+
 install_label_env_packages() {
   local label_py="$1"
   local label_ready=0
@@ -291,6 +342,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-system-deps)
       AUTO_SYSTEM_DEPS=0
+      shift
+      ;;
+    --skip-enable-linger)
+      AUTO_ENABLE_LINGER=0
       shift
       ;;
     --skip-pip-upgrade)
@@ -459,6 +514,10 @@ if [[ "$INSTALL_GUI_SHORTCUT" -eq 1 ]]; then
   fi
 fi
 
+if [[ "$AUTO_ENABLE_LINGER" -eq 1 ]]; then
+  ensure_user_linger
+fi
+
 cat <<EOF
 
 [BumbleBox] Setup complete.
@@ -478,6 +537,13 @@ Auto-detected by BumbleBox nest-label commands and GUI.
 Manual override (optional):
   export BUMBLEBOX_NEST_PYTHON=${LABEL_VENV_PY}
 
+EOF
+fi
+
+if [[ -n "$LINGER_RESULT" ]]; then
+  cat <<EOF
+
+${LINGER_RESULT}
 EOF
 fi
 

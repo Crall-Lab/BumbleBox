@@ -87,6 +87,7 @@ from .storage_manager import (
 )
 from .status_history import list_recent_run_records, load_run_summary
 from .systemd_units import (
+    build_systemd_action_sudo_command,
     format_systemd_action_result,
     format_systemd_result,
     run_systemd_action,
@@ -272,6 +273,73 @@ class BumbleBoxV2GUI(tk.Tk):
 
     def _show_info(self, title: str, message: str) -> None:
         self._show_message("info", title, message)
+
+    @staticmethod
+    def _current_login_user() -> str:
+        return (
+            os.environ.get("SUDO_USER")
+            or os.environ.get("USER")
+            or os.environ.get("LOGNAME")
+            or ""
+        ).strip()
+
+    def _user_linger_enabled(self) -> bool | None:
+        user = self._current_login_user()
+        if not user:
+            return None
+        if shutil.which("loginctl") is None:
+            return None
+        try:
+            proc = subprocess.run(
+                ["loginctl", "show-user", user, "-p", "Linger", "--value"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            return None
+        value = (proc.stdout or "").strip().lower()
+        if value == "yes":
+            return True
+        if value == "no":
+            return False
+        return None
+
+    def _show_automation_started_popup(self, config: dict) -> None:
+        scheduling = config.get("scheduling", {}) if isinstance(config.get("scheduling"), dict) else {}
+        scope = str(scheduling.get("scope", "user")).strip().lower()
+        if scope == "system":
+            self._show_info(
+                "Automated Recording Started",
+                (
+                    "Automated recording has started.\n\n"
+                    "This system is using system-level timers, so scheduled recordings will continue "
+                    "even if you log out."
+                ),
+            )
+            return
+
+        linger_enabled = self._user_linger_enabled()
+        if linger_enabled is True:
+            self._show_info(
+                "Automated Recording Started",
+                (
+                    "Automated recording has started.\n\n"
+                    "This BumbleBox is configured to keep scheduled recordings running even if you log out."
+                ),
+            )
+            return
+
+        self._show_info(
+            "Automated Recording Started",
+            (
+                "Automated recording has started.\n\n"
+                "Scheduled recordings will run while this BumbleBox user is logged in. "
+                "If you need them to continue after logout, rerun the setup script to enable background scheduling."
+            ),
+        )
 
     def _apply_ocean_slate_theme(self) -> None:
         colors = self._palette
@@ -2958,7 +3026,14 @@ class BumbleBoxV2GUI(tk.Tk):
             should_show = allowed_roles is None or fleet_role in allowed_roles
             if key == "camera.mp4_codec":
                 should_show = should_show and codec_value == "mp4" and ui_mode == "advanced"
-            if key in {"camera.preview_window", "camera.tuning_file"}:
+            if key in {
+                "camera.preview_window",
+                "camera.tuning_file",
+                "scheduling.backend",
+                "scheduling.scope",
+                "scheduling.unit_prefix",
+                "scheduling.service_user",
+            }:
                 should_show = should_show and ui_mode == "advanced"
             if should_show:
                 row.grid()
@@ -4916,7 +4991,8 @@ class BumbleBoxV2GUI(tk.Tk):
             text=(
                 "Repeated recording is started with scheduled systemd timers. "
                 "This button saves the current Config Editor settings, writes the timer files, "
-                "installs them into systemd, and starts them now."
+                "installs them into systemd, and starts them now. In Basic mode it uses user-scope timers "
+                "so automation can start without sudo."
             ),
             wraplength=900,
             justify=tk.LEFT,
@@ -6915,9 +6991,59 @@ class BumbleBoxV2GUI(tk.Tk):
         except Exception as exc:
             self._show_error("Systemd generation failed", str(exc))
 
+    def _build_systemd_permission_guidance(
+        self,
+        *,
+        config: dict[str, object],
+        config_path: str | Path,
+        output_dir: str,
+    ) -> str:
+        config_path = str(config_path)
+        scope = str((config.get("scheduling") or {}).get("scope", "system")).strip().lower()
+        if scope != "system":
+            return ""
+        install_cmd = build_systemd_action_sudo_command(
+            action="install",
+            config_path=config_path,
+            output_dir=output_dir,
+        )
+        status_cmd = build_systemd_action_sudo_command(
+            action="status",
+            config_path=config_path,
+            output_dir=output_dir,
+        )
+        return (
+            "Scheduler scope is set to 'system', which writes timer files into /etc/systemd/system and "
+            "requires root privileges.\n\n"
+            "Options:\n"
+            "1. Keep system scope and run this from a terminal:\n"
+            f"   {install_cmd}\n"
+            f"   {status_cmd}\n\n"
+            "2. Or change Config Editor -> Scheduler scope to 'user' if per-user timers are acceptable. "
+            "User-scope timers can be installed from the GUI without sudo. If they should continue after logout, "
+            "run: loginctl enable-linger $(whoami)"
+        )
+
+    def _coerce_basic_automation_config(self, config: dict) -> tuple[dict, list[str]]:
+        notes: list[str] = []
+        ui_mode = str(self.ui_mode_var.get()).strip().lower()
+        if ui_mode != "basic":
+            return config, notes
+        scheduling = config.setdefault("scheduling", {})
+        backend_before = str(scheduling.get("backend", "systemd")).strip().lower()
+        scope_before = str(scheduling.get("scope", "user")).strip().lower()
+        if backend_before != "systemd":
+            scheduling["backend"] = "systemd"
+            notes.append("Basic-mode automation forced scheduler backend to systemd.")
+        if scope_before != "user":
+            scheduling["scope"] = "user"
+            notes.append("Basic-mode automation forced scheduler scope to user so the GUI can start timers without sudo.")
+        return config, notes
+
     def _start_automated_recording(self) -> None:
         try:
             config, config_path = self._load_effective_action_config()
+            config, automation_notes = self._coerce_basic_automation_config(config)
             snapshot_path, history_warning = self._save_config_with_history(
                 config_path,
                 config,
@@ -6944,6 +7070,8 @@ class BumbleBoxV2GUI(tk.Tk):
             ]
             if history_note:
                 lines.append(history_note)
+            if automation_notes:
+                lines.extend(automation_notes)
             lines.extend(
                 [
                     "",
@@ -6962,10 +7090,21 @@ class BumbleBoxV2GUI(tk.Tk):
             self.run_output.insert(tk.END, "\n".join(lines))
             self.notebook.select(self.run_tab)
             if not install_result.success:
-                self._show_error(
-                    "Automated recording start failed",
-                    "One or more timer setup steps failed. See Run & Schedule Results for details.",
+                guidance = self._build_systemd_permission_guidance(
+                    config=config,
+                    config_path=config_path,
+                    output_dir=output_dir,
                 )
+                if guidance and "Permission denied while copying to" in (install_result.note or ""):
+                    self.run_output.insert(tk.END, "\n\nPermission guidance\n" + guidance)
+                    self._show_error("Automated recording start failed", guidance)
+                else:
+                    self._show_error(
+                        "Automated recording start failed",
+                        "One or more timer setup steps failed. See Run & Schedule Results for details.",
+                    )
+            else:
+                self._show_automation_started_popup(config)
         except Exception as exc:
             self._show_error("Automated recording start failed", str(exc))
 
@@ -6999,6 +7138,14 @@ class BumbleBoxV2GUI(tk.Tk):
                     ),
                 )
             self.run_output.insert(tk.END, format_systemd_action_result(result))
+            guidance = self._build_systemd_permission_guidance(
+                config=config,
+                config_path=config_path,
+                output_dir=self.systemd_output_dir_var.get().strip(),
+            )
+            if action == "install" and not result.success and guidance and "Permission denied while copying to" in (result.note or ""):
+                self.run_output.insert(tk.END, "\n\nPermission guidance\n" + guidance)
+                self._show_error("Systemd install failed", guidance)
             self.notebook.select(self.run_tab)
         except Exception as exc:
             self._show_error(f"Systemd {action} failed", str(exc))

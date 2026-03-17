@@ -68,7 +68,7 @@ Minimum Python packages:
 pip3 install pyyaml opencv-contrib-python pandas numpy
 ```
 
-On Raspberry Pi, install and enable the camera stack (`rpicam`/`libcamera` + `picamera2`) using Raspberry Pi OS package sources. MP4 recording also requires `ffmpeg`; thermal camera diagnostics work better with `v4l-utils`. `scripts/setup_venv.sh` now tries to install both automatically on Pi via `apt`.
+On Raspberry Pi, install and enable the camera stack (`rpicam`/`libcamera` + `picamera2`) using Raspberry Pi OS package sources. MP4 recording also requires `ffmpeg`; thermal camera diagnostics work better with `v4l-utils`. `scripts/setup_venv.sh` now tries to install both automatically on Pi via `apt`, and also enables `loginctl linger` for the BumbleBox user so GUI-started user timers can continue after logout.
 
 For nest labeling on Debian/Pi, prefer distro packages for Qt compatibility:
 

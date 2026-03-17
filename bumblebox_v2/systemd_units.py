@@ -94,6 +94,26 @@ def _exec_start(config_path: Path, mode_override: str | None) -> str:
     return _exec_start_for_args(config_path, cmd_args)
 
 
+def build_systemd_action_sudo_command(*, action: str, config_path: str, output_dir: str) -> str:
+    action = action.strip().lower()
+    if action not in {"install", "enable", "disable", "status"}:
+        raise ValueError(f"Unsupported systemd action for sudo command builder: {action}")
+    repo_root = Path(__file__).resolve().parents[1]
+    bbx_path = repo_root / "bbx.py"
+    python_path = Path(sys.executable).resolve()
+    args = [
+        "sudo",
+        str(python_path),
+        str(bbx_path),
+        f"systemd-{action}",
+        "--config",
+        str(config_path),
+        "--output-dir",
+        str(output_dir),
+    ]
+    return " ".join(shlex.quote(str(part)) for part in args)
+
+
 def _write_unit(path: Path, content: str, written: List[Path]) -> None:
     path.write_text(content)
     written.append(path)
