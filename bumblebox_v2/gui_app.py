@@ -4909,22 +4909,48 @@ class BumbleBoxV2GUI(tk.Tk):
 
         ttk.Button(top, text="Run Once Now", command=self._run_once_now).grid(row=0, column=3, sticky="w", padx=8)
 
-        systemd_advanced = ttk.LabelFrame(top, text="Advanced Service Controls", padding=6)
-        systemd_advanced.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        ttk.Label(systemd_advanced, text="Systemd output dir").grid(row=0, column=0, sticky="w")
+        automation_box = ttk.LabelFrame(top, text="Automated Recording", padding=6)
+        automation_box.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Label(
+            automation_box,
+            text=(
+                "Repeated recording is started with scheduled systemd timers. "
+                "This button saves the current Config Editor settings, writes the timer files, "
+                "installs them into systemd, and starts them now."
+            ),
+            wraplength=900,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(automation_box, text="Start Automated Recording", command=self._start_automated_recording).grid(
+            row=0, column=1, sticky="e", padx=(12, 0)
+        )
+        automation_box.columnconfigure(0, weight=1)
+
+        systemd_advanced = ttk.LabelFrame(top, text="Advanced Timer Controls", padding=6)
+        systemd_advanced.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Label(systemd_advanced, text="Timer/unit file output dir").grid(row=0, column=0, sticky="w")
         ttk.Entry(systemd_advanced, textvariable=self.systemd_output_dir_var, width=70).grid(
             row=0, column=1, columnspan=2, sticky="ew", padx=8, pady=4
         )
-        ttk.Button(systemd_advanced, text="Generate systemd Units", command=self._generate_systemd_units).grid(
+        ttk.Button(systemd_advanced, text="Write Timer Files", command=self._generate_systemd_units).grid(
             row=0, column=3, sticky="w", padx=8
         )
+        ttk.Label(
+            systemd_advanced,
+            text=(
+                "Manual flow: write timer files if you want to inspect them, then install them "
+                "into systemd. The install step already enables and starts the timers."
+            ),
+            wraplength=900,
+            justify=tk.LEFT,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 4))
 
         actions = ttk.Frame(systemd_advanced)
-        actions.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 2))
-        ttk.Button(actions, text="Systemd Install", command=lambda: self._systemd_action("install")).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Systemd Enable", command=lambda: self._systemd_action("enable")).pack(side=tk.LEFT, padx=6)
-        ttk.Button(actions, text="Systemd Disable", command=lambda: self._systemd_action("disable")).pack(side=tk.LEFT, padx=6)
-        ttk.Button(actions, text="Systemd Status", command=lambda: self._systemd_action("status")).pack(side=tk.LEFT)
+        actions.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        ttk.Button(actions, text="Install + Start Timers", command=lambda: self._systemd_action("install")).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Enable + Start Installed Timers", command=lambda: self._systemd_action("enable")).pack(side=tk.LEFT, padx=6)
+        ttk.Button(actions, text="Disable + Stop Timers", command=lambda: self._systemd_action("disable")).pack(side=tk.LEFT, padx=6)
+        ttk.Button(actions, text="Show Timer Status", command=lambda: self._systemd_action("status")).pack(side=tk.LEFT)
         ttk.Button(actions, text="Install GUI Desktop Icon", command=self._install_gui_shortcut).pack(side=tk.LEFT, padx=12)
         systemd_advanced.columnconfigure(1, weight=1)
         self._register_advanced_widget(systemd_advanced)
@@ -6888,6 +6914,60 @@ class BumbleBoxV2GUI(tk.Tk):
             self.notebook.select(self.run_tab)
         except Exception as exc:
             self._show_error("Systemd generation failed", str(exc))
+
+    def _start_automated_recording(self) -> None:
+        try:
+            config, config_path = self._load_effective_action_config()
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                config,
+                reason="gui_systemd_start_automation",
+            )
+            output_dir = self.systemd_output_dir_var.get().strip()
+
+            write_result = write_systemd_units(
+                config=config,
+                config_path=config_path,
+                output_dir=output_dir,
+            )
+            install_result = run_systemd_action(
+                config=config,
+                action="install",
+                output_dir=output_dir,
+                config_path=config_path,
+            )
+
+            self.run_output.delete("1.0", tk.END)
+            history_note = self._format_config_history_note(snapshot_path, history_warning)
+            lines = [
+                f"Applied Config Editor snapshot to {config_path}",
+            ]
+            if history_note:
+                lines.append(history_note)
+            lines.extend(
+                [
+                    "",
+                    "Automated recording startup sequence",
+                    "1. Wrote timer/service files for this config.",
+                    "2. Installed those files into systemd.",
+                    "3. The install step enabled the timers and started them immediately.",
+                    "",
+                    "Step 1: Write timer files",
+                    format_systemd_result(write_result),
+                    "",
+                    "Step 2: Install timers into systemd and start them",
+                    format_systemd_action_result(install_result),
+                ]
+            )
+            self.run_output.insert(tk.END, "\n".join(lines))
+            self.notebook.select(self.run_tab)
+            if not install_result.success:
+                self._show_error(
+                    "Automated recording start failed",
+                    "One or more timer setup steps failed. See Run & Schedule Results for details.",
+                )
+        except Exception as exc:
+            self._show_error("Automated recording start failed", str(exc))
 
     def _systemd_action(self, action: str) -> None:
         try:
