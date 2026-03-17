@@ -5424,7 +5424,10 @@ class BumbleBoxV2GUI(tk.Tk):
                 f", {device.display_name})"
             )
             if device.mountpoint:
-                descriptor += f" mounted:{device.mountpoint}"
+                if str(device.mountpoint).startswith("/media/"):
+                    descriptor += f" currently desktop-mounted at {device.mountpoint}"
+                else:
+                    descriptor += f" currently mounted at {device.mountpoint}"
             choices.append(descriptor)
             mapping[descriptor] = device.path
 
@@ -5432,11 +5435,6 @@ class BumbleBoxV2GUI(tk.Tk):
         self.storage_device_combo.configure(values=choices)
 
         current = self.storage_device_var.get().strip()
-        if preferred_path:
-            for label, path in mapping.items():
-                if path == preferred_path:
-                    self.storage_device_var.set(label)
-                    return
         if current in choices:
             return
         self.storage_device_var.set(auto_label)

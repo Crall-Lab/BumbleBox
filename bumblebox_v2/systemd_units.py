@@ -60,15 +60,43 @@ def _service_text(description: str, working_dir: Path, exec_start: str, service_
     return "\n".join(lines)
 
 
+def _calendar_specs_for_interval(interval_minutes: int) -> List[str]:
+    interval = max(1, int(interval_minutes))
+    slots_by_hour: Dict[int, List[int]] = {}
+    for total_minutes in range(0, 24 * 60, interval):
+        hour = total_minutes // 60
+        minute = total_minutes % 60
+        slots_by_hour.setdefault(hour, []).append(minute)
+
+    groups: Dict[Tuple[int, ...], List[int]] = {}
+    for hour in range(24):
+        minutes = tuple(slots_by_hour.get(hour, []))
+        if not minutes:
+            continue
+        groups.setdefault(minutes, []).append(hour)
+
+    specs: List[str] = []
+    full_day_hours = list(range(24))
+    for minute_tuple, hours in sorted(groups.items(), key=lambda item: item[1][0]):
+        hour_field = "*"
+        if hours != full_day_hours:
+            hour_field = ",".join(f"{hour:02d}" for hour in hours)
+        minute_field = ",".join(f"{minute:02d}" for minute in minute_tuple)
+        specs.append(f"*-*-* {hour_field}:{minute_field}:00")
+    return specs
+
+
 def _timer_text(description: str, service_name: str, interval_minutes: int) -> str:
-    return "\n".join(
+    lines = [
+        "[Unit]",
+        f"Description={description}",
+        "",
+        "[Timer]",
+    ]
+    for spec in _calendar_specs_for_interval(interval_minutes):
+        lines.append(f"OnCalendar={spec}")
+    lines.extend(
         [
-            "[Unit]",
-            f"Description={description}",
-            "",
-            "[Timer]",
-            "OnBootSec=2min",
-            f"OnUnitActiveSec={int(interval_minutes)}min",
             "AccuracySec=1s",
             "Persistent=true",
             f"Unit={service_name}",
@@ -78,6 +106,7 @@ def _timer_text(description: str, service_name: str, interval_minutes: int) -> s
             "",
         ]
     )
+    return "\n".join(lines)
 
 
 def _exec_start_for_args(config_path: Path, args: List[str]) -> str:
