@@ -326,6 +326,32 @@ def _normalize_mount_path(path_text: str) -> str:
     return os.path.abspath(os.path.expanduser(str(path_text).strip()))
 
 
+def _fstab_entry_for_mount(mount_point: str) -> str | None:
+    fstab_path = Path("/etc/fstab")
+    if not fstab_path.exists():
+        return None
+    try:
+        text = fstab_path.read_text()
+    except Exception:
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == mount_point:
+            return line
+    return None
+
+
+def _uuid_fstab_note_needed(source: str | None, fstab_line: str | None) -> bool:
+    if not source or not source.startswith("/dev/sd"):
+        return False
+    if fstab_line and "UUID=" in fstab_line:
+        return False
+    return True
+
+
 def _data_root_mount_check(data_root: str) -> CheckResult:
     path = Path(data_root)
     if not path.exists():
@@ -354,7 +380,8 @@ def _data_root_mount_check(data_root: str) -> CheckResult:
                 "That does not mean the chosen data root is its own active mount point."
             ),
         )
-    if source.startswith("/dev/sd"):
+    fstab_line = _fstab_entry_for_mount(str(path))
+    if _uuid_fstab_note_needed(source, fstab_line):
         return CheckResult(
             "Data root mount",
             "WARN",

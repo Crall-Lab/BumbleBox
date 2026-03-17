@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -268,6 +269,30 @@ def _is_root_user() -> bool:
         return False
 
 
+def _effective_owner_ids(uid: Optional[int] = None, gid: Optional[int] = None) -> Tuple[int, int]:
+    owner_uid = int(uid if uid is not None else os.getuid())
+    owner_gid = int(gid if gid is not None else os.getgid())
+
+    env_uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+    env_gid = os.environ.get("SUDO_GID")
+    if uid is None and env_uid:
+        try:
+            owner_uid = int(env_uid)
+        except Exception:
+            pass
+    if gid is None and env_gid:
+        try:
+            owner_gid = int(env_gid)
+        except Exception:
+            pass
+    elif gid is None and env_uid:
+        try:
+            owner_gid = int(pwd.getpwuid(owner_uid).pw_gid)
+        except Exception:
+            pass
+    return owner_uid, owner_gid
+
+
 def _fstab_options(fstype: str, uid: int, gid: int) -> str:
     base = "defaults,nofail,x-systemd.device-timeout=10"
     if fstype.lower() in _WINDOWS_LIKE_FSTYPES:
@@ -321,6 +346,39 @@ def _release_existing_device_mount(
             or f"Could not unmount existing source mount {source_mountpoint}. Close any open file-browser windows for that drive and try again."
         )
     return source_mountpoint
+
+
+def _uuid_fstab_note_needed(source: Optional[str], fstab_line: Optional[str]) -> bool:
+    if not source or not source.startswith("/dev/sd"):
+        return False
+    if fstab_line and "UUID=" in fstab_line:
+        return False
+    return True
+
+
+def _ensure_mount_root_owned_by_user(
+    mount_dir: Path,
+    *,
+    fstype: str,
+    owner_uid: int,
+    owner_gid: int,
+    notes: List[str],
+    dry_run: bool = False,
+) -> None:
+    if str(fstype).strip().lower() in _WINDOWS_LIKE_FSTYPES:
+        return
+    if dry_run:
+        notes.append(
+            f"Dry run: would set ownership on {mount_dir} to uid={owner_uid}, gid={owner_gid} for user write access."
+        )
+        return
+    try:
+        os.chown(mount_dir, owner_uid, owner_gid)
+        notes.append(f"Set ownership on {mount_dir} to uid={owner_uid}, gid={owner_gid} for user write access.")
+    except PermissionError as exc:
+        notes.append(f"Could not update ownership on {mount_dir}: {exc}")
+    except Exception as exc:
+        notes.append(f"Could not update ownership on {mount_dir}: {exc}")
 
 
 def build_fstab_entry(device: StorageDevice, mount_point: str, *, uid: int, gid: int) -> str:
@@ -407,7 +465,7 @@ def get_storage_status(config: Dict[str, Any], *, mount_point: Optional[str] = N
             device_name = _device_name_for_message(source_device, source)
             message = f"Writing data to {device_name} storage, you can find it at {target_mount_point}"
             status = "PASS" if writable else "WARN"
-            if source.startswith("/dev/sd"):
+            if _uuid_fstab_note_needed(source, fstab_line):
                 notes.append(
                     "Mounted source uses /dev/sdX naming. UUID-based fstab is recommended to avoid boot-time device-name drift."
                 )
@@ -478,8 +536,7 @@ def setup_storage_auto_mount(
     if not selected.fstype:
         raise RuntimeError(f"Selected device {selected.path} has no detected filesystem type.")
 
-    owner_uid = int(uid if uid is not None else os.getuid())
-    owner_gid = int(gid if gid is not None else os.getgid())
+    owner_uid, owner_gid = _effective_owner_ids(uid=uid, gid=gid)
     entry = build_fstab_entry(selected, mount_point, uid=owner_uid, gid=owner_gid)
     notes: List[str] = []
 
@@ -528,6 +585,14 @@ def setup_storage_auto_mount(
     resolved = _findmnt_target(mount_dir)
     if resolved is not None and _is_exact_mount_target(resolved[1], mount_point):
         mounted_now = True
+        _ensure_mount_root_owned_by_user(
+            mount_dir,
+            fstype=selected.fstype,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            notes=notes,
+            dry_run=dry_run,
+        )
 
     message = (
         f"Writing data to {selected.name or selected.path} storage, you can find it at {mount_point}"
@@ -569,8 +634,7 @@ def mount_storage_device_now(
     if not selected.fstype:
         raise RuntimeError(f"Selected device {selected.path} has no detected filesystem type.")
 
-    owner_uid = int(uid if uid is not None else os.getuid())
-    owner_gid = int(gid if gid is not None else os.getgid())
+    owner_uid, owner_gid = _effective_owner_ids(uid=uid, gid=gid)
     notes: List[str] = []
 
     if not dry_run and not _is_root_user():
@@ -628,6 +692,15 @@ def mount_storage_device_now(
     mounted_now = bool(dry_run) or (
         resolved is not None and _is_exact_mount_target(resolved[1], mount_point)
     )
+    if mounted_now:
+        _ensure_mount_root_owned_by_user(
+            mount_dir,
+            fstype=selected.fstype,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            notes=notes,
+            dry_run=dry_run,
+        )
     if source_mountpoint:
         message = (
             f"Unmounted the existing desktop mount at {source_mountpoint} and mounted {selected.path} "

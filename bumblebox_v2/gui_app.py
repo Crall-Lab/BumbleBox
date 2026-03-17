@@ -5510,7 +5510,6 @@ class BumbleBoxV2GUI(tk.Tk):
             str(config_path),
             "--mount-point",
             mount_point,
-            "--apply-config",
         ]
         if device_path:
             command.extend(["--device", device_path])
@@ -5558,7 +5557,6 @@ class BumbleBoxV2GUI(tk.Tk):
             str(config_path),
             "--mount-point",
             mount_point,
-            "--apply-config",
         ]
         if device_path:
             command.extend(["--device", device_path])
@@ -5587,6 +5585,22 @@ class BumbleBoxV2GUI(tk.Tk):
             ),
         )
         return False
+
+    def _persist_storage_mount_point_after_privileged_action(
+        self,
+        *,
+        config_path: Path,
+        config: dict,
+        mount_point: str,
+        reason: str,
+    ) -> tuple[Path | None, str | None]:
+        config.setdefault("system", {})
+        config["system"]["data_root"] = mount_point
+        return self._save_config_with_history(
+            config_path,
+            config,
+            reason=reason,
+        )
 
     def _mount_storage_device(self) -> None:
         mount_point = self.storage_mount_point_var.get().strip()
@@ -5638,21 +5652,31 @@ class BumbleBoxV2GUI(tk.Tk):
                     mount_point=mount_point,
                     device_path=device_path,
                 ):
+                    snapshot_path, history_warning = self._persist_storage_mount_point_after_privileged_action(
+                        config_path=config_path,
+                        config=config,
+                        mount_point=mount_point,
+                        reason="storage_mount_device",
+                    )
                     self._refresh_storage_status()
+                    history_note = self._format_config_history_note(snapshot_path, history_warning)
+                    if history_note:
+                        self.storage_output.insert(tk.END, f"\n{history_note}")
                     return
 
                 sudo_cmd = build_storage_mount_sudo_command(
                     config_path=str(config_path),
                     mount_point=mount_point,
                     device_path=device_path,
-                    apply_config=True,
+                    apply_config=False,
                 )
                 self.storage_output.insert(
                     tk.END,
                     (
                         "\n\nStorage mount needs root privileges.\n"
                         "Run this in terminal on the Pi:\n"
-                        f"{sudo_cmd}"
+                        f"{sudo_cmd}\n\n"
+                        "Then, back in BumbleBox, click `Save Data Folder Path` if needed."
                     ),
                 )
                 return
@@ -5698,21 +5722,31 @@ class BumbleBoxV2GUI(tk.Tk):
                     mount_point=mount_point,
                     device_path=device_path,
                 ):
+                    snapshot_path, history_warning = self._persist_storage_mount_point_after_privileged_action(
+                        config_path=config_path,
+                        config=config,
+                        mount_point=mount_point,
+                        reason="storage_setup_auto_mount",
+                    )
                     self._refresh_storage_status()
+                    history_note = self._format_config_history_note(snapshot_path, history_warning)
+                    if history_note:
+                        self.storage_output.insert(tk.END, f"\n{history_note}")
                     return
 
                 sudo_cmd = build_storage_setup_sudo_command(
                     config_path=str(config_path),
                     mount_point=mount_point,
                     device_path=device_path,
-                    apply_config=True,
+                    apply_config=False,
                 )
                 self.storage_output.insert(
                     tk.END,
                     (
                         "\n\nStorage setup needs root privileges.\n"
                         "Run this in terminal on the Pi:\n"
-                        f"{sudo_cmd}"
+                        f"{sudo_cmd}\n\n"
+                        "Then, back in BumbleBox, click `Save Data Folder Path` if needed."
                     ),
                 )
         except Exception as exc:
