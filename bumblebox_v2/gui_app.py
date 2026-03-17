@@ -1590,8 +1590,8 @@ class BumbleBoxV2GUI(tk.Tk):
             help_title="Step 2: Storage Device",
             help_details=(
                 "Choose Auto to let BumbleBox select a detected partition, or pick a specific "
-                "/dev/... device when you want explicit control. Then click Mount Device to mount it "
-                "to the folder you chose in Step 1."
+                "/dev/... device when you want explicit control. Then use the auto-mount button to set up "
+                "the selected storage at the folder you chose in Step 1."
             ),
         )
         self.storage_device_combo = ttk.Combobox(
@@ -1605,14 +1605,9 @@ class BumbleBoxV2GUI(tk.Tk):
         device_actions.grid(row=1, column=2, sticky="w", pady=4)
         ttk.Button(
             device_actions,
-            text="Mount Device",
-            command=self._mount_storage_device,
-        ).pack(side=tk.LEFT)
-        ttk.Button(
-            device_actions,
             text="Refresh Devices",
             command=self._refresh_storage_device_choices,
-        ).pack(side=tk.LEFT, padx=(6, 0))
+        ).pack(side=tk.LEFT)
 
         actions = ttk.Frame(settings)
         actions.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 2))
@@ -1628,28 +1623,58 @@ class BumbleBoxV2GUI(tk.Tk):
         ).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Button(
             actions,
-            text="Setup Storage Auto-Mount",
+            text="Set Up Auto-Mount Storage Device (stable long-term and across reboots)",
             command=self._setup_storage_auto_mount,
         ).pack(side=tk.LEFT, padx=(8, 0))
         self._make_help_button(
             actions,
-            title="Setup Storage Auto-Mount",
+            title="Set Up Auto-Mount Storage Device",
             details=(
-                "Optional Step 3. Creates/updates persistent mount setup so the selected storage is mounted "
-                "automatically at boot to your configured mount point. If you only want a temporary mount "
-                "for this session, stop after Step 2."
+                "Recommended Step 3. Creates or updates a stable UUID-based mount so the selected storage is mounted "
+                "automatically at boot to your configured data folder. This is the recommended option for real "
+                "experiments and long-term use."
             ),
         ).pack(side=tk.LEFT, padx=(4, 0))
+
+        advanced_mount = ttk.LabelFrame(settings, text="Advanced Temporary Mount", padding=6)
+        advanced_mount.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        ttk.Label(
+            advanced_mount,
+            text=(
+                "Optional advanced path: mount the selected storage device for this session only, "
+                "without creating a persistent /etc/fstab entry."
+            ),
+            wraplength=860,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky="w")
+        mount_actions = ttk.Frame(advanced_mount)
+        mount_actions.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        ttk.Button(
+            mount_actions,
+            text="Mount Storage Device Once (temporary)",
+            command=self._mount_storage_device,
+        ).pack(side=tk.LEFT)
+        self._make_help_button(
+            mount_actions,
+            title="Mount Storage Device Once (temporary)",
+            details=(
+                "Mounts the selected storage device at the chosen data folder for this session only. "
+                "This is mainly for short tests or troubleshooting. For normal experiments, use the stable "
+                "auto-mount option above instead."
+            ),
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        advanced_mount.columnconfigure(0, weight=1)
+        self._register_advanced_widget(advanced_mount)
 
         info = (
             "Workflow:\n"
             "1. Choose the mount point.\n"
-            "2. Choose the storage device and click Mount Device.\n"
-            "3. If you want this to survive reboot and be used repeatedly during experiments, click "
-            "Setup Storage Auto-Mount. Otherwise stop after Step 2 for a temporary mount."
+            "2. Choose the storage device.\n"
+            "3. Click Set Up Auto-Mount Storage Device for the recommended stable setup used during experiments.\n"
+            "Advanced only: use Mount Storage Device Once (temporary) for a one-session mount without persistent setup."
         )
         ttk.Label(settings, text=info, wraplength=860, justify=tk.LEFT).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(8, 2)
+            row=4, column=0, columnspan=3, sticky="w", pady=(8, 2)
         )
         settings.columnconfigure(1, weight=1)
 

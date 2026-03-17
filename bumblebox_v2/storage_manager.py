@@ -281,6 +281,48 @@ def _runtime_mount_options(fstype: str, uid: int, gid: int) -> Optional[str]:
     return None
 
 
+def _stable_mount_source(device: StorageDevice) -> str:
+    uuid = str(device.uuid or "").strip()
+    if uuid:
+        by_uuid = Path("/dev/disk/by-uuid") / uuid
+        return str(by_uuid)
+    return device.path
+
+
+def _release_existing_device_mount(
+    device: StorageDevice,
+    *,
+    desired_mount_point: str,
+    notes: List[str],
+    dry_run: bool = False,
+) -> Optional[str]:
+    source_mountpoint = str(device.mountpoint or "").strip()
+    if not source_mountpoint:
+        return None
+    if _normalize_mount_path(source_mountpoint) == _normalize_mount_path(desired_mount_point):
+        return None
+
+    notes.append(
+        f"Device was already mounted at {source_mountpoint}; remounting it directly at {desired_mount_point}."
+    )
+    if dry_run:
+        notes.append("Dry run: existing mount was not unmounted.")
+        return source_mountpoint
+
+    proc = _run_command(["umount", source_mountpoint])
+    if proc is None:
+        raise RuntimeError("Could not run umount to release the existing desktop auto-mount.")
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        raise RuntimeError(
+            stderr
+            or stdout
+            or f"Could not unmount existing source mount {source_mountpoint}. Close any open file-browser windows for that drive and try again."
+        )
+    return source_mountpoint
+
+
 def build_fstab_entry(device: StorageDevice, mount_point: str, *, uid: int, gid: int) -> str:
     if not device.uuid:
         raise ValueError("Selected storage device has no UUID; cannot create stable fstab entry.")
@@ -470,6 +512,12 @@ def setup_storage_auto_mount(
     current = _findmnt_target(mount_dir)
     current_exact = current is not None and _is_exact_mount_target(current[1], mount_point)
     if not current_exact and not dry_run:
+        _release_existing_device_mount(
+            selected,
+            desired_mount_point=mount_point,
+            notes=notes,
+            dry_run=dry_run,
+        )
         proc = _run_command(["mount", mount_point])
         if proc is None:
             notes.append("Failed to run mount command (mount utility missing).")
@@ -535,7 +583,8 @@ def mount_storage_device_now(
     current_exact = current is not None and _is_exact_mount_target(current[1], mount_point)
     if current_exact:
         current_source = current[0]
-        if current_source == selected.path or current_source == f"UUID={selected.uuid}":
+        stable_source = _stable_mount_source(selected)
+        if current_source in {selected.path, stable_source, f"UUID={selected.uuid}"}:
             return StorageMountResult(
                 mount_point=mount_point,
                 device_name=selected.name or selected.display_name,
@@ -553,45 +602,41 @@ def mount_storage_device_now(
         )
 
     used_bind_mount = False
-    source_mountpoint: Optional[str] = None
+    source_mountpoint = _release_existing_device_mount(
+        selected,
+        desired_mount_point=mount_point,
+        notes=notes,
+        dry_run=dry_run,
+    )
 
-    if selected.mountpoint and _normalize_mount_path(selected.mountpoint) != _normalize_mount_path(mount_point):
-        used_bind_mount = True
-        source_mountpoint = selected.mountpoint
-        if not dry_run:
-            proc = _run_command(["mount", "--bind", selected.mountpoint, mount_point])
-            if proc is None:
-                notes.append("Failed to run mount command (mount utility missing).")
-            elif proc.returncode != 0:
-                stderr = (proc.stderr or "").strip()
-                stdout = (proc.stdout or "").strip()
-                raise RuntimeError(stderr or stdout or "bind mount failed")
-    else:
-        args = ["mount"]
-        mount_opts = _runtime_mount_options(selected.fstype, owner_uid, owner_gid)
-        if mount_opts:
-            args.extend(["-o", mount_opts])
-        args.extend([selected.path, mount_point])
-        if not dry_run:
-            proc = _run_command(args)
-            if proc is None:
-                notes.append("Failed to run mount command (mount utility missing).")
-            elif proc.returncode != 0:
-                stderr = (proc.stderr or "").strip()
-                stdout = (proc.stdout or "").strip()
-                raise RuntimeError(stderr or stdout or "mount failed")
+    args = ["mount"]
+    mount_opts = _runtime_mount_options(selected.fstype, owner_uid, owner_gid)
+    if mount_opts:
+        args.extend(["-o", mount_opts])
+    mount_source = _stable_mount_source(selected)
+    args.extend([mount_source, mount_point])
+    if not dry_run:
+        proc = _run_command(args)
+        if proc is None:
+            notes.append("Failed to run mount command (mount utility missing).")
+        elif proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            stdout = (proc.stdout or "").strip()
+            raise RuntimeError(stderr or stdout or "mount failed")
 
     resolved = _findmnt_target(mount_dir)
     mounted_now = bool(dry_run) or (
         resolved is not None and _is_exact_mount_target(resolved[1], mount_point)
     )
-    if used_bind_mount and source_mountpoint:
+    if source_mountpoint:
         message = (
-            f"Mounted {selected.path} at {mount_point} by bind-mounting the existing filesystem "
-            f"from {source_mountpoint}."
+            f"Unmounted the existing desktop mount at {source_mountpoint} and mounted {selected.path} "
+            f"directly at {mount_point}."
         )
     else:
         message = f"Mounted {selected.path} at {mount_point}."
+    if selected.uuid:
+        notes.append(f"Used UUID-backed mount source for this session: {_stable_mount_source(selected)}")
     if dry_run:
         notes.append("Dry run: no mount command was executed.")
 
@@ -655,10 +700,11 @@ def format_storage_mount_result(result: StorageMountResult) -> str:
         f"Mount point: {result.mount_point}",
         f"Device: {result.device_path} (name={result.device_name}, uuid={result.device_uuid or 'missing'}, fstype={result.fstype})",
         f"Mounted now: {result.mounted_now}",
-        f"Bind mount used: {result.used_bind_mount}",
     ]
     if result.source_mountpoint:
-        lines.append(f"Existing source mount: {result.source_mountpoint}")
+        lines.append(f"Previous source mount: {result.source_mountpoint}")
+    if result.used_bind_mount:
+        lines.append(f"Bind mount used: {result.used_bind_mount}")
     lines.append(result.message)
     for note in result.notes:
         lines.append(f"- {note}")
