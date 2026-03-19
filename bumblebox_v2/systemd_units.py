@@ -33,19 +33,11 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _preferred_runtime_python() -> Path:
+def _preferred_exec_launcher() -> Path:
     repo_root = _repo_root()
-    candidates = [
-        repo_root / ".venvs" / "bbx-runtime" / "bin" / "python",
-        repo_root / ".venv" / "bin" / "python",
-        Path(sys.executable).resolve(),
-    ]
-    for candidate in candidates:
-        try:
-            if candidate.exists() and candidate.is_file():
-                return candidate.resolve()
-        except Exception:
-            continue
+    launcher = (repo_root / "bbx").resolve()
+    if launcher.exists() and launcher.is_file():
+        return launcher
     return Path(sys.executable).resolve()
 
 
@@ -126,9 +118,12 @@ def _timer_text(description: str, service_name: str, interval_minutes: int) -> s
 
 
 def _exec_start_for_args(config_path: Path, args: List[str]) -> str:
-    python_path = _preferred_runtime_python()
-    bbx_path = (_repo_root() / "bbx.py").resolve()
-    cmd = [str(python_path), str(bbx_path), *args, "--config", str(config_path.resolve())]
+    launcher_path = _preferred_exec_launcher()
+    if launcher_path.name == "bbx":
+        cmd = [str(launcher_path), *args, "--config", str(config_path.resolve())]
+    else:
+        bbx_path = (_repo_root() / "bbx.py").resolve()
+        cmd = [str(launcher_path), str(bbx_path), *args, "--config", str(config_path.resolve())]
     return " ".join(shlex.quote(part) for part in cmd)
 
 
