@@ -6,6 +6,7 @@ import json
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, asdict
@@ -31,6 +32,7 @@ class RunSummary:
     session_name: str
     session_dir: str
     hostname: str
+    python_executable: str
     camera_infrared: Optional[bool]
     camera_monochrome_output: Optional[bool]
     resolved_tuning_file: Optional[str]
@@ -2279,6 +2281,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         session_name=session_name,
         session_dir=str(session_dir),
         hostname=hostname,
+        python_executable=str(Path(sys.executable).resolve()),
         camera_infrared=camera_infrared,
         camera_monochrome_output=camera_monochrome_output,
         resolved_tuning_file=resolved_tuning_file,
@@ -2349,6 +2352,7 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Run mode: {summary.mode}",
         f"Session: {summary.session_name}",
         f"Directory: {summary.session_dir}",
+        f"Python executable: {summary.python_executable}",
         f"Camera IR setting: {summary.camera_infrared if summary.camera_infrared is not None else 'n/a'}",
         f"Camera monochrome output: {summary.camera_monochrome_output if summary.camera_monochrome_output is not None else 'n/a'}",
         f"Resolved tuning file: {summary.resolved_tuning_file or 'default'}",
