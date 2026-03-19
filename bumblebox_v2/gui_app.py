@@ -7187,11 +7187,8 @@ class BumbleBoxV2GUI(tk.Tk):
         try:
             config, config_path = self._load_effective_action_config()
             config, automation_notes = self._coerce_basic_automation_config(config)
-            snapshot_path, history_warning = self._save_config_with_history(
-                config_path,
-                config,
-                reason="gui_systemd_start_automation",
-            )
+            scheduling = config.setdefault("scheduling", {})
+            scheduling["enabled"] = True
             output_dir = self.systemd_output_dir_var.get().strip()
 
             write_result = write_systemd_units(
@@ -7207,12 +7204,23 @@ class BumbleBoxV2GUI(tk.Tk):
             )
 
             self.run_output.delete("1.0", tk.END)
+            snapshot_path = None
+            history_warning = None
+            if install_result.success:
+                snapshot_path, history_warning = self._save_config_with_history(
+                    config_path,
+                    config,
+                    reason="gui_systemd_start_automation",
+                )
             history_note = self._format_config_history_note(snapshot_path, history_warning)
             lines = [
-                f"Applied Config Editor snapshot to {config_path}",
             ]
-            if history_note:
-                lines.append(history_note)
+            if install_result.success:
+                lines.append(f"Applied Config Editor snapshot to {config_path}")
+                if history_note:
+                    lines.append(history_note)
+            else:
+                lines.append("Config was not updated because timer installation did not complete successfully.")
             if automation_notes:
                 lines.extend(automation_notes)
             lines.extend(
@@ -7255,21 +7263,27 @@ class BumbleBoxV2GUI(tk.Tk):
         try:
             if action in {"install", "enable"}:
                 config, config_path = self._load_effective_action_config()
-                snapshot_path, history_warning = self._save_config_with_history(
-                    config_path,
-                    config,
-                    reason=f"gui_systemd_{action}",
-                )
+                config.setdefault("scheduling", {})
+                config["scheduling"]["enabled"] = True
             else:
                 config, config_path = self._load_config_or_defaults()
-                snapshot_path = None
-                history_warning = None
+                if action == "disable":
+                    config.setdefault("scheduling", {})
+                    config["scheduling"]["enabled"] = False
+            snapshot_path = None
+            history_warning = None
             result = run_systemd_action(
                 config=config,
                 action=action,
                 output_dir=self.systemd_output_dir_var.get().strip(),
                 config_path=config_path,
             )
+            if result.success and action in {"install", "enable", "disable"}:
+                snapshot_path, history_warning = self._save_config_with_history(
+                    config_path,
+                    config,
+                    reason=f"gui_systemd_{action}",
+                )
             self.run_output.delete("1.0", tk.END)
             history_note = self._format_config_history_note(snapshot_path, history_warning)
             if snapshot_path is not None or history_warning is not None:

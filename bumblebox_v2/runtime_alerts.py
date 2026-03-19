@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import os
 import subprocess
 import time
@@ -65,6 +66,8 @@ def _latest_recording_video(data_root: Path) -> Optional[Path]:
 def _latest_recorded_video_from_run_history(data_root: Path, limit: int = 40) -> Optional[Path]:
     records = list_recent_run_records(data_root, limit=limit)
     for record in records:
+        if record.mode not in RECORDING_MODES:
+            continue
         try:
             summary = load_run_summary(record.summary_path)
         except Exception:
@@ -78,6 +81,48 @@ def _latest_recorded_video_from_run_history(data_root: Path, limit: int = 40) ->
             continue
         if video_path.exists():
             return video_path
+    return None
+
+
+def _record_timestamp_iso(iso_text: str) -> Optional[float]:
+    raw = str(iso_text or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return None
+
+
+def _latest_recording_attempt(data_root: Path, limit: int = 40) -> Optional[Dict[str, Any]]:
+    records = list_recent_run_records(data_root, limit=limit)
+    for record in records:
+        if record.mode not in RECORDING_MODES:
+            continue
+        try:
+            summary = load_run_summary(record.summary_path)
+        except Exception:
+            continue
+
+        attempt_ts = (
+            _record_timestamp_iso(record.finished_at)
+            or _record_timestamp_iso(record.started_at)
+        )
+        if attempt_ts is None:
+            try:
+                attempt_ts = record.summary_path.stat().st_mtime
+            except Exception:
+                attempt_ts = time.time()
+
+        errors = [str(item).strip() for item in (summary.get("errors") or []) if str(item).strip()]
+        warnings = [str(item).strip() for item in (summary.get("warnings") or []) if str(item).strip()]
+        return {
+            "record": record,
+            "summary": summary,
+            "timestamp": attempt_ts,
+            "first_error": errors[0] if errors else None,
+            "first_warning": warnings[0] if warnings else None,
+        }
     return None
 
 
@@ -142,27 +187,12 @@ def _recording_freshness_alert(config: Dict[str, Any]) -> RuntimeAlert:
     if not data_root.exists():
         return RuntimeAlert("WARN", "Recording freshness", f"No data root found at {data_root}.")
 
+    latest_attempt = _latest_recording_attempt(data_root)
     latest_recorded_video = _latest_recorded_video_from_run_history(data_root)
     used_fallback_scan = False
     if latest_recorded_video is None:
         latest_recorded_video = _latest_recording_video(data_root)
         used_fallback_scan = latest_recorded_video is not None
-
-    if latest_recorded_video is None:
-        return RuntimeAlert(
-            "WARN",
-            "Recording freshness",
-            f"No recording videos (.mp4 or .mjpeg) found under {data_root} while scheduling is enabled.",
-        )
-
-    try:
-        age_minutes = (time.time() - latest_recorded_video.stat().st_mtime) / 60.0
-    except Exception as exc:
-        return RuntimeAlert(
-            "WARN",
-            "Recording freshness",
-            f"Could not stat latest recording video ({latest_recorded_video}): {exc}",
-        )
 
     capture = config.get("capture", {})
     if not isinstance(capture, dict):
@@ -170,9 +200,86 @@ def _recording_freshness_alert(config: Dict[str, Any]) -> RuntimeAlert:
     record_interval_min = max(1.0, float(capture.get("record_interval_minutes", 30)))
     recording_seconds = max(1.0, float(capture.get("recording_seconds", 20)))
     expected_gap = max(record_interval_min * 2.0, record_interval_min + (recording_seconds / 60.0) + 2.0)
+    now_ts = time.time()
+
+    latest_attempt_age_minutes: Optional[float] = None
+    if latest_attempt is not None:
+        latest_attempt_age_minutes = max(0.0, (now_ts - float(latest_attempt["timestamp"])) / 60.0)
+
+    if latest_recorded_video is None:
+        if latest_attempt is not None:
+            session_name = str(latest_attempt["record"].session_name)
+            error_text = str(latest_attempt.get("first_error") or "").strip()
+            if latest_attempt["record"].success:
+                return RuntimeAlert(
+                    "WARN",
+                    "Recording freshness",
+                    (
+                        f"Latest scheduled recording attempt was {latest_attempt_age_minutes:.1f} minutes ago "
+                        f"({session_name}), but no recording video was found under {data_root}. "
+                        "Check output path and cleanup settings."
+                    ),
+                )
+            detail = f" First error: {error_text}" if error_text else ""
+            return RuntimeAlert(
+                "WARN",
+                "Recording freshness",
+                (
+                    f"Latest scheduled recording attempt was {latest_attempt_age_minutes:.1f} minutes ago "
+                    f"({session_name}), and it failed before producing a video.{detail}"
+                ),
+            )
+        return RuntimeAlert(
+            "WARN",
+            "Recording freshness",
+            f"No recording videos (.mp4 or .mjpeg) found under {data_root} while scheduling is enabled.",
+        )
+
+    try:
+        latest_video_mtime = latest_recorded_video.stat().st_mtime
+        age_minutes = (now_ts - latest_video_mtime) / 60.0
+    except Exception as exc:
+        return RuntimeAlert(
+            "WARN",
+            "Recording freshness",
+            f"Could not stat latest recording video ({latest_recorded_video}): {exc}",
+        )
+
+    if (
+        latest_attempt is not None
+        and latest_attempt_age_minutes is not None
+        and latest_attempt["timestamp"] > latest_video_mtime
+        and not latest_attempt["record"].success
+    ):
+        session_name = str(latest_attempt["record"].session_name)
+        error_text = str(latest_attempt.get("first_error") or "").strip()
+        detail = f" First error: {error_text}" if error_text else ""
+        return RuntimeAlert(
+            "WARN",
+            "Recording freshness",
+            (
+                f"Latest successful recording video is {age_minutes:.1f} minutes old ({latest_recorded_video.name}), "
+                f"but the most recent scheduled recording attempt was {latest_attempt_age_minutes:.1f} minutes ago "
+                f"({session_name}) and failed before video output.{detail}"
+            ),
+        )
 
     if age_minutes > expected_gap:
         source_note = " (fallback filesystem scan)" if used_fallback_scan else ""
+        if latest_attempt is not None and latest_attempt_age_minutes is not None:
+            session_name = str(latest_attempt["record"].session_name)
+            if not latest_attempt["record"].success:
+                error_text = str(latest_attempt.get("first_error") or "").strip()
+                detail = f" First error: {error_text}" if error_text else ""
+                return RuntimeAlert(
+                    "WARN",
+                    "Recording freshness",
+                    (
+                        f"Latest recording video is {age_minutes:.1f} minutes old ({latest_recorded_video.name}){source_note}, "
+                        f"but the scheduler did run {latest_attempt_age_minutes:.1f} minutes ago ({session_name}) and that "
+                        f"recording attempt failed before producing a video.{detail}"
+                    ),
+                )
         return RuntimeAlert(
             "WARN",
             "Recording freshness",
