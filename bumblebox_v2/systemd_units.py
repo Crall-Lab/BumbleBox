@@ -33,6 +33,22 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _preferred_runtime_python() -> Path:
+    repo_root = _repo_root()
+    candidates = [
+        repo_root / ".venvs" / "bbx-runtime" / "bin" / "python",
+        repo_root / ".venv" / "bin" / "python",
+        Path(sys.executable).resolve(),
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_file():
+                return candidate.resolve()
+        except Exception:
+            continue
+    return Path(sys.executable).resolve()
+
+
 def _service_text(description: str, working_dir: Path, exec_start: str, service_user: str | None) -> str:
     lines = [
         "[Unit]",
@@ -110,7 +126,7 @@ def _timer_text(description: str, service_name: str, interval_minutes: int) -> s
 
 
 def _exec_start_for_args(config_path: Path, args: List[str]) -> str:
-    python_path = Path(sys.executable).resolve()
+    python_path = _preferred_runtime_python()
     bbx_path = (_repo_root() / "bbx.py").resolve()
     cmd = [str(python_path), str(bbx_path), *args, "--config", str(config_path.resolve())]
     return " ".join(shlex.quote(part) for part in cmd)
