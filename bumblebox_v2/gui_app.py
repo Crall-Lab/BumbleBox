@@ -1553,10 +1553,10 @@ class BumbleBoxV2GUI(tk.Tk):
         top = ttk.Frame(self.storage_tab)
         top.pack(fill=tk.BOTH, expand=False)
 
-        self.storage_mount_point_var = tk.StringVar(value="/mnt/bumblebox/data")
+        self.storage_mount_point_var = tk.StringVar(value=str(self._recommended_data_root()))
         self.storage_device_var = tk.StringVar(value="Auto (recommended)")
         self._storage_device_display_to_path: dict[str, str] = {}
-        default_storage_path = str((Path.home() / "Desktop" / "BumbleBoxData").expanduser())
+        default_storage_path = str(self._recommended_data_root())
 
         settings = ttk.LabelFrame(top, text="Storage Configuration", padding=10)
         settings.pack(fill=tk.X)
@@ -5439,12 +5439,94 @@ class BumbleBoxV2GUI(tk.Tk):
             return
         self.storage_device_var.set(auto_label)
 
+    @staticmethod
+    def _recommended_data_root() -> Path:
+        return (Path.home() / "BumbleBoxData").expanduser()
+
+    @staticmethod
+    def _desktop_data_shortcut_path() -> Path:
+        return (Path.home() / "Desktop" / "BumbleBoxData").expanduser()
+
+    def _should_offer_desktop_data_shortcut(self, mount_point: str) -> bool:
+        try:
+            mount_path = Path(mount_point).expanduser().resolve()
+        except Exception:
+            return False
+        desktop_dir = self._desktop_data_shortcut_path().parent
+        try:
+            desktop_dir_resolved = desktop_dir.resolve()
+        except Exception:
+            desktop_dir_resolved = desktop_dir
+        return mount_path.parent != desktop_dir_resolved
+
+    def _ensure_desktop_data_shortcut(self, mount_point: str) -> tuple[Path, str]:
+        mount_path = Path(mount_point).expanduser().resolve()
+        desktop_shortcut = self._desktop_data_shortcut_path()
+        desktop_shortcut.parent.mkdir(parents=True, exist_ok=True)
+
+        if desktop_shortcut.exists() or desktop_shortcut.is_symlink():
+            try:
+                existing_resolved = desktop_shortcut.resolve()
+            except Exception:
+                existing_resolved = None
+            if existing_resolved == mount_path:
+                return desktop_shortcut, "Desktop shortcut already points to the selected data folder."
+            if desktop_shortcut.is_symlink():
+                desktop_shortcut.unlink()
+            else:
+                alternate = desktop_shortcut.parent / "BumbleBoxData Shortcut"
+                if alternate.exists() or alternate.is_symlink():
+                    try:
+                        alternate_resolved = alternate.resolve()
+                    except Exception:
+                        alternate_resolved = None
+                    if alternate_resolved == mount_path:
+                        return alternate, "Desktop shortcut already points to the selected data folder."
+                    if alternate.is_symlink():
+                        alternate.unlink()
+                    else:
+                        raise FileExistsError(
+                            f"Desktop already contains {desktop_shortcut} and {alternate}. Remove or rename one of them to create a shortcut."
+                        )
+                alternate.symlink_to(mount_path, target_is_directory=True)
+                return alternate, (
+                    f"Desktop already contains a real folder at {desktop_shortcut}, so BumbleBox created a shortcut named "
+                    f"{alternate.name} instead."
+                )
+
+        desktop_shortcut.symlink_to(mount_path, target_is_directory=True)
+        return desktop_shortcut, "Created a Desktop shortcut to the selected data folder."
+
+    def _offer_desktop_data_shortcut(self, mount_point: str) -> None:
+        if not self._should_offer_desktop_data_shortcut(mount_point):
+            return
+        create_shortcut = messagebox.askyesno(
+            "Desktop Data Shortcut",
+            (
+                f"BumbleBox is now using:\n{mount_point}\n\n"
+                "Do you want a Desktop shortcut to this data folder too?"
+            ),
+        )
+        if not create_shortcut:
+            return
+        try:
+            shortcut_path, note = self._ensure_desktop_data_shortcut(mount_point)
+        except Exception as exc:
+            self._show_error("Desktop shortcut failed", str(exc))
+            return
+        messagebox.showinfo(
+            "Desktop Data Shortcut",
+            f"{note}\n\nShortcut path:\n{shortcut_path}",
+        )
+
     def _load_storage_mount_point_from_config(self) -> None:
         try:
             config, _ = self._load_config_or_defaults()
             mount_point = str(config.get("system", {}).get("data_root", "")).strip()
-            if mount_point:
+            if mount_point and mount_point != "/mnt/bumblebox/data":
                 self.storage_mount_point_var.set(mount_point)
+            else:
+                self.storage_mount_point_var.set(str(self._recommended_data_root()))
         except Exception:
             pass
 
@@ -5646,6 +5728,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 history_note = self._format_config_history_note(snapshot_path, history_warning)
                 if history_note:
                     self.storage_output.insert(tk.END, f"\n{history_note}")
+                self._offer_desktop_data_shortcut(mount_point)
             except PermissionError:
                 if self._run_pkexec_storage_mount(
                     config_path=config_path,
@@ -5662,6 +5745,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     history_note = self._format_config_history_note(snapshot_path, history_warning)
                     if history_note:
                         self.storage_output.insert(tk.END, f"\n{history_note}")
+                    self._offer_desktop_data_shortcut(mount_point)
                     return
 
                 sudo_cmd = build_storage_mount_sudo_command(
@@ -5716,6 +5800,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 history_note = self._format_config_history_note(snapshot_path, history_warning)
                 if history_note:
                     self.storage_output.insert(tk.END, f"\n{history_note}")
+                self._offer_desktop_data_shortcut(mount_point)
             except PermissionError:
                 if self._run_pkexec_storage_setup(
                     config_path=config_path,
@@ -5732,6 +5817,7 @@ class BumbleBoxV2GUI(tk.Tk):
                     history_note = self._format_config_history_note(snapshot_path, history_warning)
                     if history_note:
                         self.storage_output.insert(tk.END, f"\n{history_note}")
+                    self._offer_desktop_data_shortcut(mount_point)
                     return
 
                 sudo_cmd = build_storage_setup_sudo_command(
