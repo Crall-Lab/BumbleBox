@@ -22,12 +22,6 @@ DEFAULT_EXECUTION_TARGET = "pi_safe"
 DEFAULT_TAG_SIZE_MM = 2.5
 DEFAULT_EARLY_STOP_PATIENCE = 40
 DEFAULT_EARLY_STOP_MIN_IMPROVEMENT = 0.002
-VALID_SWEEP_OVERRIDE_KEYS = {
-    "minMarkerPerimeterRate",
-    "adaptiveThreshWinSizeMin",
-    "adaptiveThreshWinSizeMax",
-    "adaptiveThreshWinSizeStep",
-}
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mjpeg", ".avi", ".mov", ".mkv"}
@@ -59,6 +53,15 @@ PROFILE_PARAMETER_SPACE = {
         "polygonalApproxAccuracyRate": [0.04, 0.05, 0.06, 0.08],
         "adaptiveThreshConstant": [5, 7],
     },
+}
+VALID_SWEEP_OVERRIDE_KEYS = {
+    key
+    for space in PROFILE_PARAMETER_SPACE.values()
+    for key in space
+}
+FLOAT_SWEEP_OVERRIDE_KEYS = {
+    "minMarkerPerimeterRate",
+    "polygonalApproxAccuracyRate",
 }
 
 
@@ -169,6 +172,27 @@ def _min_marker_rates_for_tag_size(
     return sorted({round(value, 4) for value in scaled})
 
 
+def resolve_profile_parameter_space(
+    profile: str,
+    tag_size_mm: float,
+    frame_width: int,
+    frame_height: int,
+) -> dict[str, list[float | int]]:
+    profile_key = str(profile).strip().lower()
+    if profile_key not in VALID_PROFILES:
+        raise ValueError(f"profile must be one of {sorted(VALID_PROFILES)}, got: {profile}")
+    if tag_size_mm <= 0:
+        raise ValueError("tag_size_mm must be > 0")
+
+    space = deepcopy(PROFILE_PARAMETER_SPACE[profile_key])
+    space["minMarkerPerimeterRate"] = _min_marker_rates_for_tag_size(
+        tag_size_mm=tag_size_mm,
+        frame_width=frame_width,
+        frame_height=frame_height,
+    )
+    return space
+
+
 def build_parameter_grid(
     profile: str,
     tag_size_mm: float,
@@ -176,15 +200,8 @@ def build_parameter_grid(
     frame_height: int,
     sweep_overrides: Optional[dict[str, Sequence[float | int]]] = None,
 ) -> list[dict[str, float | int]]:
-    profile_key = str(profile).strip().lower()
-    if profile_key not in VALID_PROFILES:
-        raise ValueError(f"profile must be one of {sorted(VALID_PROFILES)}, got: {profile}")
-    if tag_size_mm <= 0:
-        raise ValueError("tag_size_mm must be > 0")
-
-    space = PROFILE_PARAMETER_SPACE[profile_key]
-    space = dict(space)
-    space["minMarkerPerimeterRate"] = _min_marker_rates_for_tag_size(
+    space = resolve_profile_parameter_space(
+        profile=profile,
         tag_size_mm=tag_size_mm,
         frame_width=frame_width,
         frame_height=frame_height,
@@ -199,7 +216,7 @@ def build_parameter_grid(
             if not values:
                 raise ValueError(f"sweep override list for '{key}' cannot be empty")
 
-            if key == "minMarkerPerimeterRate":
+            if key in FLOAT_SWEEP_OVERRIDE_KEYS:
                 parsed = []
                 for value in values:
                     parsed_value = float(value)

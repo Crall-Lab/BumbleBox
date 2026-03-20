@@ -133,6 +133,45 @@ LAVENDER_LIGHT_PALETTE = {
     "output_text": "#111111",
 }
 
+OPTIMIZE_SWEEP_FIELDS = (
+    (
+        "minMarkerPerimeterRate",
+        "float",
+        "minMarkerPerimeterRate",
+        "Minimum marker perimeter ratio. Raise to filter tiny false positives.",
+    ),
+    (
+        "adaptiveThreshWinSizeMin",
+        "int",
+        "adaptiveThreshWinSizeMin",
+        "Lower bound of adaptive threshold window size.",
+    ),
+    (
+        "adaptiveThreshWinSizeMax",
+        "int",
+        "adaptiveThreshWinSizeMax",
+        "Upper bound of adaptive threshold window size.",
+    ),
+    (
+        "adaptiveThreshWinSizeStep",
+        "int",
+        "adaptiveThreshWinSizeStep",
+        "Step size between min and max adaptive threshold windows.",
+    ),
+    (
+        "polygonalApproxAccuracyRate",
+        "float",
+        "polygonalApproxAccuracyRate",
+        "Polygon approximation tolerance. Lower values preserve more contour detail.",
+    ),
+    (
+        "adaptiveThreshConstant",
+        "int",
+        "adaptiveThreshConstant",
+        "Constant subtracted during adaptive thresholding. Useful for brightness-sensitive tuning.",
+    ),
+)
+
 
 class BumbleBoxV2GUI(tk.Tk):
     def __init__(self) -> None:
@@ -3738,10 +3777,10 @@ class BumbleBoxV2GUI(tk.Tk):
         self.opt_preview_frames_var = tk.StringVar(value="240")
         self.opt_apply_best_var = tk.BooleanVar(value=True)
         self.opt_top_k_var = tk.StringVar(value="5")
-        self.opt_sweep_min_marker_perimeter_rate_var = tk.StringVar(value="")
-        self.opt_sweep_adaptive_thresh_win_size_min_var = tk.StringVar(value="")
-        self.opt_sweep_adaptive_thresh_win_size_max_var = tk.StringVar(value="")
-        self.opt_sweep_adaptive_thresh_win_size_step_var = tk.StringVar(value="")
+        self._opt_sweep_profile_vars: dict[str, dict[str, tk.StringVar]] = {}
+        self._opt_profile_notebook: ttk.Notebook | None = None
+        self._opt_profile_tabs: dict[str, ttk.Frame] = {}
+        self._opt_profile_syncing = False
         self.opt_status_var = tk.StringVar(value="Idle")
         self._optimize_top_k = 5
 
@@ -3763,13 +3802,15 @@ class BumbleBoxV2GUI(tk.Tk):
             help_title="Optimization Profile",
             help_details="Quick tests fewer combinations; Deep explores more combinations and takes longer.",
         )
-        ttk.Combobox(
+        profile_combo = ttk.Combobox(
             top,
             textvariable=self.opt_profile_var,
             values=["quick", "balanced", "deep"],
             state="readonly",
             width=20,
-        ).grid(row=1, column=1, sticky="w", padx=8, pady=4)
+        )
+        profile_combo.grid(row=1, column=1, sticky="w", padx=8, pady=4)
+        profile_combo.bind("<<ComboboxSelected>>", self._on_optimize_profile_selected)
 
         self._grid_help_label(
             top,
@@ -3917,67 +3958,27 @@ class BumbleBoxV2GUI(tk.Tk):
 
         sweep_frame = ttk.LabelFrame(
             advanced,
-            text="Custom Sweep Overrides (optional, comma-separated)",
+            text="Profile Sweep Values (editable, comma-separated)",
             padding=6,
         )
         sweep_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self._grid_help_label(
-            sweep_frame,
-            row=0,
-            column=0,
-            text="minMarkerPerimeterRate",
-            help_title="minMarkerPerimeterRate",
-            help_details="Minimum marker perimeter ratio. Raise to filter tiny false positives.",
-        )
-        ttk.Entry(
-            sweep_frame,
-            textvariable=self.opt_sweep_min_marker_perimeter_rate_var,
-            width=28,
-        ).grid(row=0, column=1, sticky="ew", padx=8, pady=2)
-        self._grid_help_label(
-            sweep_frame,
-            row=1,
-            column=0,
-            text="adaptiveThreshWinSizeMin",
-            help_title="adaptiveThreshWinSizeMin",
-            help_details="Lower bound of adaptive threshold window size.",
-        )
-        ttk.Entry(
-            sweep_frame,
-            textvariable=self.opt_sweep_adaptive_thresh_win_size_min_var,
-            width=28,
-        ).grid(row=1, column=1, sticky="ew", padx=8, pady=2)
-        self._grid_help_label(
-            sweep_frame,
-            row=2,
-            column=0,
-            text="adaptiveThreshWinSizeMax",
-            help_title="adaptiveThreshWinSizeMax",
-            help_details="Upper bound of adaptive threshold window size.",
-        )
-        ttk.Entry(
-            sweep_frame,
-            textvariable=self.opt_sweep_adaptive_thresh_win_size_max_var,
-            width=28,
-        ).grid(row=2, column=1, sticky="ew", padx=8, pady=2)
-        self._grid_help_label(
-            sweep_frame,
-            row=3,
-            column=0,
-            text="adaptiveThreshWinSizeStep",
-            help_title="adaptiveThreshWinSizeStep",
-            help_details="Step size between min and max adaptive threshold windows.",
-        )
-        ttk.Entry(
-            sweep_frame,
-            textvariable=self.opt_sweep_adaptive_thresh_win_size_step_var,
-            width=28,
-        ).grid(row=3, column=1, sticky="ew", padx=8, pady=2)
         ttk.Label(
             sweep_frame,
-            text="Leave blank to use profile defaults for any field.",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        sweep_frame.columnconfigure(1, weight=1)
+            text=(
+                "Each tab shows the current sweep values for that profile. "
+                "Edit any field, or revert the tab to defaults for the current tag size."
+            ),
+        ).grid(row=0, column=0, sticky="w")
+        self._opt_profile_notebook = ttk.Notebook(sweep_frame)
+        self._opt_profile_notebook.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._opt_profile_notebook.bind("<<NotebookTabChanged>>", self._on_optimize_profile_tab_changed)
+        for profile in ("quick", "balanced", "deep"):
+            tab = self._build_optimize_sweep_profile_tab(self._opt_profile_notebook, profile)
+            self._opt_profile_tabs[profile] = tab
+            self._opt_profile_notebook.add(tab, text=profile)
+            self._reset_optimize_sweep_profile_defaults(profile)
+        self._select_optimize_profile_tab(self.opt_profile_var.get().strip().lower() or "quick")
+        sweep_frame.columnconfigure(0, weight=1)
 
         advanced.columnconfigure(1, weight=1)
         self._register_advanced_widget(advanced)
@@ -4040,6 +4041,116 @@ class BumbleBoxV2GUI(tk.Tk):
                 unique.append(value)
         return unique
 
+    def _format_optimize_sweep_values(self, values: list[float | int]) -> str:
+        formatted = []
+        for value in values:
+            if isinstance(value, float):
+                formatted.append(f"{value:g}")
+            else:
+                formatted.append(str(value))
+        return ", ".join(formatted)
+
+    def _current_opt_tag_size_for_defaults(self) -> float:
+        from .tracking_optimizer import DEFAULT_TAG_SIZE_MM
+
+        raw = self.opt_tag_size_mm_var.get().strip()
+        if not raw:
+            return DEFAULT_TAG_SIZE_MM
+        try:
+            parsed = float(raw)
+        except Exception:
+            return DEFAULT_TAG_SIZE_MM
+        if parsed <= 0:
+            return DEFAULT_TAG_SIZE_MM
+        return parsed
+
+    def _resolve_optimize_profile_sweep_defaults(self, profile: str) -> dict[str, list[float | int]]:
+        from .tracking_optimizer import resolve_profile_parameter_space
+
+        return resolve_profile_parameter_space(
+            profile=profile,
+            tag_size_mm=self._current_opt_tag_size_for_defaults(),
+            frame_width=4056,
+            frame_height=3040,
+        )
+
+    def _build_optimize_sweep_profile_tab(self, notebook: ttk.Notebook, profile: str) -> ttk.Frame:
+        tab = ttk.Frame(notebook, padding=6)
+        profile_vars: dict[str, tk.StringVar] = {}
+        self._opt_sweep_profile_vars[profile] = profile_vars
+
+        for row, (key, _value_type, help_title, help_details) in enumerate(OPTIMIZE_SWEEP_FIELDS):
+            profile_vars[key] = tk.StringVar(value="")
+            self._grid_help_label(
+                tab,
+                row=row,
+                column=0,
+                text=key,
+                help_title=help_title,
+                help_details=help_details,
+            )
+            ttk.Entry(
+                tab,
+                textvariable=profile_vars[key],
+                width=34,
+            ).grid(row=row, column=1, sticky="ew", padx=8, pady=2)
+
+        controls = ttk.Frame(tab)
+        controls.grid(row=len(OPTIMIZE_SWEEP_FIELDS), column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(
+            controls,
+            text="Revert To Profile Defaults",
+            command=lambda selected_profile=profile: self._reset_optimize_sweep_profile_defaults(selected_profile),
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            controls,
+            text="Blank fields fall back to defaults for the current tag size.",
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        tab.columnconfigure(1, weight=1)
+        return tab
+
+    def _reset_optimize_sweep_profile_defaults(self, profile: str) -> None:
+        defaults = self._resolve_optimize_profile_sweep_defaults(profile)
+        profile_vars = self._opt_sweep_profile_vars.get(profile, {})
+        for key, _value_type, _help_title, _help_details in OPTIMIZE_SWEEP_FIELDS:
+            if key not in profile_vars:
+                continue
+            profile_vars[key].set(self._format_optimize_sweep_values(list(defaults[key])))
+
+    def _select_optimize_profile_tab(self, profile: str) -> None:
+        if self._opt_profile_notebook is None:
+            return
+        tab = self._opt_profile_tabs.get(profile)
+        if tab is None:
+            return
+        self._opt_profile_syncing = True
+        try:
+            self.opt_profile_var.set(profile)
+            self._opt_profile_notebook.select(tab)
+        finally:
+            self._opt_profile_syncing = False
+
+    def _on_optimize_profile_selected(self, _event: object | None = None) -> None:
+        if self._opt_profile_syncing:
+            return
+        self._select_optimize_profile_tab(self.opt_profile_var.get().strip().lower())
+
+    def _on_optimize_profile_tab_changed(self, _event: object | None = None) -> None:
+        if self._opt_profile_syncing or self._opt_profile_notebook is None:
+            return
+        tab_id = self._opt_profile_notebook.select()
+        if not tab_id:
+            return
+        profile = str(self._opt_profile_notebook.tab(tab_id, "text")).strip().lower()
+        if not profile:
+            return
+        self._opt_profile_syncing = True
+        try:
+            self.opt_profile_var.set(profile)
+        finally:
+            self._opt_profile_syncing = False
+
     def _start_optimize_tracking(self) -> None:
         if self._optimize_thread and self._optimize_thread.is_alive():
             self._show_info("Optimization running", "Tracking optimization is already running.")
@@ -4085,38 +4196,28 @@ class BumbleBoxV2GUI(tk.Tk):
             if top_k <= 0:
                 raise ValueError("top results must be >= 1")
 
+            profile = self.opt_profile_var.get().strip().lower()
+            if profile not in self._opt_sweep_profile_vars:
+                raise ValueError(f"Unknown optimization profile: {profile}")
+
+            profile_defaults = self._resolve_optimize_profile_sweep_defaults(profile)
+            profile_vars = self._opt_sweep_profile_vars[profile]
             sweep_overrides = {}
-            min_perimeter = self._parse_csv_numeric_values(
-                self.opt_sweep_min_marker_perimeter_rate_var.get(),
-                label="minMarkerPerimeterRate sweep",
-                value_type="float",
-            )
-            if min_perimeter:
-                sweep_overrides["minMarkerPerimeterRate"] = min_perimeter
-
-            win_min = self._parse_csv_numeric_values(
-                self.opt_sweep_adaptive_thresh_win_size_min_var.get(),
-                label="adaptiveThreshWinSizeMin sweep",
-                value_type="int",
-            )
-            if win_min:
-                sweep_overrides["adaptiveThreshWinSizeMin"] = win_min
-
-            win_max = self._parse_csv_numeric_values(
-                self.opt_sweep_adaptive_thresh_win_size_max_var.get(),
-                label="adaptiveThreshWinSizeMax sweep",
-                value_type="int",
-            )
-            if win_max:
-                sweep_overrides["adaptiveThreshWinSizeMax"] = win_max
-
-            win_step = self._parse_csv_numeric_values(
-                self.opt_sweep_adaptive_thresh_win_size_step_var.get(),
-                label="adaptiveThreshWinSizeStep sweep",
-                value_type="int",
-            )
-            if win_step:
-                sweep_overrides["adaptiveThreshWinSizeStep"] = win_step
+            for key, value_type, _help_title, _help_details in OPTIMIZE_SWEEP_FIELDS:
+                default_text = self._format_optimize_sweep_values(list(profile_defaults[key]))
+                default_values = self._parse_csv_numeric_values(
+                    default_text,
+                    label=f"{key} sweep",
+                    value_type=value_type,
+                )
+                raw_text = profile_vars[key].get().strip()
+                current_values = self._parse_csv_numeric_values(
+                    raw_text or default_text,
+                    label=f"{key} sweep",
+                    value_type=value_type,
+                )
+                if current_values != default_values:
+                    sweep_overrides[key] = current_values
         except Exception as exc:
             self._show_error("Invalid settings", str(exc))
             return
@@ -4135,7 +4236,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
         optimize_kwargs = {
             "input_path": input_path,
-            "profile": self.opt_profile_var.get().strip(),
+            "profile": profile,
             "sample_frames": sample_frames,
             "dictionary_name": self.opt_dictionary_var.get().strip() or "4X4_50",
             "tag_size_mm": tag_size_mm,
