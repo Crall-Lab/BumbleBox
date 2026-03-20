@@ -5014,17 +5014,26 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Label(
             automation_box,
             text=(
-                "Repeated recording is started with scheduled systemd timers. "
-                "This button saves the current Config Editor settings, writes the timer files, "
-                "installs them into systemd, and starts them now. In Basic mode it uses user-scope timers "
-                "so automation can start without sudo."
+                "Repeated recording uses scheduled systemd timers. "
+                "Start saves the current Config Editor settings, writes the timer files, "
+                "installs them into systemd, and starts them now. Stop disables the timers and stops future "
+                "scheduled runs. In Basic mode BumbleBox uses user-scope timers so automation can start without sudo."
             ),
             wraplength=900,
             justify=tk.LEFT,
         ).grid(row=0, column=0, sticky="w")
-        ttk.Button(automation_box, text="Start Automated Recording", command=self._start_automated_recording).grid(
-            row=0, column=1, sticky="e", padx=(12, 0)
-        )
+        automation_actions = ttk.Frame(automation_box)
+        automation_actions.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        ttk.Button(
+            automation_actions,
+            text="Start Automated Recording",
+            command=self._start_automated_recording,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            automation_actions,
+            text="Stop Automated Recording",
+            command=self._stop_automated_recording,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         automation_box.columnconfigure(0, weight=1)
 
         systemd_advanced = ttk.LabelFrame(top, text="Advanced Timer Controls", padding=6)
@@ -7258,6 +7267,12 @@ class BumbleBoxV2GUI(tk.Tk):
                 self._show_automation_started_popup(config)
         except Exception as exc:
             self._show_error("Automated recording start failed", str(exc))
+
+    def _stop_automated_recording(self) -> None:
+        try:
+            self._systemd_action("disable")
+        except Exception as exc:
+            self._show_error("Automated recording stop failed", str(exc))
 
     def _systemd_action(self, action: str) -> None:
         try:
