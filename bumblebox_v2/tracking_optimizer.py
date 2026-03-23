@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import cv2
 
@@ -103,6 +103,7 @@ class TrackingOptimizationResult:
     summary_json_path: str
     candidates_csv_path: str
     preview_video_path: Optional[str]
+    review_manifest_json_path: Optional[str]
     best_params: dict[str, float | int]
     best_score: float
     best_mean_detected: float
@@ -286,13 +287,14 @@ def _sample_indices(total_count: int, sample_count: int) -> list[int]:
     return sorted(indices[:sample_count])
 
 
-def _load_sample_frames_from_video(video_path: Path, sample_count: int) -> tuple[list, int]:
+def _load_sample_frames_from_video(video_path: Path, sample_count: int) -> tuple[list, int, list[int]]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video for optimization: {video_path}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frames = []
+    used_indices: list[int] = []
 
     if total_frames > 0:
         indices = _sample_indices(total_frames, sample_count)
@@ -303,21 +305,25 @@ def _load_sample_frames_from_video(video_path: Path, sample_count: int) -> tuple
                 continue
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             frames.append(gray)
+            used_indices.append(frame_idx)
     else:
+        next_index = 0
         while len(frames) < sample_count:
             ok, frame = cap.read()
             if not ok or frame is None:
                 break
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             frames.append(gray)
+            used_indices.append(next_index)
+            next_index += 1
 
     cap.release()
     if not frames:
         raise RuntimeError(f"No readable frames found in video: {video_path}")
-    return frames, max(total_frames, len(frames))
+    return frames, max(total_frames, len(frames)), used_indices
 
 
-def _load_sample_frames_from_image_dir(image_dir: Path, sample_count: int) -> tuple[list, int]:
+def _load_sample_frames_from_image_dir(image_dir: Path, sample_count: int) -> tuple[list, int, list[int]]:
     all_images = sorted(
         path for path in image_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     )
@@ -326,24 +332,31 @@ def _load_sample_frames_from_image_dir(image_dir: Path, sample_count: int) -> tu
 
     indices = _sample_indices(len(all_images), sample_count)
     frames = []
+    used_indices: list[int] = []
     for idx in indices:
         image = cv2.imread(str(all_images[idx]), cv2.IMREAD_GRAYSCALE)
         if image is None:
             continue
         frames.append(image)
+        used_indices.append(idx)
 
     if not frames:
         raise RuntimeError(f"All sampled images failed to load from: {image_dir}")
-    return frames, len(all_images)
+    return frames, len(all_images), used_indices
 
 
-def load_sample_frames(input_path: str | Path, sample_count: int) -> tuple[list, str, int]:
+def load_sample_frames_with_indices(input_path: str | Path, sample_count: int) -> tuple[list, str, int, list[int]]:
     path = Path(input_path).expanduser().resolve()
     input_type = _classify_input_path(path)
     if input_type == "video":
-        frames, total_count = _load_sample_frames_from_video(path, sample_count)
+        frames, total_count, sample_indices = _load_sample_frames_from_video(path, sample_count)
     else:
-        frames, total_count = _load_sample_frames_from_image_dir(path, sample_count)
+        frames, total_count, sample_indices = _load_sample_frames_from_image_dir(path, sample_count)
+    return frames, input_type, total_count, sample_indices
+
+
+def load_sample_frames(input_path: str | Path, sample_count: int) -> tuple[list, str, int]:
+    frames, input_type, total_count, _sample_indices = load_sample_frames_with_indices(input_path, sample_count)
     return frames, input_type, total_count
 
 
@@ -551,6 +564,149 @@ def write_preview_video(
     return output
 
 
+def _annotate_review_frame(
+    frame_gray: Any,
+    detector: Any,
+    candidate: OptimizationCandidate,
+    *,
+    sample_position: int,
+    source_index: int,
+) -> tuple[Any, int, int]:
+    corners, ids, rejected = detector.detectMarkers(frame_gray)
+    detected_count = 0 if ids is None else int(len(ids))
+    rejected_count = 0 if rejected is None else int(len(rejected))
+
+    annotated = cv2.cvtColor(frame_gray, cv2.COLOR_GRAY2BGR)
+    if ids is not None and len(ids) > 0:
+        cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
+
+    overlay_lines = [
+        f"Candidate #{candidate.rank}  score={candidate.score:.3f}",
+        f"sample={sample_position} source={source_index} detected={detected_count} rejected={rejected_count}",
+    ]
+    for idx, line in enumerate(overlay_lines):
+        y = 34 + (idx * 34)
+        cv2.putText(
+            annotated,
+            line,
+            (18, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            annotated,
+            line,
+            (18, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    return annotated, detected_count, rejected_count
+
+
+def _resize_review_image(frame_bgr: Any, *, max_width: int = 1280, max_height: int = 900) -> Any:
+    height, width = frame_bgr.shape[:2]
+    scale = min(max_width / float(width), max_height / float(height), 1.0)
+    if scale >= 1.0:
+        return frame_bgr
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    return cv2.resize(frame_bgr, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+
+def write_top_candidate_review_artifacts(
+    *,
+    sampled_frames: Sequence,
+    sample_indices: Sequence[int],
+    dictionary_name: str,
+    candidates: Sequence[OptimizationCandidate],
+    output_dir: str | Path,
+    max_candidates: int = 5,
+    max_frames: int = 12,
+) -> Optional[Path]:
+    if not sampled_frames or not candidates:
+        return None
+
+    selected_candidate_count = max(1, min(int(max_candidates), len(candidates)))
+    selected_frame_positions = _sample_indices(len(sampled_frames), min(max_frames, len(sampled_frames)))
+
+    review_dir = Path(output_dir).expanduser().resolve() / "top_candidate_review"
+    review_dir.mkdir(parents=True, exist_ok=True)
+
+    dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionary_name))
+    manifest: dict[str, object] = {
+        "candidate_count": selected_candidate_count,
+        "frame_count": len(selected_frame_positions),
+        "candidates": [],
+    }
+
+    for candidate in candidates[:selected_candidate_count]:
+        detector_params = cv2.aruco.DetectorParameters()
+        for key, value in candidate.params.items():
+            if hasattr(detector_params, key):
+                setattr(detector_params, key, value)
+        detector = cv2.aruco.ArucoDetector(dictionary, detector_params)
+
+        candidate_dir = review_dir / f"candidate_{candidate.rank:02d}"
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+
+        frame_entries = []
+        for review_frame_idx, sample_position in enumerate(selected_frame_positions, start=1):
+            source_index = (
+                int(sample_indices[sample_position])
+                if sample_position < len(sample_indices)
+                else int(sample_position)
+            )
+            annotated, detected_count, rejected_count = _annotate_review_frame(
+                sampled_frames[sample_position],
+                detector,
+                candidate,
+                sample_position=sample_position,
+                source_index=source_index,
+            )
+            preview_frame = _resize_review_image(annotated)
+            output_path = candidate_dir / f"frame_{review_frame_idx:03d}.png"
+            if not cv2.imwrite(str(output_path), preview_frame):
+                raise RuntimeError(f"Failed to write review preview image: {output_path}")
+            frame_entries.append(
+                {
+                    "review_frame_index": review_frame_idx - 1,
+                    "sample_position": sample_position,
+                    "source_index": source_index,
+                    "detected_count": detected_count,
+                    "rejected_count": rejected_count,
+                    "path": str(output_path),
+                }
+            )
+
+        manifest["candidates"].append(
+            {
+                "rank": candidate.rank,
+                "score": candidate.score,
+                "mean_detected": candidate.mean_detected,
+                "std_detected": candidate.std_detected,
+                "mean_rejected": candidate.mean_rejected,
+                "stability": candidate.stability,
+                "unique_ids": candidate.unique_ids,
+                "eval_fps": candidate.eval_fps,
+                "runtime_seconds": candidate.runtime_seconds,
+                "average_frame_ms": ((candidate.runtime_seconds / len(sampled_frames)) * 1000.0),
+                "params": candidate.params,
+                "frames": frame_entries,
+            }
+        )
+
+    manifest_path = review_dir / "review_manifest.json"
+    with manifest_path.open("w") as f:
+        json.dump(manifest, f, indent=2)
+    return manifest_path
+
+
 def optimize_tracking(
     input_path: str | Path,
     profile: str = DEFAULT_PROFILE,
@@ -595,7 +751,10 @@ def optimize_tracking(
 
     normalized_dictionary = normalize_dictionary_name(dictionary_name)
     resolved_input = Path(input_path).expanduser().resolve()
-    sampled_frames, input_type, total_input_frames = load_sample_frames(resolved_input, sample_frames)
+    sampled_frames, input_type, total_input_frames, sample_indices = load_sample_frames_with_indices(
+        resolved_input,
+        sample_frames,
+    )
     frame_height, frame_width = sampled_frames[0].shape[:2]
     param_grid = build_parameter_grid(
         profile_key,
@@ -682,6 +841,15 @@ def optimize_tracking(
             output_path=run_dir / "best_params_preview.mp4",
             max_frames=preview_frames,
         )
+    review_manifest_json_path = write_top_candidate_review_artifacts(
+        sampled_frames=sampled_frames,
+        sample_indices=sample_indices,
+        dictionary_name=normalized_dictionary,
+        candidates=evaluated,
+        output_dir=run_dir,
+        max_candidates=5,
+        max_frames=12,
+    )
 
     top_candidates = evaluated[: max(top_k, 1)]
     result = TrackingOptimizationResult(
@@ -707,6 +875,9 @@ def optimize_tracking(
         summary_json_path=str(run_dir / "optimization_summary.json"),
         candidates_csv_path=str(csv_path),
         preview_video_path=str(preview_video_path) if preview_video_path else None,
+        review_manifest_json_path=(
+            str(review_manifest_json_path) if review_manifest_json_path else None
+        ),
         best_params=best.params,
         best_score=best.score,
         best_mean_detected=best.mean_detected,
@@ -759,6 +930,8 @@ def format_optimization_report(result: TrackingOptimizationResult, top_k: int = 
     ]
     if result.preview_video_path:
         lines.append(f"Preview video: {result.preview_video_path}")
+    if result.review_manifest_json_path:
+        lines.append(f"Review manifest: {result.review_manifest_json_path}")
 
     lines.append("")
     lines.append("Top candidates:")

@@ -198,6 +198,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._optimize_warning: str | None = None
         self._optimize_result = None
         self._optimize_applied_config: str | None = None
+        self._optimize_review_dialog: tk.Toplevel | None = None
         self._optimize_progress_q: queue.Queue[tuple[int, int]] = queue.Queue()
         self._fps_sweep_thread: threading.Thread | None = None
         self._fps_sweep_error: str | None = None
@@ -3775,7 +3776,6 @@ class BumbleBoxV2GUI(tk.Tk):
         self.opt_early_stop_min_improvement_var = tk.StringVar(value="0.002")
         self.opt_preview_var = tk.BooleanVar(value=False)
         self.opt_preview_frames_var = tk.StringVar(value="240")
-        self.opt_apply_best_var = tk.BooleanVar(value=True)
         self.opt_top_k_var = tk.StringVar(value="5")
         self._opt_sweep_profile_vars: dict[str, dict[str, tk.StringVar]] = {}
         self._opt_profile_notebook: ttk.Notebook | None = None
@@ -3858,17 +3858,19 @@ class BumbleBoxV2GUI(tk.Tk):
             value="desktop",
         ).pack(side=tk.LEFT, padx=12)
 
-        options = ttk.Frame(top)
-        options.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Checkbutton(
-            options,
-            text="Apply best params to current config",
-            variable=self.opt_apply_best_var,
+        review_note = ttk.Frame(top)
+        review_note.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(
+            review_note,
+            text="After optimization, BumbleBox can open a top-5 review window before applying any parameters.",
         ).pack(side=tk.LEFT)
         self._make_help_button(
-            options,
-            title="Apply Best Params",
-            details="If enabled, writes the winning ArUco parameter set into current config after optimization.",
+            review_note,
+            title="Optimization Review",
+            details=(
+                "When optimization finishes, BumbleBox can open a review window for the top five candidates. "
+                "You can browse representative frames, compare candidate parameters, and apply the one you choose."
+            ),
         ).pack(side=tk.LEFT, padx=(4, 0))
 
         advanced = ttk.LabelFrame(top, text="Advanced Optimization Options", padding=6)
@@ -4251,9 +4253,6 @@ class BumbleBoxV2GUI(tk.Tk):
             "preview_frames": preview_frames,
             "top_k": max(top_k, 10),
         }
-        apply_best = bool(self.opt_apply_best_var.get())
-        config_path = self.config_path_var.get().strip() or str(DEFAULT_USER_CONFIG_PATH)
-
         self.optimize_output.delete("1.0", tk.END)
         self.optimize_output.insert(tk.END, "Running optimize-tracking...\n")
         self.opt_status_var.set("Running...")
@@ -4261,14 +4260,14 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._optimize_thread = threading.Thread(
             target=self._run_optimize_tracking_worker,
-            args=(optimize_kwargs, apply_best, config_path),
+            args=(optimize_kwargs,),
             daemon=True,
         )
         self._optimize_thread.start()
         self.after(200, self._poll_optimize_tracking)
 
-    def _run_optimize_tracking_worker(self, optimize_kwargs: dict, apply_best: bool, config_path: str) -> None:
-        from .tracking_optimizer import apply_best_params_to_config, optimize_tracking
+    def _run_optimize_tracking_worker(self, optimize_kwargs: dict) -> None:
+        from .tracking_optimizer import optimize_tracking
 
         def progress_callback(done: int, total: int) -> None:
             self._optimize_progress_q.put((done, total))
@@ -4283,29 +4282,241 @@ class BumbleBoxV2GUI(tk.Tk):
             self._optimize_error = str(exc)
             return
 
-        if apply_best:
-            try:
-                config_path_obj = Path(config_path)
-                if config_path_obj.exists():
-                    config = load_config(config_path_obj)
-                else:
-                    config = load_defaults()
-                updated = apply_best_params_to_config(config, result.best_params)
-                snapshot_path, history_warning = self._save_config_with_history(
-                    config_path_obj,
-                    updated,
-                    reason="optimize_tracking_apply_best",
-                )
-                self._optimize_applied_config = str(config_path_obj)
-                history_note = self._format_config_history_note(snapshot_path, history_warning)
-                if history_note:
-                    self._optimize_warning = (
-                        history_note
-                        if self._optimize_warning is None
-                        else f"{self._optimize_warning}\n{history_note}"
-                    )
-            except Exception as exc:
-                self._optimize_warning = f"Optimization finished, but config update failed: {exc}"
+    def _prompt_optimize_review(self) -> None:
+        if self._optimize_result is None:
+            return
+        review_manifest = getattr(self._optimize_result, "review_manifest_json_path", None)
+        if not review_manifest:
+            return
+        review_path = Path(review_manifest)
+        if not review_path.exists():
+            return
+        confirmed = messagebox.askyesno(
+            "Review optimization candidates",
+            "Do you want to review the performance of the top five candidates?",
+            parent=self,
+        )
+        if confirmed:
+            self._open_optimize_review_dialog(review_path)
+
+    def _apply_selected_optimization_candidate(self, params: dict[str, float | int]) -> None:
+        from .tracking_optimizer import apply_best_params_to_config
+
+        try:
+            config_path_obj = Path(self.config_path_var.get().strip() or str(DEFAULT_USER_CONFIG_PATH))
+            if config_path_obj.exists():
+                config = load_config(config_path_obj)
+            else:
+                config = load_defaults()
+
+            updated = apply_best_params_to_config(config, params)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path_obj,
+                updated,
+                reason="optimize_tracking_apply_selected_candidate",
+            )
+            self._optimize_applied_config = str(config_path_obj)
+            self._load_config_into_editor()
+        except Exception as exc:
+            self._show_error("Optimization apply failed", str(exc))
+            return
+
+        message = f"Applied selected optimization parameters to:\n{config_path_obj}"
+        history_note = self._format_config_history_note(snapshot_path, history_warning)
+        if history_note:
+            message += f"\n\n{history_note}"
+        self._show_info("Optimization parameters applied", message)
+
+        self.optimize_output.insert(
+            tk.END,
+            f"\n\nApplied selected optimization parameters to config: {config_path_obj}",
+        )
+
+    def _open_optimize_review_dialog(self, manifest_path: Path) -> None:
+        try:
+            with manifest_path.open() as f:
+                manifest = json.load(f)
+        except Exception as exc:
+            self._show_error("Review load failed", str(exc))
+            return
+
+        candidates = manifest.get("candidates") or []
+        if not candidates:
+            self._show_error("Review unavailable", "No review candidates were generated for this optimization run.")
+            return
+
+        if self._optimize_review_dialog is not None and self._optimize_review_dialog.winfo_exists():
+            self._optimize_review_dialog.destroy()
+
+        dialog = tk.Toplevel(self)
+        self._optimize_review_dialog = dialog
+        dialog.title("Optimization Candidate Review")
+        dialog.geometry("1440x980")
+        dialog.minsize(1080, 760)
+        dialog.transient(self)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: self._close_optimize_review_dialog(dialog))
+
+        outer = ttk.Frame(dialog, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        header = ttk.Frame(outer)
+        header.pack(fill=tk.X)
+
+        candidate_options = []
+        candidate_lookup: dict[str, dict] = {}
+        for candidate in candidates[:5]:
+            label = (
+                f"#{candidate['rank']} "
+                f"score={candidate['score']:.3f} "
+                f"detected={candidate['mean_detected']:.2f} "
+                f"fps={candidate['eval_fps']:.1f}"
+            )
+            candidate_options.append(label)
+            candidate_lookup[label] = candidate
+
+        candidate_var = tk.StringVar(value=candidate_options[0])
+        frame_scale_var = tk.IntVar(value=1)
+        summary_var = tk.StringVar(value="")
+        frame_info_var = tk.StringVar(value="")
+
+        ttk.Label(header, text="Candidate").grid(row=0, column=0, sticky="w")
+        candidate_combo = ttk.Combobox(
+            header,
+            textvariable=candidate_var,
+            values=candidate_options,
+            state="readonly",
+            width=56,
+        )
+        candidate_combo.grid(row=0, column=1, sticky="w", padx=8)
+
+        body = ttk.Frame(outer)
+        body.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        sidebar = ttk.Frame(body)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+
+        ttk.Label(sidebar, text="Candidate summary").pack(anchor="w")
+        ttk.Label(
+            sidebar,
+            textvariable=summary_var,
+            justify=tk.LEFT,
+            wraplength=360,
+        ).pack(anchor="w", pady=(4, 8))
+
+        ttk.Label(sidebar, text="Parameters").pack(anchor="w")
+        params_text = tk.Text(sidebar, height=16, width=42, wrap=tk.WORD)
+        params_text.pack(fill=tk.BOTH, expand=False)
+        params_text.configure(state=tk.DISABLED)
+
+        viewer = ttk.Frame(body)
+        viewer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
+
+        image_label = ttk.Label(viewer)
+        image_label.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(viewer, textvariable=frame_info_var, justify=tk.LEFT).pack(anchor="w", pady=(6, 0))
+
+        controls = ttk.Frame(viewer)
+        controls.pack(fill=tk.X, pady=(8, 0))
+
+        def _selected_candidate() -> dict:
+            return candidate_lookup[candidate_var.get()]
+
+        state: dict[str, object] = {"photo": None}
+
+        def _set_params_text(candidate: dict) -> None:
+            params_text.configure(state=tk.NORMAL)
+            params_text.delete("1.0", tk.END)
+            params_text.insert(tk.END, json.dumps(candidate["params"], indent=2, sort_keys=True))
+            params_text.configure(state=tk.DISABLED)
+
+        def _update_frame(*_args: object) -> None:
+            candidate = _selected_candidate()
+            frames = candidate.get("frames") or []
+            if not frames:
+                image_label.configure(image="", text="No review frames available.")
+                frame_info_var.set("No review frames available.")
+                return
+
+            frame_idx = max(0, min(len(frames) - 1, int(frame_scale_var.get()) - 1))
+            if frame_scale_var.get() != frame_idx + 1:
+                frame_scale_var.set(frame_idx + 1)
+            frame_entry = frames[frame_idx]
+
+            photo = tk.PhotoImage(file=frame_entry["path"])
+            image_label.configure(image=photo, text="")
+            image_label.image = photo
+            state["photo"] = photo
+            frame_info_var.set(
+                "Frame "
+                f"{frame_idx + 1}/{len(frames)} | "
+                f"sample index {frame_entry['sample_position']} | "
+                f"source index {frame_entry['source_index']} | "
+                f"detected {frame_entry['detected_count']} | "
+                f"rejected {frame_entry['rejected_count']}"
+            )
+
+        def _update_candidate(*_args: object) -> None:
+            candidate = _selected_candidate()
+            avg_frame_ms = float(candidate.get("average_frame_ms", 0.0))
+            summary_var.set(
+                f"Rank: {candidate['rank']}\n"
+                f"Score: {candidate['score']:.4f}\n"
+                f"Mean detections/frame: {candidate['mean_detected']:.3f}\n"
+                f"Mean rejected/frame: {candidate['mean_rejected']:.3f}\n"
+                f"Stability: {candidate['stability']:.3f}\n"
+                f"Unique IDs: {candidate['unique_ids']}\n"
+                f"Average frame time: {avg_frame_ms:.2f} ms\n"
+                f"Eval FPS: {candidate['eval_fps']:.2f}"
+            )
+            _set_params_text(candidate)
+            frames = candidate.get("frames") or []
+            frame_slider.configure(to=max(1, len(frames)))
+            frame_scale_var.set(1)
+            _update_frame()
+
+        def _shift_frame(delta: int) -> None:
+            candidate = _selected_candidate()
+            frame_count = max(1, len(candidate.get("frames") or []))
+            next_value = max(1, min(frame_count, int(frame_scale_var.get()) + delta))
+            frame_scale_var.set(next_value)
+            _update_frame()
+
+        ttk.Button(controls, text="Prev Frame", command=lambda: _shift_frame(-1)).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Next Frame", command=lambda: _shift_frame(1)).pack(side=tk.LEFT, padx=(8, 0))
+        frame_slider = tk.Scale(
+            controls,
+            from_=1,
+            to=1,
+            orient=tk.HORIZONTAL,
+            variable=frame_scale_var,
+            showvalue=False,
+            command=_update_frame,
+            length=420,
+        )
+        frame_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+
+        footer = ttk.Frame(outer)
+        footer.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(
+            footer,
+            text="Apply These Optimization Parameters",
+            command=lambda: self._apply_selected_optimization_candidate(
+                dict(_selected_candidate()["params"])
+            ),
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            footer,
+            text="Close",
+            command=lambda: self._close_optimize_review_dialog(dialog),
+        ).pack(side=tk.RIGHT)
+
+        candidate_combo.bind("<<ComboboxSelected>>", _update_candidate)
+        _update_candidate()
+
+    def _close_optimize_review_dialog(self, dialog: tk.Toplevel) -> None:
+        if self._optimize_review_dialog is dialog:
+            self._optimize_review_dialog = None
+        dialog.destroy()
 
     def _poll_optimize_tracking(self) -> None:
         from .tracking_optimizer import format_optimization_report
@@ -4344,15 +4555,11 @@ class BumbleBoxV2GUI(tk.Tk):
             tk.END,
             format_optimization_report(self._optimize_result, top_k=self._optimize_top_k),
         )
-        if self._optimize_applied_config:
-            self.optimize_output.insert(
-                tk.END,
-                f"\n\nBest parameters were applied to config: {self._optimize_applied_config}",
-            )
         if self._optimize_warning:
             self.opt_status_var.set("Completed with warning")
             self.optimize_output.insert(tk.END, f"\n\nWarning: {self._optimize_warning}")
         self.notebook.select(self.optimize_tracking_tab)
+        self._prompt_optimize_review()
 
     def _build_nest_label_tab(self) -> None:
         top = ttk.Frame(self.nest_label_tab)
