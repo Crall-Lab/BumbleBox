@@ -9,6 +9,7 @@ import time
 import argparse
 import os
 import setup
+from tuning_utils import resolve_tuning_file
 
 def rpi4_preview(preview_time, shutter_speed, width, height, preview_digital_zoom, preview_tuning_file, preview_window):
     
@@ -72,7 +73,14 @@ def main():
         print(f'preview height: {preview_height} pixels')
         preview_digital_zoom = setup.preview_digital_zoom
         #tuning_file = os.environ["TUNING_FILE"]
-        preview_tuning_file = setup.preview_tuning_file
+        preview_tuning_file = resolve_tuning_file(
+            explicit_tuning_file=getattr(setup, "preview_tuning_file", None),
+            camera_model=getattr(setup, "camera_model", None),
+            width=getattr(setup, "preview_width", None),
+            height=getattr(setup, "preview_height", None),
+            infrared=getattr(setup, "infrared_preview", None),
+            default_sensor="imx477",
+        )
         print(f'tuning file used: {preview_tuning_file}')
         print("if the name of the tuning file has \"noir\" in it, that means its calibrating for you having taken out the IR filter in the camera. So hopefully you did that, or else it might look funky!") 
         #preview_window = os.environ["PREVIEW_WINDOW"]
@@ -100,9 +108,23 @@ def main():
             print(f'shutter speed: {args.shutter} microseconds')
             print(f'preview width: {args.width} pixels')
             print(f'preview height: {args.height} pixels')
-            print(f'tuning file used: {args.tuning_file}\n')
-            
-            rpi4_preview(args.preview_time, args.shutter, args.width, args.height, args.preview_digital_zoom, args.preview_tuning_file)
+            resolved_preview_tuning_file = resolve_tuning_file(
+                explicit_tuning_file=args.preview_tuning_file,
+                width=args.width,
+                height=args.height,
+                default_sensor="imx477",
+            )
+            print(f'tuning file used: {resolved_preview_tuning_file}\n')
+
+            rpi4_preview(
+                args.preview_time,
+                args.shutter,
+                args.width,
+                args.height,
+                args.preview_digital_zoom,
+                resolved_preview_tuning_file,
+                "QTGL",
+            )
             
         except:
             
@@ -116,7 +138,14 @@ def main():
             print(f'preview height: 1013 pixels')
             print(f'tuning file used: "imx477_noir.json"\n')
              
-            rpi4_preview(30, 2500, 1352, 1013, "imx477_noir.json", "QTGL")
+            fallback_tuning_file = resolve_tuning_file(
+                explicit_tuning_file="imx477_noir.json",
+                width=1352,
+                height=1013,
+                infrared=True,
+                default_sensor="imx477",
+            )
+            rpi4_preview(30, 2500, 1352, 1013, None, fallback_tuning_file, "QTGL")
     
     
 if __name__ == '__main__':

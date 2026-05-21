@@ -4,6 +4,7 @@ import setup
 from picamera2 import Picamera2
 import time
 from statistics import mean 
+from tuning_utils import resolve_tuning_file
 
 #edit code to add in rejected image points
 def test_tracking(preview_time, width, height, tag_dictionary, box_type, shutter_speed, digital_zoom, tuning_file):
@@ -113,8 +114,26 @@ def test_tracking(preview_time, width, height, tag_dictionary, box_type, shutter
     except:
         print("Average number of tags tracked: 0")
 def main():
-    
-    test_tracking(setup.preview_time, setup.width, setup.height, setup.tag_dictionary, setup.box_type, setup.shutter_speed, setup.recording_digital_zoom, setup.tuning_file)
+    resolved_tuning_file = resolve_tuning_file(
+        explicit_tuning_file=getattr(setup, "tuning_file", None),
+        camera_model=getattr(setup, "camera_model", None),
+        width=getattr(setup, "width", None),
+        height=getattr(setup, "height", None),
+        infrared=getattr(setup, "infrared_recording", None),
+        default_sensor="imx477",
+    )
+    print(f"Using tuning file: {resolved_tuning_file}")
+
+    test_tracking(
+        setup.preview_time,
+        setup.width,
+        setup.height,
+        setup.tag_dictionary,
+        setup.box_type,
+        setup.shutter_speed,
+        setup.recording_digital_zoom,
+        resolved_tuning_file,
+    )
     
 if __name__ == '__main__':
     

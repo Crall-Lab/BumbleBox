@@ -9,7 +9,12 @@ import time
 
 def load_actual_fps(filepath):
     try:
-        with open(filepath, 'r') as f:
+        fps_path = filepath
+        if not str(filepath).endswith(".txt"):
+            base, _ = os.path.splitext(filepath)
+            candidate = base + "_actual_fps.txt"
+            fps_path = candidate if os.path.exists(candidate) else filepath
+        with open(fps_path, 'r') as f:
             return float(f.readline().strip())
     except Exception:
         return None
@@ -34,10 +39,10 @@ def trackTagsFromVid(filepath, todays_folder_path, filename, tag_dictionary, box
     #Optimized custom BumbleBox parameters:  
     if box_type == 'custom':
         parameters.minMarkerPerimeterRate = 0.02
-        parameters.adaptiveThreshWinSizeMin = 3
-        parameters.adaptiveThreshWinSizMax = 31
+        parameters.adaptiveThreshWinSizeMin = 5
+        parameters.adaptiveThreshWinSizeMax = 29
         parameters.adaptiveThreshWinSizeStep = 3
-        parameters.polygonalApproxAccuracyRate = 0.08
+        parameters.polygonalApproxAccuracyRate = 0.06
 
     elif box_type == 'koppert':
         print("Note: 'koppert' box_type selected, but no presets defined yet.")
@@ -129,10 +134,10 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
     #Optimized custom BumbleBox parameters:  
     if box_type == 'custom':
         parameters.minMarkerPerimeterRate = 0.02
-        parameters.adaptiveThreshWinSizeMin = 3
-        parameters.adaptiveThreshWinSizMax = 31
+        parameters.adaptiveThreshWinSizeMin = 5
+        parameters.adaptiveThreshWinSizeMax = 29
         parameters.adaptiveThreshWinSizeStep = 3
-        parameters.polygonalApproxAccuracyRate = 0.08
+        parameters.polygonalApproxAccuracyRate = 0.06
 
     elif box_type == 'koppert':
         print("Note: 'koppert' box_type selected, but no presets defined yet.")
@@ -268,12 +273,12 @@ def trackTagsFromRAM_parallel(filename, todays_folder_path, frames_list, tag_dic
     #Optimized custom BumbleBox parameters:  
     if box_type == 'custom':
         parameters.minMarkerPerimeterRate = 0.02
-        parameters.adaptiveThreshWinSizeMin = 3
-        parameters.adaptiveThreshWinSizMax = 31
+        parameters.adaptiveThreshWinSizeMin = 5
+        parameters.adaptiveThreshWinSizeMax = 29
         parameters.adaptiveThreshWinSizeStep = 3
-        parameters.polygonalApproxAccuracyRate = 0.08
-        
-    elif aruco_params:
+        parameters.polygonalApproxAccuracyRate = 0.06
+
+    if aruco_params:
         print("Applying user-defined ArUco parameters:")
         for param_name, param_value in aruco_params.items():
             if hasattr(parameters, param_name):
@@ -308,4 +313,3 @@ def trackTagsFromRAM_parallel(filename, todays_folder_path, frames_list, tag_dic
 
     print(f"Multiprocessing tag tracking finished — {len(df)} tags, {len(df2)} no-ID detections")
     return df, df2, total_frames
-

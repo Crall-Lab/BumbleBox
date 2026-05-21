@@ -31,7 +31,7 @@ def remove_jumps_old(interpolated_df):
     return interpolated_df
 
 
-def remove_jumps(df, log_path=None, jump_thresh=500):
+def remove_jumps(df, log_path=None, jump_thresh=500, jump_threshold_pixels=None):
     """
     Flags suspicious jumps in ArUco tag tracking data and logs jump rows + neighbors.
 
@@ -45,11 +45,20 @@ def remove_jumps(df, log_path=None, jump_thresh=500):
         pd.DataFrame: DataFrame with 'flagged_as_jump' column added
     """
 
+    if df.empty:
+        return df
+
+    if jump_threshold_pixels is not None:
+        jump_thresh = float(jump_threshold_pixels)
+
     cleaned_df = df.copy()
     cleaned_df['flagged_as_jump'] = False
 
     if log_path is None:
-        colony_number = cleaned_df.loc[0,'colony number']
+        if 'colony number' in cleaned_df.columns and not cleaned_df.empty:
+            colony_number = cleaned_df.iloc[0]['colony number']
+        else:
+            colony_number = "unknown"
         log_dir = "./jump_logs"
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
@@ -449,6 +458,9 @@ def interpolate(df, max_seconds_gap, actual_frames_per_second):
         # Append the group to the list of DataFrames
         interpolated_dfs.append(interpolated_group)
     
+    if not interpolated_dfs:
+        return df
+
     try:
         # Concatenate all the interpolated groups into a single DataFrame
         interpolated_df = pd.concat(interpolated_dfs, ignore_index=True)

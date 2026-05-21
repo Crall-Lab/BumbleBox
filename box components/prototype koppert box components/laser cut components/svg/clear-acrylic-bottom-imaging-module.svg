@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 814.6179 722.605">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: none;
+        stroke: #000;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: .7087px;
+      }
+    </style>
+  </defs>
+  <g id="LWPOLYLINE">
+    <rect class="cls-1" x="15.1531" y="7.0785" width="780.0549" height="704.3046" rx="57.0585" ry="57.0585"/>
+  </g>
+  <g id="CIRCLE">
+    <circle class="cls-1" cx="405.1805" cy="359.2308" r="51.264"/>
+  </g>
+</svg>

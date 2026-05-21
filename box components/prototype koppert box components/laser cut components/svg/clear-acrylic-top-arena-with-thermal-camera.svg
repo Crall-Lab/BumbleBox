@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 798.2626 765.1568">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: none;
+        stroke: #000;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: .7087px;
+      }
+
+      .cls-2 {
+        letter-spacing: .004em;
+      }
+
+      .cls-3 {
+        font-family: MyriadPro-Regular, 'Myriad Pro';
+        font-size: 23px;
+      }
+
+      .cls-4 {
+        letter-spacing: -.005em;
+      }
+
+      .cls-5 {
+        letter-spacing: -.013em;
+      }
+    </style>
+  </defs>
+  <g>
+    <g id="CIRCLE">
+      <circle class="cls-1" cx="397.9341" cy="461.9124" r="6.3779"/>
+    </g>
+    <g id="CIRCLE-2" data-name="CIRCLE">
+      <circle class="cls-1" cx="46.3976" cy="704.3061" r="9.18"/>
+    </g>
+    <g id="CIRCLE-3" data-name="CIRCLE">
+      <circle class="cls-1" cx="749.4803" cy="77.0239" r="9.18"/>
+    </g>
+    <g id="CIRCLE-4" data-name="CIRCLE">
+      <circle class="cls-1" cx="46.3976" cy="77.0239" r="9.18"/>
+    </g>
+    <g id="CIRCLE-5" data-name="CIRCLE">
+      <circle class="cls-1" cx="749.4803" cy="704.3061" r="9.18"/>
+    </g>
+    <g id="LWPOLYLINE">
+      <path class="cls-1" d="m19.2501,119.8695h9.8868v541.6569h-9.8868v24.2323c0,25.2504,20.4695,45.72,45.72,45.72h24.351v-10.1407h617.3779v10.1407h24.2088c25.2504,0,45.72-20.4695,45.72-45.72v-24.2323h-9.8868V119.8695h9.8868v-24.2983c0-25.2504-20.4695-45.72-45.72-45.72h-24.2088v10.1407H89.3211v-10.1407h-24.351c-25.2504,0-45.72,20.4695-45.72,45.72v24.2983Z"/>
+    </g>
+  </g>
+  <text class="cls-3" transform="translate(310.1311 37.9035)"><tspan x="0" y="0">with hole </tspan><tspan class="cls-5" x="94.7812" y="0">f</tspan><tspan x="101.1982" y="0">or the</tspan><tspan class="cls-2" x="158.1221" y="0">r</tspan><tspan x="165.7354" y="0">mal came</tspan><tspan class="cls-4" x="258.4014" y="0">r</tspan><tspan x="265.8076" y="0">a</tspan></text>
+</svg>

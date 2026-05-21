@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 816.7451 748.9836">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: none;
+        stroke: #000;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: .7087px;
+      }
+    </style>
+  </defs>
+  <g id="LWPOLYLINE">
+    <path class="cls-1" d="m17.7343,669.578c0,31.8499,25.8195,57.6694,57.6694,57.6694l641.6359.0062h.0931s24.2087,0,24.2087,0c31.8499,0,57.6694-25.8195,57.6694-57.6694V79.3994c0-31.8499-25.8195-57.6694-57.6694-57.6694H75.4066c-31.8499,0-57.6694,25.8195-57.6694,57.6694l-.0029,565.9527v.442s0,23.784,0,23.784Z"/>
+  </g>
+  <g id="CIRCLE">
+    <circle class="cls-1" cx="372.3742" cy="256.1622" r="5.4"/>
+  </g>
+  <g id="CIRCLE-2" data-name="CIRCLE">
+    <circle class="cls-1" cx="372.3742" cy="205.7625" r="5.4"/>
+  </g>
+  <g id="CIRCLE-3" data-name="CIRCLE">
+    <circle class="cls-1" cx="444.3738" cy="205.7625" r="5.4"/>
+  </g>
+  <g id="CIRCLE-4" data-name="CIRCLE">
+    <circle class="cls-1" cx="444.3738" cy="256.1622" r="5.4"/>
+  </g>
+  <g id="CIRCLE-5" data-name="CIRCLE">
+    <circle class="cls-1" cx="408.374" cy="374.4918" r="68.2715"/>
+  </g>
+</svg>

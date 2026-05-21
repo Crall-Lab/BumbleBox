@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import os
+from tuning_utils import resolve_tuning_file
 
 '''BumbleBox settings! These settings will be exported to the other scripts.'''
 
@@ -54,11 +55,15 @@ quality = 95
 
 infrared_recording = True
 
-if infrared_recording == True:
-	tuning_file = 'imx477_noir.json' # algorithm that runs based on the camera type (this automatically turns on 
-
-elif infrared_recording == False:
-	tuning_file = 'imx477.json'
+camera_model = 'hq_noir' if infrared_recording else 'hq'
+tuning_file = resolve_tuning_file(
+	explicit_tuning_file=None,
+	camera_model=camera_model,
+	width=width,
+	height=height,
+	infrared=infrared_recording,
+	default_sensor='imx477',
+)
 
 data_folder_path = '/mnt/bumblebox/data'
 
@@ -111,11 +116,14 @@ preview_window = 'QTGL' #either 'QTGL', 'QT', or for lite operating systems 'DRM
 
 preview_digital_zoom = (275,0,3300,3040)
 
-if infrared_preview == True:
-	preview_tuning_file = 'imx477_noir.json' # algorithm that runs based on the camera type (this automatically turns on 
-
-elif infrared_preview == False:
-	preview_tuning_file = 'imx477.json'
+preview_tuning_file = resolve_tuning_file(
+	explicit_tuning_file=None,
+	camera_model=camera_model,
+	width=preview_width,
+	height=preview_height,
+	infrared=infrared_preview,
+	default_sensor='imx477',
+)
 
 
 '''Composite nest image for brood labelling - creation settings. Images are automatically set to generate at 11pm when create_composite_nest_images = True'''
@@ -124,4 +132,3 @@ create_composite_nest_images = True
 number_of_images = 60 #the number of images that will be used from today's data folder to create the image (if there are fewer than the number listed here, it will use all images)
 
 composite_images_per_day = 1 #Needs to be 1 for now
-

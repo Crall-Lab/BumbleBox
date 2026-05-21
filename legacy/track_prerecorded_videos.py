@@ -54,17 +54,17 @@ def main(video_folder, dictionary, box_type, fallback_fps, run_metrics):
                 #result is list containing: [ bumblebox, XX, yyyy, mm, dd, HH, MM, SS ]
                 dt = result[2:]
                 dt = [ int(x) for x in dt ]
-                now = datetime.datetime(year=dt[0], month=dt[1], day=dt[2], hour=dt[3], minute=dt[4], seconds=dt[5])
+                now = datetime(year=dt[0], month=dt[1], day=dt[2], hour=dt[3], minute=dt[4], second=dt[5])
                 colony_number = result[1]
 
                 df, df2, frame_num = trackTagsFromVid(
-                    filepath=filepath,
-                    output_dir=root,
-                    filename=filename,
-                    tag_dictionary=dictionary,
-                    box_type=box_type,
-                    now=now,
-                    colony_number=colony_number
+                    filepath,
+                    root,
+                    filename,
+                    dictionary,
+                    box_type,
+                    now,
+                    colony_number
                 )
 
                 fps = load_actual_fps(filepath) or fallback_fps
@@ -92,17 +92,15 @@ if __name__ == '__main__':
     print(f"Video folder: {args.video_folder}")
     print(f"Aruco dictionary: {args.dictionary}")
     print(f"Box type for Aruco parameters: {args.box_type}")
-    print(f"Current datetime: {}")
+    print(f"Current datetime: {datetime.now().isoformat(timespec='seconds')}")
     print(f"Fallback FPS for metrics: {args.fps}")
     print(f"Behavioral metrics being run: {args.metrics}")
     print("Starting processing...")
-    #video_folder, dictionary, box_type, now, colony_number, fallback_fps, run_metrics
+    #video_folder, dictionary, box_type, fallback_fps, run_metrics
     main(
         video_folder=args.video_folder,
         dictionary=args.dictionary,
         box_type=args.box_type,
-        now=now,
-        colony_number=colony_number,
         fallback_fps=args.fps,
         run_metrics=args.metrics
     )

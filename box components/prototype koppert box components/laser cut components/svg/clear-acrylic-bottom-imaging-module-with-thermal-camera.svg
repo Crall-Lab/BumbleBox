@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 814.6179 777.3564">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: none;
+        stroke: #000;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: .7087px;
+      }
+
+      .cls-2 {
+        letter-spacing: -.005em;
+      }
+
+      .cls-3 {
+        font-family: MyriadPro-Regular, 'Myriad Pro';
+        font-size: 22px;
+      }
+
+      .cls-4 {
+        letter-spacing: .004em;
+      }
+
+      .cls-5 {
+        letter-spacing: -.006em;
+      }
+
+      .cls-6 {
+        letter-spacing: 0em;
+      }
+    </style>
+  </defs>
+  <g>
+    <g id="LWPOLYLINE">
+      <rect class="cls-1" x="388.8813" y="453.9172" width="32.5984" height="35.433"/>
+    </g>
+    <g id="LWPOLYLINE-2" data-name="LWPOLYLINE">
+      <rect class="cls-1" x="15.1531" y="48.8875" width="780.0549" height="704.3046" rx="57.0585" ry="57.0585"/>
+    </g>
+    <g id="CIRCLE">
+      <circle class="cls-1" cx="405.1805" cy="401.0398" r="51.264"/>
+    </g>
+    <g id="CIRCLE-2" data-name="CIRCLE">
+      <circle class="cls-1" cx="379.6895" cy="472.295" r="2.8346"/>
+    </g>
+    <g id="CIRCLE-3" data-name="CIRCLE">
+      <circle class="cls-1" cx="430.662" cy="533.2315" r="2.8346"/>
+    </g>
+    <g id="CIRCLE-4" data-name="CIRCLE">
+      <circle class="cls-1" cx="430.662" cy="472.2795" r="2.8346"/>
+    </g>
+    <g id="CIRCLE-5" data-name="CIRCLE">
+      <circle class="cls-1" cx="379.6895" cy="533.247" r="2.8346"/>
+    </g>
+  </g>
+  <text class="cls-3" transform="translate(268.3037 29.9981)"><tspan x="0" y="0">with cuts </tspan><tspan class="cls-5" x="88.1309" y="0">t</tspan><tspan x="95.2803" y="0">o house the</tspan><tspan class="cls-4" x="203.3428" y="0">r</tspan><tspan x="210.625" y="0">mal came</tspan><tspan class="cls-2" x="299.2617" y="0">r</tspan><tspan class="cls-6" x="306.3457" y="0">a</tspan></text>
+</svg>

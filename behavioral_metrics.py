@@ -10,6 +10,7 @@ import os
 from scipy import spatial
 import glob
 from data_cleaning import interpolate
+import subprocess
 
 #Enter a folder path to run this script on data youve already collected without calculating behavior metrics. Type the path to the parent folder of your data
 folder_path = '/mnt/bumblebox/data' #Otherwise it should be set to None
@@ -30,11 +31,11 @@ def compute_speed(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int, moving_
     
     df_sorted['elapsed frames'] = df_sorted.groupby('ID')['frame'].diff()
     # Compute the Euclidean distance, which gives speed (assuming frame rate is constant)
-    sub_df = df_sorted[ df_sorted['elapsed frames'] < speed_cutoff_frames ]
+    sub_df = df_sorted[df_sorted['elapsed frames'] < speed_cutoff_frames].copy()
     sub_df['speed'] = np.sqrt(sub_df['deltaX']**2 + sub_df['deltaY']**2)
 
     #only calculate speed when moving, otherwise mark as NAN
-    sub_df.loc[sub_df['speed'] < 3.16, 'speed'] = np.nan
+    sub_df.loc[sub_df['speed'] < moving_threshold, 'speed'] = np.nan
     
     df_sorted.loc[:, 'speed'] = sub_df.loc[:, 'speed']
     # Drop temporary columns used for computations
@@ -54,11 +55,10 @@ def compute_activity(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int, movi
     
     df_sorted['elapsed frames'] = df_sorted.groupby('ID')['frame'].diff()
     # Compute the Euclidean distance, which gives speed (assuming frame rate is constant)
-    sub_df = df_sorted[ df_sorted['elapsed frames'] < speed_cutoff_frames ]
+    sub_df = df_sorted[df_sorted['elapsed frames'] < speed_cutoff_frames].copy()
     sub_df['activity'] = np.sqrt(sub_df['deltaX']**2 + sub_df['deltaY']**2) #Calculating speed here - we threshold for activity below
 
-    sub_df.loc[sub_df['activity'] < moving_threshold, 'activity'] = 0 
-    sub_df.loc[sub_df['activity'] <= moving_threshold, 'activity'] = 1
+    sub_df.loc[:, 'activity'] = (sub_df['activity'] > moving_threshold).astype(int)
     
     df_sorted.loc[:, 'activity'] = sub_df.loc[:, 'activity']
     # Drop temporary columns used for computations
@@ -70,10 +70,8 @@ def compute_activity(df: pd.DataFrame, fps: int, speed_cutoff_seconds: int, movi
 def compute_social_center_distance(df: pd.DataFrame, todays_folder_path: str, filename: str) -> pd.DataFrame:
     # Compute the social center across the whole video
     social_centers = df[['centroidX', 'centroidY']].mean() 
-    print(social_centers[0])
-    print(social_centers[1])
     # Compute the distance of each bee from the social center of its frame
-    df['distance_from_center'] = np.sqrt((df['centroidX'] - social_centers[0])**2 + (df['centroidY'] - social_centers[1])**2)
+    df['distance_from_center'] = np.sqrt((df['centroidX'] - social_centers.iloc[0])**2 + (df['centroidY'] - social_centers.iloc[1])**2)
     df_sorted = df.sort_values(by=['frame','ID'])
     df_sorted.to_csv(todays_folder_path + "/" + filename + '_updated.csv', index=False)
     return df_sorted
@@ -117,7 +115,7 @@ def pairwise_distance(df: pd.DataFrame, todays_folder_path: str, filename: str) 
                 print(f"heres the videos index: {video_pd_df.index}")
                 return 
     #calculate frame averages, mins, and maxes
-    pairwise_distance_df = frame_avg_min_max_distances_to_other_bees(pairwise_distance_df)
+    video_pd_df = frame_avg_min_max_distances_to_other_bees(video_pd_df)
     
     #extract frame_number column to bring it to the front of the df
     frame_column = video_pd_df['frame']
@@ -326,8 +324,8 @@ def calculate_behavior_metrics(df, actual_frames_per_second, moving_threshold, t
                 
     if "activity" in setup.behavior_metrics:
         print("Trying activity")
-    df = compute_activity(df,actual_frames_per_second,4, moving_threshold, todays_folder_path, filename)
-    print("Just computed activity")
+        df = compute_activity(df,actual_frames_per_second,4, moving_threshold, todays_folder_path, filename)
+        print("Just computed activity")
         
     if "distance from center" in setup.behavior_metrics:
         print("Trying distance from center")

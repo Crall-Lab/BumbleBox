@@ -5,21 +5,16 @@ import sys
 import cv2
 import time
 import pwd
-import argparse
 import socket
 import subprocess
-import pandas as pd
 from datetime import date, datetime
-from picamera2 import Picamera2, Preview
-from picamera2.encoders import JpegEncoder
+from picamera2 import Picamera2
 from libcamera import controls
 from config_loader import load_config
 import behavioral_metrics
 import data_cleaning
-from tag_tracking_utils import load_actual_fps
 from tag_tracking_utils import trackTagsFromVid
-from tag_tracking_utils import trackTagsFromRAM #for if we want to integrate a flag to turn multiprocessing on/off
-from tag_tracking_utils import trackTagsFromRAM_parallel
+from tuning_utils import resolve_recording_tuning_from_config
 
 config = load_config()
 username = pwd.getpwuid(os.getuid())[0]
@@ -45,12 +40,13 @@ def picam2_record_mp4(filename, outdir):
     shutter_speed = config["camera_settings"]["shutter_speed"]
     width = config["camera_settings"]["width"]
     height = config["camera_settings"]["height"]
-    tuning_file = config["camera_settings"]["tuning_file"]
+    tuning_file = resolve_recording_tuning_from_config(config)
     noise_reduction_mode = config["camera_settings"]["noise_reduction_mode"]
     digital_zoom = config["camera_settings"]["recording_digital_zoom"]
     
     recording_time = config["recording_options"]["recording_time"]
 
+    print(f"Using tuning file: {tuning_file}")
     tuning = Picamera2.load_tuning_file(tuning_file)
     picam2 = Picamera2(tuning=tuning)
     preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
@@ -131,7 +127,12 @@ def main():
         if now.hour == 23 and now.minute == 0:
             return print("Exiting to allow composite image generation to run")
 
-    ret, todays_folder_path = create_todays_folder(config["todays_folder_path"])
+    data_root = (
+        config.get("todays_folder_path")
+        or config.get("system", {}).get("data_root")
+        or "/mnt/bumblebox/data"
+    )
+    ret, todays_folder_path = create_todays_folder(data_root)
     if ret == 1:
         return print("Failed to create today's folder")
 
@@ -143,89 +144,85 @@ def main():
 
     frames_list, filepath, actual_fps = picam2_record_mp4(filename, todays_folder_path)
 
-    #Idk why I got rid of MJPEG recording, but for when I bring it back - we'll use this function for MJPEG and the trackRAM for MP4
-    if config["recording_options"]["track_recorded_videos"] and config["camera_settings"]["codec"] == ".mjpeg":
+    should_track = config.get("recording_options", {}).get("track_recorded_videos", False)
+    codec = str(config.get("camera_settings", {}).get("codec", "mp4")).lower().lstrip(".")
+
+    if should_track and codec == "mjpeg":
 
         # Optional: load user-defined ArUco params if present in config.yaml
         aruco_params = config.get("aruco_params", None)
 
-		# Choose tracking call depending on box_type and whether custom params are provided
+        # Choose tracking call depending on box_type and whether custom params are provided
         if config["box_type"] is None and aruco_params:
             df, df2, frame_num = trackTagsFromVid(
-				filepath,
-				todays_folder_path,
-				filename,
-				config["tag_dictionary"],
-				None,  # No preset box_type
-				now,
-				config["colony_number"],
-				aruco_params=aruco_params
-			)
+                filepath,
+                todays_folder_path,
+                filename,
+                config["tag_dictionary"],
+                None,  # No preset box_type
+                now,
+                config["colony_number"],
+                aruco_params=aruco_params
+            )
         else:
             df, df2, frame_num = trackTagsFromVid(
-				filepath,
-				todays_folder_path,
-				filename,
-				config["tag_dictionary"],
-				config["box_type"],
-				now,
-				config["colony_number"]
-			)
-
-    #leverage the RAM tracking script for faster multiprocessing and use the flag for whether multiprocessing is on/off
-    elif config["recording_options"]["track_recorded_videos"] and config["camera_settings"]["codec"] == ".mp4":
-
-    aruco_params = config.get("aruco_params", None)
-    use_parallel = config["recording_options"].get("use_parallel_ram_tracking", False)
-
-    if use_parallel:
-        from tag_tracking_utils import trackTagsFromRAM_parallel as trackRAM
-    else:
-        from tag_tracking_utils import trackTagsFromRAM as trackRAM
-
-    print(f"Running {'parallel' if use_parallel else 'serial'} RAM-based ArUco tracking.")
-
-    df, df2, frame_num = trackRAM(
-        filename,
-        todays_folder_path,
-        frames_list,
-        config["tag_dictionary"],
-        config["box_type"],
-        now,
-        config["colony_number"],
-        aruco_params=aruco_params
-    )
-
-
-	
-	#The duplicate related functions do the following:
-	#find and remove any completely duplicate rows 
-	#find duplicated tags in the same frame that have different XY coordinates - this happens in Aruco tracking
-	#the severity usually depends on aruco parameters you're using, so if you're experimenting with those, watch out for duplicates
-	#remove the duplicate tag that is further away from the most recent instance of that tag being tracked (on either side of the frame with the duplicate tags)
-	#based on the value of ______ in the config.yaml file, either remove both duplicate tags if there isn't a tag near enough to check against
-	#OR flag both of them as being unresolvable duplicates - they'll have a True value in the "unresolvable duplicates" column
-	#If 
-	if config["data_cleaning"]["remove_jumps"] and not df.empty:
-
-	    df = data_cleaning.remove_jumps(df)
-
-        if config["data_cleaning"]["interpolate_data"] and not df.empty:
-            # already have actual_fps from recording
-            df = data_cleaning.interpolate(df, config["max_seconds_gap"], actual_fps)
-
-	if config["data_cleaning"]["compute_heading_angle"] and not df.empty:
-
-	    df = data_cleaning.compute_heading_angle(df)
-
-        if not df.empty and config["calculate_behavior_metrics"]:
-            behavioral_metrics.calculate_behavior_metrics(
-                df,
-                actual_fps,
+                filepath,
                 todays_folder_path,
-                filename
+                filename,
+                config["tag_dictionary"],
+                config["box_type"],
+                now,
+                config["colony_number"]
             )
-            print("Behavioral metrics calculated.")
+
+    elif should_track and codec == "mp4":
+        aruco_params = config.get("aruco_params", None)
+        use_parallel = config.get("recording_options", {}).get("use_parallel_ram_tracking", False)
+
+        if use_parallel:
+            from tag_tracking_utils import trackTagsFromRAM_parallel as trackRAM
+        else:
+            from tag_tracking_utils import trackTagsFromRAM as trackRAM
+
+        print(f"Running {'parallel' if use_parallel else 'serial'} RAM-based ArUco tracking.")
+
+        df, df2, frame_num = trackRAM(
+            filename,
+            todays_folder_path,
+            [[frame] for frame in frames_list],
+            config["tag_dictionary"],
+            config["box_type"],
+            now,
+            config["colony_number"],
+            aruco_params=aruco_params
+        )
+    else:
+        return print("Tracking not enabled for this recording.")
+
+    # The duplicate/jump handling and interpolation happen after tracking.
+    cleaning_cfg = config.get("data_cleaning") or config.get("date cleaning") or {}
+    max_seconds_gap = cleaning_cfg.get("max_seconds_gap", 3)
+    moving_threshold = config.get("moving_threshold", 3.16)
+
+    if cleaning_cfg.get("remove_jumps", False) and not df.empty:
+        threshold = cleaning_cfg.get("jump_threshold_pixels", 500)
+        df = data_cleaning.remove_jumps(df, jump_threshold_pixels=threshold)
+
+    if cleaning_cfg.get("interpolate_data", False) and not df.empty:
+        df = data_cleaning.interpolate(df, max_seconds_gap, actual_fps)
+
+    if cleaning_cfg.get("compute_heading_angle", False) and not df.empty:
+        df = data_cleaning.compute_heading_angle(df)
+
+    if not df.empty and config.get("calculate_behavior_metrics", False):
+        behavioral_metrics.calculate_behavior_metrics(
+            df,
+            actual_fps,
+            moving_threshold,
+            todays_folder_path,
+            filename
+        )
+        print("Behavioral metrics calculated.")
 
 if __name__ == "__main__":
     main()

@@ -15,6 +15,7 @@ from data_cleaning import interpolate
 from config_loader import load_config
 from record_video import create_todays_folder
 from tag_tracking_utils import trackTagsFromRAM  # If needed, adjust import
+from tuning_utils import resolve_recording_tuning_from_config
 
 config = load_config()
 
@@ -22,6 +23,7 @@ username = pwd.getpwuid(os.getuid())[0]
 
 
 def array_capture(recording_time, fps, shutter_speed, width, height, tuning_file, noise_reduction_mode, digital_zoom, outdir=None, filename=None):
+    print(f"Using tuning file: {tuning_file}")
     tuning = Picamera2.load_tuning_file(tuning_file)
     picam2 = Picamera2(tuning=tuning)
     preview = picam2.create_preview_configuration({"format": "YUV420", "size": (width, height)})
@@ -98,13 +100,15 @@ def main():
 
     print(f"Session filename: {filename}")
 
+    resolved_tuning_file = resolve_recording_tuning_from_config(config)
+
     frames_list, recorded_fps = array_capture(
         config["recording_time"],
         config["frames_per_second"],
         config["shutter_speed"],
         config["width"],
         config["height"],
-        config["tuning_file"],
+        resolved_tuning_file,
         config["noise_reduction_mode"],
         tuple(config["recording_digital_zoom"]) if config["recording_digital_zoom"] else None,
         outdir=todays_folder_path,

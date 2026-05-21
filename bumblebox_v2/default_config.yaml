@@ -1,0 +1,123 @@
+system:
+  colony_id: "01"
+  data_root: "/mnt/bumblebox/data"
+  pi_model: "auto"
+  ram_gb_override: null
+  timezone: "auto"
+
+camera:
+  model: "auto"
+  width: 4056
+  height: 3040
+  fps_target: 5.0
+  shutter_us: 2500
+  codec: "mp4"
+  infrared: true
+  monochrome_output: false
+  noise_reduction: "Auto"
+  preview_window: "QT"
+  tuning_file: null
+  digital_zoom: null
+  mp4_codec: "libx264"
+
+thermal:
+  enabled: false
+  device_path: "auto"
+  width: 160
+  height: 120
+  fps_target: 8.7
+  pixel_format: "auto"
+  expected_name: "PureThermal"
+
+pipeline:
+  mode: "record_and_track"
+  tracking_source: "ram"
+  defer_tracking_until_after_recording: true
+  parallel_tracking: true
+  calculate_behavior_metrics: true
+
+capture:
+  recording_seconds: 20
+  record_interval_minutes: 30
+  track_interval_minutes: 5
+  composite_images_per_day: 1
+  composite_image_sample_count: 60
+
+tracking:
+  tag_dictionary: "4X4_50"
+  box_preset: "custom"
+  excluded_tag_ids:
+    - 17
+    - 37
+  aruco_params:
+    minMarkerPerimeterRate: 0.02
+    adaptiveThreshWinSizeMin: 5
+    adaptiveThreshWinSizeMax: 29
+    adaptiveThreshWinSizeStep: 3
+    polygonalApproxAccuracyRate: 0.06
+
+cleaning:
+  drop_unresolvable_duplicates: true
+  remove_jumps: true
+  jump_threshold_pixels: 500
+  interpolate_data: true
+  max_seconds_gap: 3
+  compute_heading_angle: true
+
+metrics:
+  enabled:
+    - speed
+    - activity
+    - distance_from_center
+    - pairwise_distance
+    - contacts
+    - video_averages
+  contact_distance_cm: 2.0
+  pixel_contact_distance: 206.1
+  moving_threshold_px_per_frame: 3.16
+
+calibration:
+  pixels_per_cm: 103.05
+  method: "needs_calibration"
+  last_updated: null
+
+runtime:
+  use_mock_camera: false
+  camera_warmup_seconds: 2.0
+  speed_cutoff_seconds: 4
+  save_frame_timestamps: true
+  fps_report_on_each_recording: true
+  render_tracking_video: false
+  save_mp4_sidecar_fps_txt: true
+  ui_theme_mode: "dark"
+
+scheduling:
+  backend: "systemd"
+  scope: "user"
+  unit_prefix: "bumblebox-v2"
+  service_user: "auto"
+  enabled: false
+  active_hours: "00:00-23:59"
+
+fleet:
+  role: "standalone"
+  queen_host: null
+  queen_local_pipeline_enabled: true
+  queen_media_schedule:
+    enabled: false
+    pull_interval_minutes: 30
+    track_interval_minutes: 60
+    output_root: null
+    max_videos_total: 200
+    max_videos_per_worker: 1
+    cooldown_minutes: 60
+    max_queen_load_1m: 3.0
+    min_queen_mem_gb: 0.8
+    disable_visualization: false
+    allow_when_queen_bbox_active: false
+  ssh:
+    user: "pi"
+    port: 22
+    identity_file: "~/.ssh/bbx_fleet_ed25519"
+    connect_timeout_seconds: 5
+  workers: []
