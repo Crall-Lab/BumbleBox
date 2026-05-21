@@ -183,7 +183,7 @@ def main():
         print("Running nest image generation script via crontab")
         #run_via_cron = True
     
-    
+    #total_frames = generate_nest_image("/home/august/Desktop/colony_development/figures/kde_images/colony-20/nestImages-7-31", "2024-07-31", 78, "bumblebox-11", shuffle=False)
     total_frames = generate_nest_image(todays_folder_path, today, args.number_of_images, hostname, shuffle=True)
     
     end = time.time()
