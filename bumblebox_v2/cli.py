@@ -1323,6 +1323,14 @@ def _cmd_optimize_tracking(args: argparse.Namespace) -> int:
         if min_perimeter:
             sweep_overrides["minMarkerPerimeterRate"] = min_perimeter
 
+        max_perimeter = _parse_comma_numeric_values(
+            args.sweep_max_marker_perimeter_rate,
+            label="--sweep-max-marker-perimeter-rate",
+            value_type="float",
+        )
+        if max_perimeter:
+            sweep_overrides["maxMarkerPerimeterRate"] = max_perimeter
+
         win_min = _parse_comma_numeric_values(
             args.sweep_adaptive_thresh_win_size_min,
             label="--sweep-adaptive-thresh-win-size-min",
@@ -2250,6 +2258,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     optimize_parser.add_argument(
+        "--sweep-max-marker-perimeter-rate",
+        default="",
+        help=(
+            "Optional comma-separated override values for maxMarkerPerimeterRate "
+            "(for example 0.12,0.16,0.20)."
+        ),
+    )
+    optimize_parser.add_argument(
         "--sweep-adaptive-thresh-win-size-min",
         default="",
         help=(
@@ -2288,13 +2304,13 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_parser.add_argument(
         "--early-stop-patience",
         type=int,
-        default=40,
-        help="Stop after this many non-improving evaluations (0 disables).",
+        default=0,
+        help="Stop after this many non-improving evaluations (0 disables; default 0).",
     )
     optimize_parser.add_argument(
         "--early-stop-min-improvement",
         type=float,
-        default=0.002,
+        default=0.0,
         help="Minimum score increase considered an improvement for early stop.",
     )
     optimize_parser.add_argument("--output-dir", help="Optional output root directory for optimization runs.")

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -141,6 +142,12 @@ OPTIMIZE_SWEEP_FIELDS = (
         "Minimum marker perimeter ratio. Raise to filter tiny false positives.",
     ),
     (
+        "maxMarkerPerimeterRate",
+        "float",
+        "maxMarkerPerimeterRate",
+        "Maximum marker perimeter ratio. Lower to filter unusually large false positives.",
+    ),
+    (
         "adaptiveThreshWinSizeMin",
         "int",
         "adaptiveThreshWinSizeMin",
@@ -172,6 +179,8 @@ OPTIMIZE_SWEEP_FIELDS = (
     ),
 )
 
+ARUCO_4X4_DICTIONARY_OPTIONS = ["4X4_50", "4X4_100", "4X4_250", "4X4_1000"]
+
 
 class BumbleBoxV2GUI(tk.Tk):
     def __init__(self) -> None:
@@ -196,10 +205,18 @@ class BumbleBoxV2GUI(tk.Tk):
         self._optimize_thread: threading.Thread | None = None
         self._optimize_error: str | None = None
         self._optimize_warning: str | None = None
+        self._optimize_extra_report: str | None = None
         self._optimize_result = None
+        self._optimize_refinement_result = None
         self._optimize_applied_config: str | None = None
         self._optimize_review_dialog: tk.Toplevel | None = None
-        self._optimize_progress_q: queue.Queue[tuple[int, int]] = queue.Queue()
+        self._optimize_stop_event = threading.Event()
+        self._optimize_progress_q: queue.Queue[
+            tuple[int, int, list[dict[str, object]], dict[str, object]]
+        ] = queue.Queue()
+        self._optimize_started_monotonic: float | None = None
+        self._optimize_last_progress_monotonic: float | None = None
+        self._optimize_latest_progress: tuple[int, int, list[dict[str, object]], dict[str, object]] | None = None
         self._fps_sweep_thread: threading.Thread | None = None
         self._fps_sweep_error: str | None = None
         self._fps_sweep_report = None
@@ -1742,7 +1759,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self.camera_test_seconds_var = tk.StringVar(value="20")
         self.camera_test_display_width_var = tk.StringVar(value="1280")
-        self.camera_test_dictionary_var = tk.StringVar(value="")
+        self.camera_test_dictionary_var = tk.StringVar(value=self._current_config_tag_dictionary())
         self.camera_test_box_preset_var = tk.StringVar(value="auto")
         self.camera_test_show_rejected_var = tk.BooleanVar(value=False)
         self.camera_test_no_clahe_var = tk.BooleanVar(value=False)
@@ -1831,11 +1848,20 @@ class BumbleBoxV2GUI(tk.Tk):
             tracking,
             row=3,
             column=0,
-            text="Dictionary override (optional)",
+            text="Tag dictionary",
             help_title="ArUco Dictionary Override",
-            help_details="Use only when your printed tags are not using the dictionary defined in config.",
+            help_details=(
+                "Dictionary used for this live tracking test. It starts from tracking.tag_dictionary in config; "
+                "change it here for testing, or save the config editor field to make it the normal run setting."
+            ),
         )
-        ttk.Entry(tracking, textvariable=self.camera_test_dictionary_var, width=14).grid(row=3, column=1, sticky="w", padx=8, pady=3)
+        ttk.Combobox(
+            tracking,
+            textvariable=self.camera_test_dictionary_var,
+            values=ARUCO_4X4_DICTIONARY_OPTIONS,
+            state="readonly",
+            width=12,
+        ).grid(row=3, column=1, sticky="w", padx=8, pady=3)
         self._grid_help_label(
             tracking,
             row=4,
@@ -2574,6 +2600,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 [
                     ("Pipeline mode", "pipeline.mode", str, ["record_only", "track_only", "record_and_track", "mixed_schedule"], None),
                     ("Tracking source", "pipeline.tracking_source", str, ["ram", "video"], None),
+                    ("Tag dictionary", "tracking.tag_dictionary", str, ARUCO_4X4_DICTIONARY_OPTIONS, None),
                     ("Deferred tracking", "pipeline.defer_tracking_until_after_recording", bool, None, None),
                     ("Parallel tracking", "pipeline.parallel_tracking", bool, None, None),
                     ("Behavior metrics", "pipeline.calculate_behavior_metrics", bool, None, None),
@@ -2627,6 +2654,38 @@ class BumbleBoxV2GUI(tk.Tk):
             }
         )
         return mapping
+
+    @staticmethod
+    def _normalize_display_dictionary(value: str | None) -> str:
+        text = str(value or "").strip().upper()
+        if text.startswith("DICT_"):
+            text = text[5:]
+        if text in ARUCO_4X4_DICTIONARY_OPTIONS:
+            return text
+        return "4X4_50"
+
+    def _current_config_tag_dictionary(self) -> str:
+        editor_field = getattr(self, "config_fields", {}).get("tracking.tag_dictionary")
+        if editor_field is not None:
+            try:
+                return self._normalize_display_dictionary(editor_field[0].get())
+            except Exception:
+                pass
+        try:
+            config, _ = self._load_config_or_defaults()
+            tracking = config.get("tracking", {})
+            if isinstance(tracking, dict):
+                return self._normalize_display_dictionary(tracking.get("tag_dictionary"))
+        except Exception:
+            pass
+        return "4X4_50"
+
+    def _sync_dictionary_selectors_from_config(self) -> None:
+        dictionary = self._current_config_tag_dictionary()
+        for attr_name in ("opt_dictionary_var", "camera_test_dictionary_var"):
+            variable = getattr(self, attr_name, None)
+            if variable is not None:
+                variable.set(dictionary)
 
     def _config_widget_width(self, key: str, value_type: type, choices: list[str] | None) -> int:
         if choices:
@@ -2685,6 +2744,10 @@ class BumbleBoxV2GUI(tk.Tk):
             ),
             "pipeline.mode": "Main run mode: record only, track only, record+track, or mixed schedule lanes.",
             "pipeline.tracking_source": "Track from in-memory frames (ram) or saved video files (video).",
+            "tracking.tag_dictionary": (
+                "ArUco dictionary used for tag detection in recording, tracking, camera tests, and optimization. "
+                "This must match the dictionary used to generate or print the tags."
+            ),
             "pipeline.defer_tracking_until_after_recording": "When enabled, tracking runs after recording to reduce runtime contention.",
             "pipeline.parallel_tracking": "Allow concurrent tracking work. Faster on strong hardware, heavier on limited Pi resources.",
             "pipeline.calculate_behavior_metrics": "Enable legacy in-box behavior metrics during tracking pipeline.",
@@ -2796,6 +2859,12 @@ class BumbleBoxV2GUI(tk.Tk):
                 if key == "camera.tuning_file":
                     ttk.Button(row_frame, text="Browse", command=self._browse_tuning_file).grid(
                         row=0, column=2, sticky="w", padx=(6, 0)
+                    )
+                if key == "tracking.tag_dictionary":
+                    widget.bind(
+                        "<<ComboboxSelected>>",
+                        lambda _event: self._sync_dictionary_selectors_from_config(),
+                        add="+",
                     )
 
                 self._make_help_button(
@@ -3766,17 +3835,20 @@ class BumbleBoxV2GUI(tk.Tk):
         self.opt_input_path_var = tk.StringVar(value="")
         self.opt_output_dir_var = tk.StringVar(value="")
         self.opt_profile_var = tk.StringVar(value="quick")
-        self.opt_dictionary_var = tk.StringVar(value="4X4_50")
+        self.opt_dictionary_var = tk.StringVar(value=self._current_config_tag_dictionary())
         self.opt_tag_size_mm_var = tk.StringVar(value="2.5")
         self.opt_sample_frames_var = tk.StringVar(value="80")
         self.opt_execution_target_var = tk.StringVar(value="pi_safe")
         self.opt_workers_var = tk.StringVar(value="")
         self.opt_expected_tags_var = tk.StringVar(value="")
-        self.opt_early_stop_patience_var = tk.StringVar(value="40")
-        self.opt_early_stop_min_improvement_var = tk.StringVar(value="0.002")
+        self.opt_early_stop_patience_var = tk.StringVar(value="0")
+        self.opt_early_stop_min_improvement_var = tk.StringVar(value="0")
         self.opt_preview_var = tk.BooleanVar(value=False)
         self.opt_preview_frames_var = tk.StringVar(value="240")
         self.opt_top_k_var = tk.StringVar(value="5")
+        self.opt_refinement_rounds_var = tk.StringVar(value="2")
+        self.opt_refinement_seed_count_var = tk.StringVar(value="5")
+        self.opt_refinement_validation_multiplier_var = tk.StringVar(value="2")
         self._opt_sweep_profile_vars: dict[str, dict[str, tk.StringVar]] = {}
         self._opt_profile_notebook: ttk.Notebook | None = None
         self._opt_profile_tabs: dict[str, ttk.Frame] = {}
@@ -3792,7 +3864,10 @@ class BumbleBoxV2GUI(tk.Tk):
             help_title="Optimization Input",
             help_details="Path to representative video (or image folder) used to test ArUco parameter sweeps.",
         )
-        ttk.Entry(top, textvariable=self.opt_input_path_var, width=90).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
+        input_frame = ttk.Frame(top)
+        input_frame.grid(row=0, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Entry(input_frame, textvariable=self.opt_input_path_var, width=70).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        input_frame.columnconfigure(0, weight=1)
 
         self._grid_help_label(
             top,
@@ -3816,25 +3891,81 @@ class BumbleBoxV2GUI(tk.Tk):
             top,
             row=2,
             column=0,
-            text="Tag size (mm)",
-            help_title="Tag Size",
-            help_details="Physical marker size in millimeters; used to shape parameter heuristics.",
+            text="Tag dictionary",
+            help_title="Tag Dictionary",
+            help_details=(
+                "ArUco dictionary used for optimization. It starts from tracking.tag_dictionary in config. "
+                "Use Save To Config if this should become the dictionary used by normal recording/tracking runs."
+            ),
         )
-        ttk.Entry(top, textvariable=self.opt_tag_size_mm_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        dictionary_frame = ttk.Frame(top)
+        dictionary_frame.grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        ttk.Combobox(
+            dictionary_frame,
+            textvariable=self.opt_dictionary_var,
+            values=ARUCO_4X4_DICTIONARY_OPTIONS,
+            state="readonly",
+            width=12,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            dictionary_frame,
+            text="Save To Config",
+            command=self._save_optimizer_dictionary_to_config,
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         self._grid_help_label(
             top,
             row=3,
             column=0,
-            text="Sample frames",
-            help_title="Sample Frames",
-            help_details="Number of frames sampled for scoring. More frames improve robustness but increase runtime.",
+            text="Tag size (mm)",
+            help_title="Tag Size",
+            help_details="Physical marker size in millimeters; used to shape parameter heuristics.",
         )
-        ttk.Entry(top, textvariable=self.opt_sample_frames_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=4)
+        tag_size_frame = ttk.Frame(top)
+        tag_size_frame.grid(row=3, column=1, sticky="w", padx=8, pady=4)
+        ttk.Entry(tag_size_frame, textvariable=self.opt_tag_size_mm_var, width=10).pack(side=tk.LEFT)
+        ttk.Button(
+            tag_size_frame,
+            text="Measure Smallest & Largest Tags",
+            command=self._open_tag_perimeter_measurement_dialog,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self._make_help_button(
+            tag_size_frame,
+            title="Measure Smallest & Largest Tags",
+            details=(
+                "Open representative frames and measure the smallest and largest real tags you want BumbleBox "
+                "to detect. BumbleBox uses those pixel perimeters to choose safer minMarkerPerimeterRate and "
+                "maxMarkerPerimeterRate sweep values for the first optimization pass."
+            ),
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
         self._grid_help_label(
             top,
             row=4,
+            column=0,
+            text="Sample frames",
+            help_title="Sample Frames",
+            help_details="Number of frames sampled for scoring. More frames improve robustness but increase runtime.",
+        )
+        ttk.Entry(top, textvariable=self.opt_sample_frames_var, width=10).grid(row=4, column=1, sticky="w", padx=8, pady=4)
+
+        self._grid_help_label(
+            top,
+            row=5,
+            column=0,
+            text="Expected tags/frame (optional)",
+            help_title="Expected Tags",
+            help_details=(
+                "Expected real tag count visible in a typical frame. For example, use about 150 if roughly "
+                "150 tags are visible. This helps the optimizer prefer candidates that detect more true tags "
+                "without letting false positives dominate."
+            ),
+        )
+        ttk.Entry(top, textvariable=self.opt_expected_tags_var, width=10).grid(row=5, column=1, sticky="w", padx=8, pady=4)
+
+        self._grid_help_label(
+            top,
+            row=6,
             column=0,
             text="Execution target",
             help_title="Execution Target",
@@ -3844,7 +3975,7 @@ class BumbleBoxV2GUI(tk.Tk):
             ),
         )
         execution_frame = ttk.Frame(top)
-        execution_frame.grid(row=4, column=1, sticky="w", padx=8, pady=4)
+        execution_frame.grid(row=6, column=1, sticky="w", padx=8, pady=4)
         ttk.Radiobutton(
             execution_frame,
             text="Pi-safe (recommended on Pi)",
@@ -3859,7 +3990,7 @@ class BumbleBoxV2GUI(tk.Tk):
         ).pack(side=tk.LEFT, padx=12)
 
         review_note = ttk.Frame(top)
-        review_note.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        review_note.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Label(
             review_note,
             text="After optimization, BumbleBox can open a top-5 review window before applying any parameters.",
@@ -3874,7 +4005,7 @@ class BumbleBoxV2GUI(tk.Tk):
         ).pack(side=tk.LEFT, padx=(4, 0))
 
         advanced = ttk.LabelFrame(top, text="Advanced Optimization Options", padding=6)
-        advanced.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        advanced.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self._grid_help_label(
             advanced,
             row=0,
@@ -3888,58 +4019,46 @@ class BumbleBoxV2GUI(tk.Tk):
             advanced,
             row=1,
             column=0,
-            text="Dictionary override",
-            help_title="Dictionary Override",
-            help_details="Force a specific ArUco dictionary when config default is not correct for this test.",
-        )
-        ttk.Entry(advanced, textvariable=self.opt_dictionary_var, width=22).grid(row=1, column=1, sticky="w", padx=8, pady=4)
-        self._grid_help_label(
-            advanced,
-            row=2,
-            column=0,
             text="Workers (optional override)",
             help_title="Workers",
             help_details="Manual worker count override. Leave blank to let optimizer choose based on target mode.",
         )
-        ttk.Entry(advanced, textvariable=self.opt_workers_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        ttk.Entry(advanced, textvariable=self.opt_workers_var, width=10).grid(row=1, column=1, sticky="w", padx=8, pady=4)
+        self._grid_help_label(
+            advanced,
+            row=2,
+            column=0,
+            text="Early stop patience",
+            help_title="Early Stop Patience",
+            help_details=(
+                "Set to 0 to test every parameter combination. This is the default now because the GUI has "
+                "an End Early button. Use a positive number only if you intentionally want automatic early stopping."
+            ),
+        )
+        ttk.Entry(advanced, textvariable=self.opt_early_stop_patience_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
         self._grid_help_label(
             advanced,
             row=3,
             column=0,
-            text="Expected tags/frame (optional)",
-            help_title="Expected Tags",
-            help_details="Expected detections per frame. Used to penalize over-read false positives.",
+            text="Early stop min improvement",
+            help_title="Minimum Improvement",
+            help_details=(
+                "Minimum score gain considered meaningful when early stopping is enabled. This is ignored when "
+                "early stop patience is 0."
+            ),
         )
-        ttk.Entry(advanced, textvariable=self.opt_expected_tags_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=4)
+        ttk.Entry(advanced, textvariable=self.opt_early_stop_min_improvement_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=4)
         self._grid_help_label(
             advanced,
             row=4,
-            column=0,
-            text="Early stop patience",
-            help_title="Early Stop Patience",
-            help_details="Number of non-improving checks before optimizer stops a search branch.",
-        )
-        ttk.Entry(advanced, textvariable=self.opt_early_stop_patience_var, width=10).grid(row=4, column=1, sticky="w", padx=8, pady=4)
-        self._grid_help_label(
-            advanced,
-            row=5,
-            column=0,
-            text="Early stop min improvement",
-            help_title="Minimum Improvement",
-            help_details="Minimum score gain considered meaningful for continuing search.",
-        )
-        ttk.Entry(advanced, textvariable=self.opt_early_stop_min_improvement_var, width=10).grid(row=5, column=1, sticky="w", padx=8, pady=4)
-        self._grid_help_label(
-            advanced,
-            row=6,
             column=0,
             text="Top results to show",
             help_title="Top Results",
             help_details="Number of best parameter candidates shown in optimizer output.",
         )
-        ttk.Entry(advanced, textvariable=self.opt_top_k_var, width=10).grid(row=6, column=1, sticky="w", padx=8, pady=4)
+        ttk.Entry(advanced, textvariable=self.opt_top_k_var, width=10).grid(row=4, column=1, sticky="w", padx=8, pady=4)
         preview_options = ttk.Frame(advanced)
-        preview_options.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        preview_options.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Checkbutton(
             preview_options,
             text="Write preview video",
@@ -3958,12 +4077,30 @@ class BumbleBoxV2GUI(tk.Tk):
             details="Maximum number of frames rendered in preview output.",
         ).pack(side=tk.LEFT, padx=(4, 0))
 
+        refinement_options = ttk.Frame(advanced)
+        refinement_options.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(refinement_options, text="Iterative refinement rounds").pack(side=tk.LEFT, padx=(12, 2))
+        ttk.Entry(refinement_options, textvariable=self.opt_refinement_rounds_var, width=5).pack(side=tk.LEFT)
+        ttk.Label(refinement_options, text="seed candidates").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Entry(refinement_options, textvariable=self.opt_refinement_seed_count_var, width=5).pack(side=tk.LEFT)
+        ttk.Label(refinement_options, text="validation frame multiplier").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Entry(refinement_options, textvariable=self.opt_refinement_validation_multiplier_var, width=5).pack(side=tk.LEFT)
+        self._make_help_button(
+            refinement_options,
+            title="Iterative Refinement",
+            details=(
+                "After a broad optimization run, this can refine around the current top candidates. "
+                "Round 1 uses wider nearby values, later rounds use narrower values, and the final "
+                "validation pass re-scores finalists on more sampled frames."
+            ),
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
         sweep_frame = ttk.LabelFrame(
             advanced,
             text="Profile Sweep Values (editable, comma-separated)",
             padding=6,
         )
-        sweep_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        sweep_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Label(
             sweep_frame,
             text=(
@@ -3986,13 +4123,27 @@ class BumbleBoxV2GUI(tk.Tk):
         self._register_advanced_widget(advanced)
 
         controls = ttk.Frame(top)
-        controls.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        controls.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.optimize_run_btn = ttk.Button(
             controls,
             text="Run optimize-tracking",
             command=self._start_optimize_tracking,
         )
         self.optimize_run_btn.pack(side=tk.LEFT)
+        self.optimize_refine_btn = ttk.Button(
+            controls,
+            text="Run Iterative Refinement From Top 5",
+            command=self._start_optimize_refinement,
+            state=tk.DISABLED,
+        )
+        self.optimize_refine_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.optimize_stop_btn = ttk.Button(
+            controls,
+            text="End Early",
+            command=self._stop_optimize_tracking,
+            state=tk.DISABLED,
+        )
+        self.optimize_stop_btn.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(controls, textvariable=self.opt_status_var).pack(side=tk.LEFT, padx=10)
 
         top.columnconfigure(1, weight=1)
@@ -4007,6 +4158,31 @@ class BumbleBoxV2GUI(tk.Tk):
             min_text_lines=4,
             max_text_lines=16,
         )
+
+    def _save_optimizer_dictionary_to_config(self) -> None:
+        try:
+            dictionary = self._normalize_display_dictionary(self.opt_dictionary_var.get())
+            config, config_path = self._load_config_or_defaults()
+            config.setdefault("tracking", {})["tag_dictionary"] = dictionary
+            validate_config(config)
+            snapshot_path, history_warning = self._save_config_with_history(
+                config_path,
+                config,
+                reason="optimizer_tag_dictionary",
+            )
+            self._load_config_into_editor()
+            self.opt_dictionary_var.set(dictionary)
+        except Exception as exc:
+            self._show_error("Save dictionary failed", str(exc))
+            return
+
+        history_note = self._format_config_history_note(snapshot_path, history_warning)
+        message = f"Saved tracking.tag_dictionary = {dictionary} to:\n{config_path}"
+        if history_note:
+            message += f"\n\n{history_note}"
+        self.optimize_output.delete("1.0", tk.END)
+        self.optimize_output.insert(tk.END, message)
+        self._show_info("Tag dictionary saved", message)
 
     def _parse_csv_numeric_values(self, raw: str, *, label: str, value_type: str) -> list[float | int]:
         text = str(raw or "").strip()
@@ -4153,6 +4329,540 @@ class BumbleBoxV2GUI(tk.Tk):
         finally:
             self._opt_profile_syncing = False
 
+    def _build_optimizer_measurement_frame_refs(self, input_path: str, *, max_frames: int = 25) -> list[dict[str, object]]:
+        import cv2
+
+        from .tracking_optimizer import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, _resolve_user_path, _sample_indices
+
+        resolved = _resolve_user_path(input_path)
+        if resolved.is_dir():
+            image_paths = sorted(
+                path
+                for path in resolved.iterdir()
+                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            )
+            if not image_paths:
+                raise RuntimeError(f"No supported image files found in: {resolved}")
+            indices = _sample_indices(len(image_paths), min(max_frames, len(image_paths)))
+            return [
+                {
+                    "kind": "image",
+                    "path": image_paths[index],
+                    "label": f"{image_paths[index].name} ({index + 1}/{len(image_paths)})",
+                }
+                for index in indices
+            ]
+
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Input path does not exist: {resolved}")
+
+        suffix = resolved.suffix.lower()
+        if suffix in IMAGE_EXTENSIONS:
+            return [{"kind": "image", "path": resolved, "label": resolved.name}]
+
+        if suffix not in VIDEO_EXTENSIONS:
+            raise ValueError(f"Unsupported input extension for measurement: {resolved.suffix}")
+
+        cap = cv2.VideoCapture(str(resolved))
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {resolved}")
+        try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        finally:
+            cap.release()
+        if total_frames > 0:
+            indices = _sample_indices(total_frames, min(max_frames, total_frames))
+        else:
+            indices = [0]
+        return [
+            {
+                "kind": "video",
+                "path": resolved,
+                "frame_index": index,
+                "label": f"{resolved.name} frame {index}",
+            }
+            for index in indices
+        ]
+
+    def _load_optimizer_measurement_frame_ref(self, frame_ref: dict[str, object]) -> tuple[object, str]:
+        import cv2
+
+        path = Path(frame_ref["path"])
+        kind = str(frame_ref["kind"])
+        label = str(frame_ref.get("label") or path)
+        if kind == "image":
+            frame = cv2.imread(str(path))
+            if frame is None:
+                raise RuntimeError(f"Could not read image: {path}")
+            return frame, label
+
+        if kind == "video":
+            frame_index = int(frame_ref.get("frame_index") or 0)
+            cap = cv2.VideoCapture(str(path))
+            if not cap.isOpened():
+                raise RuntimeError(f"Could not open video: {path}")
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_index))
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    raise RuntimeError(f"Could not read frame {frame_index} from video: {path}")
+            finally:
+                cap.release()
+            return frame, label
+
+        raise ValueError(f"Unsupported frame reference kind: {kind}")
+
+    def _open_tag_perimeter_measurement_dialog(self) -> None:
+        import base64
+        import math
+
+        import cv2
+
+        from .tracking_optimizer import suggest_marker_perimeter_rate_sweeps_from_measurements
+
+        input_path = self.opt_input_path_var.get().strip()
+        if not input_path:
+            self._show_error("Missing input", "Set an input video or image folder path first.")
+            return
+
+        try:
+            frame_refs = self._build_optimizer_measurement_frame_refs(input_path)
+        except Exception as exc:
+            self._show_error("Measurement frames failed", str(exc))
+            return
+        if not frame_refs:
+            self._show_error("Measurement frames failed", "No representative frames were found.")
+            return
+
+        max_display_width = 1040
+        max_display_height = 680
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Measure Smallest & Largest Tags")
+        dialog.geometry("1180x920")
+        dialog.minsize(760, 560)
+        dialog.transient(self)
+
+        outer = ttk.Frame(dialog, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        note = (
+            "Use the frame controls to find good examples. Measure the SMALLEST real tag you want BumbleBox "
+            "to detect and the LARGEST real tag you expect to accept. Avoid measuring artifacts. Drag any "
+            "placed point to adjust it. Scroll over the image or use the zoom buttons for more precise placement."
+        )
+        ttk.Label(outer, text=note, wraplength=1080, justify=tk.LEFT).pack(anchor="w")
+
+        frame_controls = ttk.Frame(outer)
+        frame_controls.pack(fill=tk.X, pady=(8, 6))
+        frame_info_var = tk.StringVar(value="")
+        zoom_var = tk.StringVar(value="Zoom: 100%")
+        active_role_var = tk.StringVar(value="smallest")
+        ttk.Button(frame_controls, text="Prev Frame", command=lambda: shift_frame(-1)).pack(side=tk.LEFT)
+        ttk.Button(frame_controls, text="Next Frame", command=lambda: shift_frame(1)).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Button(frame_controls, text="Zoom -", command=lambda: adjust_zoom(1 / 1.25)).pack(side=tk.LEFT)
+        ttk.Button(frame_controls, text="Zoom +", command=lambda: adjust_zoom(1.25)).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(frame_controls, text="Fit", command=lambda: set_zoom(1.0)).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(frame_controls, textvariable=zoom_var).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Radiobutton(
+            frame_controls,
+            text="Measure smallest tag",
+            variable=active_role_var,
+            value="smallest",
+            command=lambda: redraw_points(),
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            frame_controls,
+            text="Measure largest tag",
+            variable=active_role_var,
+            value="largest",
+            command=lambda: redraw_points(),
+        ).pack(side=tk.LEFT, padx=(8, 12))
+        ttk.Label(frame_controls, textvariable=frame_info_var, justify=tk.LEFT).pack(side=tk.LEFT)
+
+        canvas_frame = ttk.Frame(outer)
+        canvas_frame.pack(fill=tk.BOTH, expand=True)
+        canvas_frame.columnconfigure(0, weight=1)
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(
+            canvas_frame,
+            width=800,
+            height=500,
+            highlightthickness=1,
+            highlightbackground="#667680",
+            bg="#111111",
+        )
+        canvas.grid(row=0, column=0, sticky="nsew")
+        x_scroll = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=canvas.xview)
+        y_scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        canvas.configure(xscrollcommand=x_scroll.set, yscrollcommand=y_scroll.set)
+
+        result_var = tk.StringVar(value="Measure both the smallest and largest real tags.")
+        role_states: dict[str, dict[str, object]] = {
+            "smallest": {
+                "label": "Smallest tag",
+                "points": [],
+                "frame_position": None,
+                "perimeter_px": None,
+                "perimeter_rate": None,
+                "source": "",
+                "frame_size": "",
+            },
+            "largest": {
+                "label": "Largest tag",
+                "points": [],
+                "frame_position": None,
+                "perimeter_px": None,
+                "perimeter_rate": None,
+                "source": "",
+                "frame_size": "",
+            },
+        }
+        current_frame: dict[str, object] = {
+            "position": 0,
+            "fit_scale": 1.0,
+            "zoom": 1.0,
+            "scale": 1.0,
+            "width": 1,
+            "height": 1,
+            "display_width": 1,
+            "display_height": 1,
+            "source": "",
+            "frame_bgr": None,
+        }
+        drag_state: dict[str, int | None] = {"index": None}
+
+        result_label = ttk.Label(outer, textvariable=result_var, justify=tk.LEFT, wraplength=1080)
+        result_label.pack(anchor="w", pady=(8, 0))
+
+        footer = ttk.Frame(outer)
+        footer.pack(fill=tk.X, pady=(10, 0))
+
+        apply_button = ttk.Button(footer, text="Apply Both To Active Profile", state=tk.DISABLED)
+
+        def current_state() -> dict[str, object]:
+            return role_states[active_role_var.get()]
+
+        def current_points() -> list[tuple[float, float]]:
+            state = current_state()
+            if state.get("frame_position") != current_frame["position"]:
+                return []
+            return state["points"]  # type: ignore[return-value]
+
+        def set_current_points(points: list[tuple[float, float]]) -> None:
+            state = current_state()
+            state["points"] = points
+            state["frame_position"] = current_frame["position"]
+            state["source"] = current_frame["source"]
+            state["frame_size"] = f"{current_frame['width']}x{current_frame['height']}"
+
+        def clamp_point(x: float, y: float) -> tuple[float, float]:
+            display_width = int(current_frame["display_width"])
+            display_height = int(current_frame["display_height"])
+            return (
+                max(0.0, min(float(display_width - 1), float(x))),
+                max(0.0, min(float(display_height - 1), float(y))),
+            )
+
+        def point_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+            return math.hypot(a[0] - b[0], a[1] - b[1])
+
+        def nearest_point_index(x: float, y: float, *, max_distance: float = 18.0) -> int | None:
+            points = current_points()
+            if not points:
+                return None
+            scale = float(current_frame["scale"])
+            display_points = [(point[0] * scale, point[1] * scale) for point in points]
+            distances = [point_distance((x, y), point) for point in display_points]
+            index = min(range(len(distances)), key=distances.__getitem__)
+            return index if distances[index] <= max_distance else None
+
+        def update_active_measurement() -> None:
+            state = current_state()
+            points = current_points()
+            state["perimeter_px"] = None
+            state["perimeter_rate"] = None
+            if len(points) < 4:
+                update_summary()
+                return
+
+            perimeter_px = 0.0
+            for idx in range(4):
+                perimeter_px += point_distance(points[idx], points[(idx + 1) % 4])
+            perimeter_rate = perimeter_px / float(max(int(current_frame["width"]), int(current_frame["height"])))
+            state["perimeter_px"] = perimeter_px
+            state["perimeter_rate"] = perimeter_rate
+            update_summary()
+
+        def update_summary() -> None:
+            lines = []
+            for role in ("smallest", "largest"):
+                state = role_states[role]
+                label = str(state["label"])
+                rate = state.get("perimeter_rate")
+                if rate is None:
+                    points = current_points() if role == active_role_var.get() else []
+                    lines.append(f"{label}: not measured yet ({len(points)}/4 points on active frame)")
+                    continue
+                lines.append(
+                    f"{label}: perimeter={float(state['perimeter_px']):.1f}px, "
+                    f"rate={float(rate):.6f}, source={state['source']}"
+                )
+
+            small_rate = role_states["smallest"].get("perimeter_rate")
+            large_rate = role_states["largest"].get("perimeter_rate")
+            if small_rate is not None and large_rate is not None:
+                min_values, max_values = suggest_marker_perimeter_rate_sweeps_from_measurements(
+                    float(small_rate),
+                    float(large_rate),
+                )
+                apply_button.configure(state=tk.NORMAL)
+                lines.extend(
+                    [
+                        "",
+                        f"Suggested minMarkerPerimeterRate: {self._format_optimize_sweep_values(min_values)}",
+                        f"Suggested maxMarkerPerimeterRate: {self._format_optimize_sweep_values(max_values)}",
+                    ]
+                )
+            else:
+                apply_button.configure(state=tk.DISABLED)
+            result_var.set("\n".join(lines))
+
+        def render_current_frame() -> None:
+            frame_bgr = current_frame.get("frame_bgr")
+            if frame_bgr is None:
+                return
+            frame_width = int(current_frame["width"])
+            frame_height = int(current_frame["height"])
+            scale = float(current_frame["scale"])
+            display_width = max(1, int(round(frame_width * scale)))
+            display_height = max(1, int(round(frame_height * scale)))
+            display_bgr = cv2.resize(
+                frame_bgr,
+                (display_width, display_height),
+                interpolation=cv2.INTER_NEAREST if scale >= 1.0 else cv2.INTER_AREA,
+            )
+            ok, png_buffer = cv2.imencode(".png", display_bgr)
+            if not ok:
+                self._show_error("Measurement frame failed", "Could not encode frame preview.")
+                return
+            image_data = base64.b64encode(png_buffer.tobytes()).decode("ascii")
+            photo = tk.PhotoImage(data=image_data)
+            canvas.delete("frame")
+            canvas.create_image(0, 0, image=photo, anchor=tk.NW, tags=("frame",))
+            canvas.image = photo
+            current_frame["display_width"] = display_width
+            current_frame["display_height"] = display_height
+            canvas.configure(scrollregion=(0, 0, display_width, display_height))
+            zoom_var.set(f"Zoom: {float(current_frame['zoom']) * 100:.0f}%")
+
+        def redraw_points() -> None:
+            canvas.delete("measurement")
+            points = current_points()
+            scale = float(current_frame["scale"])
+            color = "#FFEB3B" if active_role_var.get() == "smallest" else "#40C4FF"
+            if len(points) >= 2:
+                line_points: list[float] = []
+                for x, y in points:
+                    line_points.extend([x * scale, y * scale])
+                if len(points) == 4:
+                    line_points.extend([points[0][0] * scale, points[0][1] * scale])
+                canvas.create_line(
+                    *line_points,
+                    fill="#00E676",
+                    width=3,
+                    tags=("measurement",),
+                )
+            for idx, (x, y) in enumerate(points, start=1):
+                display_x = x * scale
+                display_y = y * scale
+                radius = 6
+                canvas.create_oval(
+                    display_x - radius,
+                    display_y - radius,
+                    display_x + radius,
+                    display_y + radius,
+                    fill=color,
+                    outline="#111111",
+                    width=2,
+                    tags=("measurement",),
+                )
+                canvas.create_text(
+                    display_x + 14,
+                    display_y - 14,
+                    text=str(idx),
+                    fill="#FFFFFF",
+                    font=("TkDefaultFont", 14, "bold"),
+                    tags=("measurement",),
+                )
+            update_summary()
+
+        def redraw_image_and_points() -> None:
+            render_current_frame()
+            redraw_points()
+
+        def set_zoom(zoom: float, *, focus: tuple[float, float] | None = None) -> None:
+            current_frame["zoom"] = max(1.0, min(8.0, float(zoom)))
+            current_frame["scale"] = float(current_frame["fit_scale"]) * float(current_frame["zoom"])
+            redraw_image_and_points()
+            if focus is not None:
+                display_width = max(1, int(current_frame["display_width"]))
+                display_height = max(1, int(current_frame["display_height"]))
+                target_x = max(0.0, min(display_width, focus[0] * float(current_frame["scale"])))
+                target_y = max(0.0, min(display_height, focus[1] * float(current_frame["scale"])))
+                visible_width = max(1, int(canvas.winfo_width()))
+                visible_height = max(1, int(canvas.winfo_height()))
+                canvas.xview_moveto(max(0.0, min(1.0, (target_x - visible_width / 2.0) / display_width)))
+                canvas.yview_moveto(max(0.0, min(1.0, (target_y - visible_height / 2.0) / display_height)))
+
+        def adjust_zoom(factor: float, *, focus_event: tk.Event | None = None) -> None:
+            focus = None
+            if focus_event is not None:
+                canvas_x = canvas.canvasx(focus_event.x)
+                canvas_y = canvas.canvasy(focus_event.y)
+                scale = float(current_frame["scale"])
+                if scale > 0:
+                    focus = (canvas_x / scale, canvas_y / scale)
+            set_zoom(float(current_frame["zoom"]) * factor, focus=focus)
+
+        def load_frame(position: int) -> None:
+            position = max(0, min(len(frame_refs) - 1, int(position)))
+            try:
+                frame_bgr, source_label = self._load_optimizer_measurement_frame_ref(frame_refs[position])
+            except Exception as exc:
+                self._show_error("Measurement frame failed", str(exc))
+                return
+
+            frame_height, frame_width = frame_bgr.shape[:2]
+            fit_scale = min(
+                max_display_width / float(frame_width),
+                max_display_height / float(frame_height),
+                1.0,
+            )
+            current_frame.update(
+                {
+                    "position": position,
+                    "fit_scale": fit_scale,
+                    "zoom": 1.0,
+                    "scale": fit_scale,
+                    "width": frame_width,
+                    "height": frame_height,
+                    "display_width": max(1, int(round(frame_width * fit_scale))),
+                    "display_height": max(1, int(round(frame_height * fit_scale))),
+                    "source": source_label,
+                    "frame_bgr": frame_bgr,
+                }
+            )
+            frame_info_var.set(
+                f"Frame {position + 1}/{len(frame_refs)} | {source_label} | image {frame_width}x{frame_height}"
+            )
+            redraw_image_and_points()
+
+        def shift_frame(delta: int) -> None:
+            load_frame(int(current_frame["position"]) + delta)
+
+        def on_press(event: tk.Event) -> None:
+            x, y = clamp_point(canvas.canvasx(event.x), canvas.canvasy(event.y))
+            index = nearest_point_index(x, y)
+            points = current_points()
+            if index is not None:
+                drag_state["index"] = index
+                return
+            if len(points) >= 4:
+                return
+            scale = float(current_frame["scale"])
+            if current_state().get("frame_position") != current_frame["position"]:
+                points = []
+            points.append((x / scale, y / scale))
+            set_current_points(points)
+            drag_state["index"] = len(points) - 1
+            redraw_points()
+
+        def on_drag(event: tk.Event) -> None:
+            index = drag_state.get("index")
+            if index is None:
+                return
+            points = current_points()
+            if not (0 <= int(index) < len(points)):
+                return
+            x, y = clamp_point(canvas.canvasx(event.x), canvas.canvasy(event.y))
+            scale = float(current_frame["scale"])
+            points[int(index)] = (x / scale, y / scale)
+            set_current_points(points)
+            redraw_points()
+
+        def on_release(_event: tk.Event) -> None:
+            drag_state["index"] = None
+            update_active_measurement()
+
+        def reset_points() -> None:
+            state = current_state()
+            state["points"] = []
+            state["frame_position"] = current_frame["position"]
+            state["perimeter_px"] = None
+            state["perimeter_rate"] = None
+            state["source"] = ""
+            state["frame_size"] = ""
+            drag_state["index"] = None
+            redraw_points()
+
+        def apply_measurement() -> None:
+            small_rate = role_states["smallest"].get("perimeter_rate")
+            large_rate = role_states["largest"].get("perimeter_rate")
+            if small_rate is None or large_rate is None:
+                self._show_error("Missing measurement", "Measure both the smallest and largest real tags first.")
+                return
+            min_values, max_values = suggest_marker_perimeter_rate_sweeps_from_measurements(
+                float(small_rate),
+                float(large_rate),
+            )
+            profile = self.opt_profile_var.get().strip().lower() or "quick"
+            profile_vars = self._opt_sweep_profile_vars.get(profile)
+            if (
+                not profile_vars
+                or "minMarkerPerimeterRate" not in profile_vars
+                or "maxMarkerPerimeterRate" not in profile_vars
+            ):
+                self._show_error("Apply failed", f"Could not find profile sweep fields for: {profile}")
+                return
+            min_text = self._format_optimize_sweep_values(min_values)
+            max_text = self._format_optimize_sweep_values(max_values)
+            profile_vars["minMarkerPerimeterRate"].set(min_text)
+            profile_vars["maxMarkerPerimeterRate"].set(max_text)
+            self._select_optimize_profile_tab(profile)
+            self.optimize_output.delete("1.0", tk.END)
+            self.optimize_output.insert(
+                tk.END,
+                (
+                    "Applied measured tag-size range to optimizer sweep.\n"
+                    f"Profile: {profile}\n"
+                    f"Smallest tag perimeter rate: {float(small_rate):.6f}\n"
+                    f"Largest tag perimeter rate: {float(large_rate):.6f}\n"
+                    f"minMarkerPerimeterRate values: {min_text}\n"
+                    f"maxMarkerPerimeterRate values: {max_text}\n\n"
+                    "Next step: run optimize-tracking, then optionally run iterative refinement from the top five."
+                ),
+            )
+            self._show_info(
+                "Measurement applied",
+                f"Updated {profile} marker perimeter sweeps:\nmin: {min_text}\nmax: {max_text}",
+            )
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        canvas.bind("<MouseWheel>", lambda event: adjust_zoom(1.25 if event.delta > 0 else 1 / 1.25, focus_event=event))
+        canvas.bind("<Button-4>", lambda event: adjust_zoom(1.25, focus_event=event))
+        canvas.bind("<Button-5>", lambda event: adjust_zoom(1 / 1.25, focus_event=event))
+
+        ttk.Button(footer, text="Reset Active Points", command=reset_points).pack(side=tk.LEFT)
+        apply_button.configure(command=apply_measurement)
+        apply_button.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(footer, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
+        load_frame(0)
+
     def _start_optimize_tracking(self) -> None:
         if self._optimize_thread and self._optimize_thread.is_alive():
             self._show_info("Optimization running", "Tracking optimization is already running.")
@@ -4232,15 +4942,21 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._optimize_error = None
         self._optimize_warning = None
+        self._optimize_extra_report = None
         self._optimize_result = None
+        self._optimize_refinement_result = None
         self._optimize_applied_config = None
         self._optimize_top_k = top_k
+        self._optimize_stop_event.clear()
+        self._optimize_started_monotonic = time.monotonic()
+        self._optimize_last_progress_monotonic = None
+        self._optimize_latest_progress = None
 
         optimize_kwargs = {
             "input_path": input_path,
             "profile": profile,
             "sample_frames": sample_frames,
-            "dictionary_name": self.opt_dictionary_var.get().strip() or "4X4_50",
+            "dictionary_name": self._normalize_display_dictionary(self.opt_dictionary_var.get()),
             "tag_size_mm": tag_size_mm,
             "sweep_overrides": sweep_overrides or None,
             "execution_target": self.opt_execution_target_var.get().strip(),
@@ -4254,9 +4970,17 @@ class BumbleBoxV2GUI(tk.Tk):
             "top_k": max(top_k, 10),
         }
         self.optimize_output.delete("1.0", tk.END)
-        self.optimize_output.insert(tk.END, "Running optimize-tracking...\n")
-        self.opt_status_var.set("Running...")
+        self.optimize_output.insert(
+            tk.END,
+            "Running optimize-tracking...\n"
+            "Evaluated parameter combinations: 0/?\n"
+            "Elapsed: 0.0s\n"
+            "The live top five and timing details will appear here after the first candidate finishes.\n",
+        )
+        self.opt_status_var.set("Running... evaluating parameter combinations")
         self.optimize_run_btn.config(state=tk.DISABLED)
+        self.optimize_refine_btn.config(state=tk.DISABLED)
+        self.optimize_stop_btn.config(state=tk.NORMAL)
 
         self._optimize_thread = threading.Thread(
             target=self._run_optimize_tracking_worker,
@@ -4266,18 +4990,184 @@ class BumbleBoxV2GUI(tk.Tk):
         self._optimize_thread.start()
         self.after(200, self._poll_optimize_tracking)
 
+    def _stop_optimize_tracking(self) -> None:
+        if not self._optimize_thread or not self._optimize_thread.is_alive():
+            return
+        self._optimize_stop_event.set()
+        self.optimize_stop_btn.config(state=tk.DISABLED)
+        self.opt_status_var.set("Stopping after current parameter combination finishes...")
+
     def _run_optimize_tracking_worker(self, optimize_kwargs: dict) -> None:
         from .tracking_optimizer import optimize_tracking
 
-        def progress_callback(done: int, total: int) -> None:
-            self._optimize_progress_q.put((done, total))
+        def progress_callback(
+            done: int,
+            total: int,
+            top_candidates: list[dict[str, object]],
+            latest_candidate: dict[str, object],
+        ) -> None:
+            self._optimize_progress_q.put((done, total, top_candidates, latest_candidate))
 
         try:
             result = optimize_tracking(
                 progress_callback=progress_callback,
+                stop_requested=self._optimize_stop_event.is_set,
                 **optimize_kwargs,
             )
             self._optimize_result = result
+        except Exception as exc:
+            self._optimize_error = str(exc)
+            return
+
+    def _start_optimize_refinement(self) -> None:
+        if self._optimize_thread and self._optimize_thread.is_alive():
+            self._show_info("Optimization running", "Tracking optimization is already running.")
+            return
+        if self._optimize_result is None:
+            self._show_error(
+                "No optimization result",
+                "Run optimize-tracking first, then refine from its top candidates.",
+            )
+            return
+
+        try:
+            input_path = self.opt_input_path_var.get().strip()
+            if not input_path:
+                input_path = str(getattr(self._optimize_result, "input_path", "") or "")
+            if not input_path:
+                raise ValueError("Set an input video or image folder path.")
+
+            tag_size_mm = float(self.opt_tag_size_mm_var.get().strip())
+            if tag_size_mm <= 0:
+                raise ValueError("tag size must be > 0")
+
+            sample_frames = int(self.opt_sample_frames_var.get().strip())
+            if sample_frames <= 0:
+                raise ValueError("sample frames must be >= 1")
+
+            rounds = int(self.opt_refinement_rounds_var.get().strip())
+            if rounds <= 0:
+                raise ValueError("iterative refinement rounds must be >= 1")
+
+            seed_count = int(self.opt_refinement_seed_count_var.get().strip())
+            if seed_count <= 0:
+                raise ValueError("seed candidates must be >= 1")
+
+            validation_multiplier = float(self.opt_refinement_validation_multiplier_var.get().strip())
+            if validation_multiplier <= 0:
+                raise ValueError("validation frame multiplier must be > 0")
+            validation_sample_frames = max(1, int(round(sample_frames * validation_multiplier)))
+
+            workers_text = self.opt_workers_var.get().strip()
+            workers = int(workers_text) if workers_text else None
+            if workers is not None and workers <= 0:
+                raise ValueError("workers must be >= 1")
+
+            expected_text = self.opt_expected_tags_var.get().strip()
+            expected_tags = float(expected_text) if expected_text else None
+            if expected_tags is not None and expected_tags <= 0:
+                raise ValueError("expected tags must be > 0")
+
+            preview_frames = int(self.opt_preview_frames_var.get().strip())
+            if preview_frames <= 0:
+                raise ValueError("preview frames must be >= 1")
+
+            top_k = int(self.opt_top_k_var.get().strip())
+            if top_k <= 0:
+                raise ValueError("top results must be >= 1")
+
+            profile = self.opt_profile_var.get().strip().lower()
+            seed_params = [
+                dict(candidate.params)
+                for candidate in self._optimize_result.top_candidates[:seed_count]
+            ]
+            if not seed_params:
+                raise ValueError("The previous optimization result has no candidates to refine.")
+        except Exception as exc:
+            self._show_error("Invalid refinement settings", str(exc))
+            return
+
+        while not self._optimize_progress_q.empty():
+            try:
+                self._optimize_progress_q.get_nowait()
+            except queue.Empty:
+                break
+
+        self._optimize_error = None
+        self._optimize_warning = None
+        self._optimize_extra_report = None
+        self._optimize_refinement_result = None
+        self._optimize_applied_config = None
+        self._optimize_top_k = top_k
+        self._optimize_stop_event.clear()
+        self._optimize_started_monotonic = time.monotonic()
+        self._optimize_last_progress_monotonic = None
+        self._optimize_latest_progress = None
+
+        refine_kwargs = {
+            "input_path": input_path,
+            "seed_params": seed_params,
+            "rounds": rounds,
+            "seed_candidate_count": seed_count,
+            "sample_frames": sample_frames,
+            "validation_sample_frames": validation_sample_frames,
+            "profile": profile,
+            "dictionary_name": self._normalize_display_dictionary(self.opt_dictionary_var.get()),
+            "tag_size_mm": tag_size_mm,
+            "execution_target": self.opt_execution_target_var.get().strip(),
+            "workers": workers,
+            "expected_tags": expected_tags,
+            "output_dir": self.opt_output_dir_var.get().strip() or None,
+            "write_preview": bool(self.opt_preview_var.get()),
+            "preview_frames": preview_frames,
+            "top_k": max(top_k, seed_count, 10),
+        }
+
+        self.optimize_output.delete("1.0", tk.END)
+        self.optimize_output.insert(
+            tk.END,
+            "Running iterative tracking refinement...\n"
+            f"Seed candidates: {len(seed_params)}\n"
+            f"Refinement rounds: {rounds}\n"
+            f"Validation sample frames: {validation_sample_frames}\n"
+            "Live round timing and top-five details will appear after the first candidate finishes.\n",
+        )
+        self.opt_status_var.set("Running iterative refinement...")
+        self.optimize_run_btn.config(state=tk.DISABLED)
+        self.optimize_refine_btn.config(state=tk.DISABLED)
+        self.optimize_stop_btn.config(state=tk.NORMAL)
+
+        self._optimize_thread = threading.Thread(
+            target=self._run_optimize_refinement_worker,
+            args=(refine_kwargs,),
+            daemon=True,
+        )
+        self._optimize_thread.start()
+        self.after(200, self._poll_optimize_tracking)
+
+    def _run_optimize_refinement_worker(self, refine_kwargs: dict) -> None:
+        from .tracking_optimizer import (
+            format_iterative_refinement_report,
+            optimize_tracking_iterative_refinement,
+        )
+
+        def progress_callback(
+            done: int,
+            total: int,
+            top_candidates: list[dict[str, object]],
+            latest_candidate: dict[str, object],
+        ) -> None:
+            self._optimize_progress_q.put((done, total, top_candidates, latest_candidate))
+
+        try:
+            refinement_result = optimize_tracking_iterative_refinement(
+                progress_callback=progress_callback,
+                stop_requested=self._optimize_stop_event.is_set,
+                **refine_kwargs,
+            )
+            self._optimize_refinement_result = refinement_result
+            self._optimize_result = refinement_result.final_result
+            self._optimize_extra_report = format_iterative_refinement_report(refinement_result)
         except Exception as exc:
             self._optimize_error = str(exc)
             return
@@ -4293,7 +5183,7 @@ class BumbleBoxV2GUI(tk.Tk):
             return
         confirmed = messagebox.askyesno(
             "Review optimization candidates",
-            "Do you want to review the performance of the top five candidates?",
+            "Do you want to review the top five score candidates and the highest-detection candidate?",
             parent=self,
         )
         if confirmed:
@@ -4364,13 +5254,17 @@ class BumbleBoxV2GUI(tk.Tk):
 
         candidate_options = []
         candidate_lookup: dict[str, dict] = {}
-        for candidate in candidates[:5]:
+        for index, candidate in enumerate(candidates, start=1):
+            review_label = str(candidate.get("review_label") or "Review candidate")
             label = (
+                f"{review_label} | "
                 f"#{candidate['rank']} "
                 f"score={candidate['score']:.3f} "
                 f"detected={candidate['mean_detected']:.2f} "
                 f"fps={candidate['eval_fps']:.1f}"
             )
+            if label in candidate_lookup:
+                label = f"{label} ({index})"
             candidate_options.append(label)
             candidate_lookup[label] = candidate
 
@@ -4411,12 +5305,12 @@ class BumbleBoxV2GUI(tk.Tk):
         viewer = ttk.Frame(body)
         viewer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
 
+        controls = ttk.Frame(viewer)
+        controls.pack(fill=tk.X, pady=(0, 8))
+
         image_label = ttk.Label(viewer)
         image_label.pack(fill=tk.BOTH, expand=True)
         ttk.Label(viewer, textvariable=frame_info_var, justify=tk.LEFT).pack(anchor="w", pady=(6, 0))
-
-        controls = ttk.Frame(viewer)
-        controls.pack(fill=tk.X, pady=(8, 0))
 
         def _selected_candidate() -> dict:
             return candidate_lookup[candidate_var.get()]
@@ -4458,20 +5352,29 @@ class BumbleBoxV2GUI(tk.Tk):
         def _update_candidate(*_args: object) -> None:
             candidate = _selected_candidate()
             avg_frame_ms = float(candidate.get("average_frame_ms", 0.0))
+            frames = candidate.get("frames") or []
             summary_var.set(
+                f"Review role: {candidate.get('review_label', 'Review candidate')}\n"
                 f"Rank: {candidate['rank']}\n"
                 f"Score: {candidate['score']:.4f}\n"
                 f"Mean detections/frame: {candidate['mean_detected']:.3f}\n"
                 f"Mean rejected/frame: {candidate['mean_rejected']:.3f}\n"
                 f"Stability: {candidate['stability']:.3f}\n"
                 f"Unique IDs: {candidate['unique_ids']}\n"
+                f"Review frames: {len(frames)}\n"
                 f"Average frame time: {avg_frame_ms:.2f} ms\n"
                 f"Eval FPS: {candidate['eval_fps']:.2f}"
             )
             _set_params_text(candidate)
-            frames = candidate.get("frames") or []
             frame_slider.configure(to=max(1, len(frames)))
             frame_scale_var.set(1)
+            _update_frame()
+
+        def _jump_frame(frame_number: int) -> None:
+            candidate = _selected_candidate()
+            frame_count = max(1, len(candidate.get("frames") or []))
+            next_value = max(1, min(frame_count, frame_number))
+            frame_scale_var.set(next_value)
             _update_frame()
 
         def _shift_frame(delta: int) -> None:
@@ -4481,15 +5384,18 @@ class BumbleBoxV2GUI(tk.Tk):
             frame_scale_var.set(next_value)
             _update_frame()
 
-        ttk.Button(controls, text="Prev Frame", command=lambda: _shift_frame(-1)).pack(side=tk.LEFT)
-        ttk.Button(controls, text="Next Frame", command=lambda: _shift_frame(1)).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(controls, text="Review frame").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="First", command=lambda: _jump_frame(1)).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Prev", command=lambda: _shift_frame(-1)).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(controls, text="Next", command=lambda: _shift_frame(1)).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(controls, text="Last", command=lambda: _jump_frame(10**9)).pack(side=tk.LEFT, padx=(6, 0))
         frame_slider = tk.Scale(
             controls,
             from_=1,
             to=1,
             orient=tk.HORIZONTAL,
             variable=frame_scale_var,
-            showvalue=False,
+            showvalue=True,
             command=_update_frame,
             length=420,
         )
@@ -4518,6 +5424,147 @@ class BumbleBoxV2GUI(tk.Tk):
             self._optimize_review_dialog = None
         dialog.destroy()
 
+    def _format_optimize_live_progress(
+        self,
+        done: int,
+        total: int,
+        top_candidates: list[dict[str, object]],
+        latest_candidate: dict[str, object] | None = None,
+    ) -> str:
+        now = time.monotonic()
+        elapsed_s = (
+            now - self._optimize_started_monotonic
+            if self._optimize_started_monotonic is not None
+            else 0.0
+        )
+        since_last_s = (
+            now - self._optimize_last_progress_monotonic
+            if self._optimize_last_progress_monotonic is not None
+            else elapsed_s
+        )
+        last_runtime_s = (
+            float(latest_candidate.get("runtime_seconds", 0.0) or 0.0)
+            if latest_candidate
+            else 0.0
+        )
+        avg_wall_s = elapsed_s / done if done > 0 else 0.0
+        remaining = max(0, total - done)
+        eta_s = avg_wall_s * remaining if done > 0 else 0.0
+        stage = str(latest_candidate.get("stage", "")).strip() if latest_candidate else ""
+        highest_detection = (
+            latest_candidate.get("highest_detection_candidate")
+            if isinstance(latest_candidate, dict)
+            else None
+        )
+
+        lines = [
+            "Running optimize-tracking..." if not stage else f"Running optimize-tracking... {stage}",
+            f"Evaluated parameter combinations: {done}/{total}",
+            (
+                f"Elapsed: {self._format_seconds(elapsed_s)} | "
+                f"Since last completed: {self._format_seconds(since_last_s)}"
+            ),
+            (
+                f"Last completed combination runtime: "
+                f"{self._format_seconds(last_runtime_s) if last_runtime_s > 0 else 'n/a'} | "
+                f"Average wall time/combination: "
+                f"{self._format_seconds(avg_wall_s) if avg_wall_s > 0 else 'n/a'} | "
+                f"ETA: {self._format_seconds(eta_s) if eta_s > 0 else 'n/a'}"
+            ),
+            "",
+            "Current top five candidates:",
+        ]
+        if not top_candidates:
+            lines.append("No candidates have finished yet.")
+            return "\n".join(lines)
+
+        param_columns = [
+            ("minMarkerPerimeterRate", "minPerim", 8, "float"),
+            ("maxMarkerPerimeterRate", "maxPerim", 8, "float"),
+            ("adaptiveThreshWinSizeMin", "winMin", 6, "int"),
+            ("adaptiveThreshWinSizeMax", "winMax", 6, "int"),
+            ("adaptiveThreshWinSizeStep", "winStep", 7, "int"),
+            ("polygonalApproxAccuracyRate", "poly", 7, "float"),
+            ("adaptiveThreshConstant", "const", 5, "int"),
+        ]
+        header_parts = [
+            f"{'#':>2}",
+            f"{'score':>8}",
+            f"{'detect':>7}",
+            f"{'reject':>7}",
+            f"{'stable':>7}",
+            f"{'ms/frame':>8}",
+        ]
+        for _key, label, width, _kind in param_columns:
+            header_parts.append(f"{label:>{width}}")
+        header = "  ".join(header_parts)
+        lines.append(header)
+        lines.append("-" * len(header))
+
+        for candidate in top_candidates[:5]:
+            params = candidate.get("params", {})
+            if not isinstance(params, dict):
+                params = {}
+            eval_fps = float(candidate.get("eval_fps", 0.0) or 0.0)
+            avg_frame_ms = (1000.0 / eval_fps) if eval_fps > 0 else 0.0
+            row_parts = [
+                f"{int(candidate.get('rank', 0)):>2}",
+                f"{float(candidate.get('score', 0.0)):>8.4f}",
+                f"{float(candidate.get('mean_detected', 0.0)):>7.3f}",
+                f"{float(candidate.get('mean_rejected', 0.0)):>7.3f}",
+                f"{float(candidate.get('stability', 0.0)):>7.3f}",
+                f"{avg_frame_ms:>8.2f}",
+            ]
+            for key, _label, width, kind in param_columns:
+                value = params.get(key, "")
+                if value == "":
+                    row_parts.append(f"{'':>{width}}")
+                elif kind == "int":
+                    row_parts.append(f"{int(float(value)):>{width}}")
+                else:
+                    row_parts.append(f"{float(value):>{width}.4g}")
+            lines.append("  ".join(row_parts))
+
+        lines.extend(
+            [
+                "",
+                "Columns: detect/reject are average counts per sampled frame.",
+                "Parameter columns: minPerim/maxPerim are marker perimeter-rate bounds, poly=polygonalApproxAccuracyRate.",
+            ]
+        )
+        if isinstance(highest_detection, dict):
+            params = highest_detection.get("params", {})
+            if not isinstance(params, dict):
+                params = {}
+            lines.extend(
+                [
+                    "",
+                    "Highest mean detections so far:",
+                    (
+                        f"rank={int(highest_detection.get('rank', 0))} | "
+                        f"detected={float(highest_detection.get('mean_detected', 0.0)):0.3f} | "
+                        f"score={float(highest_detection.get('score', 0.0)):0.4f} | "
+                        f"rejected={float(highest_detection.get('mean_rejected', 0.0)):0.3f} | "
+                        f"stability={float(highest_detection.get('stability', 0.0)):0.3f}"
+                    ),
+                    f"params={json.dumps(params, sort_keys=True)}",
+                ]
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_seconds(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        minutes = int(seconds // 60)
+        remainder = seconds - (minutes * 60)
+        if minutes < 60:
+            return f"{minutes}m {remainder:04.1f}s"
+        hours = minutes // 60
+        minutes = minutes % 60
+        return f"{hours}h {minutes:02d}m {remainder:04.1f}s"
+
     def _poll_optimize_tracking(self) -> None:
         from .tracking_optimizer import format_optimization_report
 
@@ -4529,14 +5576,48 @@ class BumbleBoxV2GUI(tk.Tk):
                 break
 
         if latest_progress:
-            done, total = latest_progress
-            self.opt_status_var.set(f"Running... {done}/{total}")
+            done, total, top_candidates, latest_candidate = latest_progress
+            self._optimize_latest_progress = latest_progress
+            self._optimize_last_progress_monotonic = time.monotonic()
+            if self._optimize_stop_event.is_set():
+                self.opt_status_var.set(
+                    f"Stopping... evaluated {done}/{total} parameter combinations"
+                )
+            else:
+                self.opt_status_var.set(f"Running... evaluated {done}/{total} parameter combinations")
+            self.optimize_output.delete("1.0", tk.END)
+            self.optimize_output.insert(
+                tk.END,
+                self._format_optimize_live_progress(done, total, top_candidates, latest_candidate),
+            )
+        elif self._optimize_thread and self._optimize_thread.is_alive() and self._optimize_latest_progress:
+            done, total, top_candidates, latest_candidate = self._optimize_latest_progress
+            self.optimize_output.delete("1.0", tk.END)
+            self.optimize_output.insert(
+                tk.END,
+                self._format_optimize_live_progress(done, total, top_candidates, latest_candidate),
+            )
+        elif self._optimize_thread and self._optimize_thread.is_alive() and self._optimize_started_monotonic:
+            elapsed_s = time.monotonic() - self._optimize_started_monotonic
+            self.optimize_output.delete("1.0", tk.END)
+            self.optimize_output.insert(
+                tk.END,
+                "Running optimize-tracking...\n"
+                "Evaluated parameter combinations: 0/?\n"
+                f"Elapsed: {self._format_seconds(elapsed_s)}\n"
+                "Waiting for the first parameter combination to finish.\n",
+            )
 
         if self._optimize_thread and self._optimize_thread.is_alive():
-            self.after(200, self._poll_optimize_tracking)
+            self.after(1000, self._poll_optimize_tracking)
             return
 
         self.optimize_run_btn.config(state=tk.NORMAL)
+        self.optimize_refine_btn.config(state=(tk.NORMAL if self._optimize_result is not None else tk.DISABLED))
+        self.optimize_stop_btn.config(state=tk.DISABLED)
+        self._optimize_started_monotonic = None
+        self._optimize_last_progress_monotonic = None
+        self._optimize_latest_progress = None
 
         if self._optimize_error:
             self.opt_status_var.set("Failed")
@@ -4549,8 +5630,12 @@ class BumbleBoxV2GUI(tk.Tk):
             self.optimize_output.insert(tk.END, "\nOptimization ended without a result.\n")
             return
 
-        self.opt_status_var.set("Completed")
+        stopped_by_user = bool(getattr(self._optimize_result, "stopped_by_user", False))
+        self.opt_status_var.set("Ended early" if stopped_by_user else "Completed")
         self.optimize_output.delete("1.0", tk.END)
+        if self._optimize_extra_report:
+            self.optimize_output.insert(tk.END, self._optimize_extra_report)
+            self.optimize_output.insert(tk.END, "\n\nFinal Optimization Report\n-------------------------\n")
         self.optimize_output.insert(
             tk.END,
             format_optimization_report(self._optimize_result, top_k=self._optimize_top_k),
@@ -5542,12 +6627,15 @@ class BumbleBoxV2GUI(tk.Tk):
                             raw_text,
                             "H.264 (Recommended)",
                         )
+                elif key == "tracking.tag_dictionary":
+                    raw = self._normalize_display_dictionary(raw)
                 if value_type is bool:
                     variable.set(bool(raw))
                 else:
                     variable.set("" if raw is None else str(raw))
             self._refresh_config_field_visibility()
             self._refresh_thermal_controls_state()
+            self._sync_dictionary_selectors_from_config()
             self._refresh_config_path_controls()
             self.config_output.delete("1.0", tk.END)
             self.config_output.insert(
@@ -5577,6 +6665,8 @@ class BumbleBoxV2GUI(tk.Tk):
                     parsed = self._mp4_codec_display_to_value().get(text, "libx264")
                 elif key == "camera.preview_window":
                     parsed = "QT"
+                elif key == "tracking.tag_dictionary":
+                    parsed = self._normalize_display_dictionary(text)
                 else:
                     parsed = text
             self._set_nested(config, key, parsed)
@@ -6315,7 +7405,7 @@ class BumbleBoxV2GUI(tk.Tk):
             if display_width <= 0:
                 raise ValueError("Display width must be > 0")
 
-            dictionary = self.camera_test_dictionary_var.get().strip() or None
+            dictionary = self._normalize_display_dictionary(self.camera_test_dictionary_var.get())
             box_preset = self.camera_test_box_preset_var.get().strip().lower()
             if box_preset == "auto":
                 box_preset = None
@@ -6361,7 +7451,7 @@ class BumbleBoxV2GUI(tk.Tk):
             if height is not None and height <= 0:
                 raise ValueError("Height override must be > 0")
 
-            dictionary = self.camera_test_dictionary_var.get().strip() or None
+            dictionary = self._normalize_display_dictionary(self.camera_test_dictionary_var.get())
             box_preset = self.camera_test_box_preset_var.get().strip().lower()
             if box_preset == "auto":
                 box_preset = None

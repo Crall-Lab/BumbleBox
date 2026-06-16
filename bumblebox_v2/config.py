@@ -40,6 +40,7 @@ VALID_PREVIEW_WINDOWS = {"QTGL", "QT", "DRM"}
 VALID_CAMERA_CODECS = {"mp4", "mjpeg"}
 VALID_THERMAL_PIXEL_FORMATS = {"auto", "y16", "gray8", "rgb"}
 VALID_UI_THEME_MODES = {"dark", "light"}
+VALID_ARUCO_TAG_DICTIONARIES = {"4X4_50", "4X4_100", "4X4_250", "4X4_1000"}
 SERVICE_USER_AUTO_SENTINELS = {"", "auto", "current", "default", "pi", "root"}
 
 
@@ -155,6 +156,16 @@ def validate_config(config: Dict[str, Any]) -> None:
             raise ConfigError(
                 f"tracking.excluded_tag_ids[{idx}] must be an integer-like tag ID"
             ) from exc
+
+    tag_dictionary = str(config.get("tracking", {}).get("tag_dictionary", "4X4_50")).strip().upper()
+    if tag_dictionary.startswith("DICT_"):
+        tag_dictionary = tag_dictionary[5:]
+    if tag_dictionary not in VALID_ARUCO_TAG_DICTIONARIES:
+        raise ConfigError(
+            "tracking.tag_dictionary must be one of "
+            f"{sorted(VALID_ARUCO_TAG_DICTIONARIES)}, got: "
+            f"{config.get('tracking', {}).get('tag_dictionary')}"
+        )
 
     backend = config["scheduling"].get("backend")
     if backend not in VALID_SCHED_BACKENDS:

@@ -20,8 +20,9 @@ DEFAULT_DICTIONARY = "4X4_50"
 DEFAULT_PROFILE = "quick"
 DEFAULT_EXECUTION_TARGET = "pi_safe"
 DEFAULT_TAG_SIZE_MM = 2.5
-DEFAULT_EARLY_STOP_PATIENCE = 40
-DEFAULT_EARLY_STOP_MIN_IMPROVEMENT = 0.002
+DEFAULT_EARLY_STOP_PATIENCE = 0
+DEFAULT_EARLY_STOP_MIN_IMPROVEMENT = 0.0
+DEFAULT_MAX_MARKER_PERIMETER_RATE = 4.0
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mjpeg", ".avi", ".mov", ".mkv"}
@@ -31,6 +32,7 @@ VALID_EXECUTION_TARGETS = {"pi_safe", "desktop"}
 PROFILE_PARAMETER_SPACE = {
     "quick": {
         "minMarkerPerimeterRate": [0.015, 0.02, 0.03],
+        "maxMarkerPerimeterRate": [DEFAULT_MAX_MARKER_PERIMETER_RATE],
         "adaptiveThreshWinSizeMin": [3, 5],
         "adaptiveThreshWinSizeMax": [23, 31],
         "adaptiveThreshWinSizeStep": [2, 4],
@@ -39,6 +41,7 @@ PROFILE_PARAMETER_SPACE = {
     },
     "balanced": {
         "minMarkerPerimeterRate": [0.01, 0.015, 0.02, 0.03],
+        "maxMarkerPerimeterRate": [DEFAULT_MAX_MARKER_PERIMETER_RATE],
         "adaptiveThreshWinSizeMin": [3, 5, 7],
         "adaptiveThreshWinSizeMax": [21, 31, 41],
         "adaptiveThreshWinSizeStep": [2, 4],
@@ -47,6 +50,7 @@ PROFILE_PARAMETER_SPACE = {
     },
     "deep": {
         "minMarkerPerimeterRate": [0.008, 0.012, 0.016, 0.02, 0.03],
+        "maxMarkerPerimeterRate": [DEFAULT_MAX_MARKER_PERIMETER_RATE],
         "adaptiveThreshWinSizeMin": [3, 5, 7],
         "adaptiveThreshWinSizeMax": [21, 31, 41],
         "adaptiveThreshWinSizeStep": [2, 4],
@@ -61,11 +65,26 @@ VALID_SWEEP_OVERRIDE_KEYS = {
 }
 FLOAT_SWEEP_OVERRIDE_KEYS = {
     "minMarkerPerimeterRate",
+    "maxMarkerPerimeterRate",
     "polygonalApproxAccuracyRate",
 }
+OPTIMIZED_ARUCO_PARAM_KEYS = (
+    "minMarkerPerimeterRate",
+    "maxMarkerPerimeterRate",
+    "adaptiveThreshWinSizeMin",
+    "adaptiveThreshWinSizeMax",
+    "adaptiveThreshWinSizeStep",
+    "polygonalApproxAccuracyRate",
+    "adaptiveThreshConstant",
+)
 
 
-ProgressCallback = Callable[[int, int], None]
+ProgressCandidateSnapshot = dict[str, Any]
+ProgressCallback = Callable[
+    [int, int, list[ProgressCandidateSnapshot], ProgressCandidateSnapshot],
+    None,
+]
+StopRequestedCallback = Callable[[], bool]
 
 
 @dataclass
@@ -90,14 +109,17 @@ class TrackingOptimizationResult:
     dictionary: str
     tag_size_mm: float
     profile: str
+    parameter_source: str
     execution_target: str
     workers: int
     sample_frames_requested: int
     sample_frames_used: int
+    parameter_combinations_total: int
     combinations_evaluated: int
     early_stop_patience: int
     early_stop_min_improvement: float
     early_stopped: bool
+    stopped_by_user: bool
     sweep_overrides: dict[str, list[float | int]]
     output_dir: str
     summary_json_path: str
@@ -107,11 +129,39 @@ class TrackingOptimizationResult:
     best_params: dict[str, float | int]
     best_score: float
     best_mean_detected: float
+    highest_detection_candidate: OptimizationCandidate
     top_candidates: list[OptimizationCandidate]
 
     def to_dict(self) -> dict:
         payload = asdict(self)
+        payload["highest_detection_candidate"] = asdict(self.highest_detection_candidate)
         payload["top_candidates"] = [asdict(item) for item in self.top_candidates]
+        return payload
+
+
+@dataclass
+class IterativeTrackingRefinementResult:
+    created_at: str
+    input_path: str
+    output_dir: str
+    rounds_requested: int
+    rounds_completed: int
+    seed_candidate_count: int
+    sample_frames: int
+    validation_sample_frames: int
+    summary_json_path: str
+    round_results: list[TrackingOptimizationResult]
+    validation_result: Optional[TrackingOptimizationResult]
+    final_result: TrackingOptimizationResult
+    stopped_by_user: bool
+
+    def to_dict(self) -> dict:
+        payload = asdict(self)
+        payload["round_results"] = [item.to_dict() for item in self.round_results]
+        payload["validation_result"] = (
+            self.validation_result.to_dict() if self.validation_result else None
+        )
+        payload["final_result"] = self.final_result.to_dict()
         return payload
 
 
@@ -131,6 +181,13 @@ def normalize_dictionary_name(dictionary_name: str) -> str:
     if not hasattr(cv2.aruco, name):
         raise ValueError(f"Unknown ArUco dictionary: {dictionary_name}")
     return name
+
+
+def _resolve_user_path(path_value: str | Path) -> Path:
+    text = str(path_value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    return Path(text).expanduser().resolve()
 
 
 def recommended_worker_count(
@@ -240,6 +297,8 @@ def build_parameter_grid(
     combinations = []
     for values in itertools.product(*(space[key] for key in keys)):
         params = dict(zip(keys, values))
+        if float(params.get("maxMarkerPerimeterRate", DEFAULT_MAX_MARKER_PERIMETER_RATE)) <= float(params["minMarkerPerimeterRate"]):
+            continue
         win_min = int(params["adaptiveThreshWinSizeMin"])
         win_max = int(params["adaptiveThreshWinSizeMax"])
         step = int(params["adaptiveThreshWinSizeStep"])
@@ -253,6 +312,277 @@ def build_parameter_grid(
     if not combinations:
         raise RuntimeError("Parameter grid is empty after validation.")
     return combinations
+
+
+def _candidate_param_key(params: dict[str, float | int]) -> tuple[float | int, ...]:
+    return tuple(params[key] for key in OPTIMIZED_ARUCO_PARAM_KEYS)
+
+
+def _normalize_candidate_params(params: dict[str, Any]) -> dict[str, float | int]:
+    normalized: dict[str, float | int] = {}
+    if "maxMarkerPerimeterRate" not in params:
+        params["maxMarkerPerimeterRate"] = DEFAULT_MAX_MARKER_PERIMETER_RATE
+    missing = [key for key in OPTIMIZED_ARUCO_PARAM_KEYS if key not in params]
+    if missing:
+        raise ValueError(f"candidate params missing required keys: {', '.join(missing)}")
+
+    for key in OPTIMIZED_ARUCO_PARAM_KEYS:
+        value = params[key]
+        if key in FLOAT_SWEEP_OVERRIDE_KEYS:
+            parsed = round(float(value), 6)
+            if parsed <= 0:
+                raise ValueError(f"{key} must be > 0")
+            normalized[key] = parsed
+            continue
+
+        parsed_float = float(value)
+        if not parsed_float.is_integer():
+            raise ValueError(f"{key} must be a whole number")
+        parsed_int = int(parsed_float)
+        if parsed_int <= 0:
+            raise ValueError(f"{key} must be >= 1")
+        normalized[key] = parsed_int
+
+    win_min = int(normalized["adaptiveThreshWinSizeMin"])
+    win_max = int(normalized["adaptiveThreshWinSizeMax"])
+    step = int(normalized["adaptiveThreshWinSizeStep"])
+    if float(normalized["maxMarkerPerimeterRate"]) <= float(normalized["minMarkerPerimeterRate"]):
+        raise ValueError("maxMarkerPerimeterRate must be greater than minMarkerPerimeterRate")
+    if win_min < 3 or win_max < 3:
+        raise ValueError("adaptive threshold window min/max values must be >= 3")
+    if win_min >= win_max:
+        raise ValueError("adaptiveThreshWinSizeMin must be less than adaptiveThreshWinSizeMax")
+    if (win_max - win_min) < step:
+        raise ValueError("adaptive threshold window range must be at least one step wide")
+    return normalized
+
+
+def normalize_candidate_param_grid(
+    candidate_param_grid: Sequence[dict[str, Any]],
+) -> list[dict[str, float | int]]:
+    normalized_grid: list[dict[str, float | int]] = []
+    seen: set[tuple[float | int, ...]] = set()
+    for params in candidate_param_grid:
+        normalized = _normalize_candidate_params(dict(params))
+        key = _candidate_param_key(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_grid.append(normalized)
+    if not normalized_grid:
+        raise RuntimeError("Candidate parameter grid is empty after validation.")
+    return normalized_grid
+
+
+def _round_float_values(values: Sequence[float]) -> list[float]:
+    return sorted({round(max(0.000001, float(value)), 6) for value in values})
+
+
+def _round_int_values(values: Sequence[int]) -> list[int]:
+    return sorted({max(1, int(value)) for value in values})
+
+
+def _refinement_float_values(key: str, value: float, round_index: int) -> list[float]:
+    if key == "minMarkerPerimeterRate":
+        if round_index <= 1:
+            multipliers = (0.5, 0.75, 1.0, 1.25, 1.5)
+        elif round_index == 2:
+            multipliers = (0.8, 0.9, 1.0, 1.1, 1.2)
+        else:
+            multipliers = (0.9, 0.95, 1.0, 1.05, 1.1)
+        return _round_float_values(min(0.08, max(0.0005, value * factor)) for factor in multipliers)
+
+    if key == "maxMarkerPerimeterRate":
+        if round_index <= 1:
+            multipliers = (0.75, 0.9, 1.0, 1.15, 1.35)
+        elif round_index == 2:
+            multipliers = (0.9, 0.97, 1.0, 1.03, 1.1)
+        else:
+            multipliers = (0.95, 1.0, 1.05)
+        return _round_float_values(
+            min(DEFAULT_MAX_MARKER_PERIMETER_RATE, max(0.001, value * factor))
+            for factor in multipliers
+        )
+
+    if key == "polygonalApproxAccuracyRate":
+        if round_index <= 1:
+            offsets = (-0.02, -0.01, 0.0, 0.01, 0.02)
+        elif round_index == 2:
+            offsets = (-0.008, -0.004, 0.0, 0.004, 0.008)
+        else:
+            offsets = (-0.004, -0.002, 0.0, 0.002, 0.004)
+        return _round_float_values(min(0.20, max(0.001, value + offset)) for offset in offsets)
+
+    raise ValueError(f"Unsupported refinement float key: {key}")
+
+
+def _refinement_int_values(key: str, value: int, round_index: int) -> list[int]:
+    if key == "adaptiveThreshWinSizeMin":
+        offsets = (-4, -2, 0, 2, 4) if round_index <= 1 else (-2, 0, 2)
+    elif key == "adaptiveThreshWinSizeMax":
+        offsets = (-8, -4, 0, 4, 8) if round_index <= 1 else (-4, 0, 4)
+    elif key == "adaptiveThreshWinSizeStep":
+        offsets = (-2, -1, 0, 1, 2) if round_index <= 1 else (-1, 0, 1)
+    elif key == "adaptiveThreshConstant":
+        offsets = (-4, -2, 0, 2, 4) if round_index <= 1 else (-2, -1, 0, 1, 2)
+    else:
+        raise ValueError(f"Unsupported refinement integer key: {key}")
+    return _round_int_values(value + offset for offset in offsets)
+
+
+def build_refinement_parameter_grid(
+    seed_params: Sequence[dict[str, Any]],
+    *,
+    round_index: int = 1,
+) -> list[dict[str, float | int]]:
+    if round_index <= 0:
+        raise ValueError("round_index must be >= 1")
+    if not seed_params:
+        raise ValueError("At least one seed candidate is required for refinement.")
+
+    candidates: list[dict[str, float | int]] = []
+    seen: set[tuple[float | int, ...]] = set()
+
+    def add_variant(raw_params: dict[str, Any]) -> None:
+        try:
+            normalized = _normalize_candidate_params(raw_params)
+        except ValueError:
+            return
+        key = _candidate_param_key(normalized)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(normalized)
+
+    for raw_seed in seed_params:
+        seed = _normalize_candidate_params(dict(raw_seed))
+        add_variant(seed)
+
+        min_rate_values = _refinement_float_values(
+            "minMarkerPerimeterRate",
+            float(seed["minMarkerPerimeterRate"]),
+            round_index,
+        )
+        poly_values = _refinement_float_values(
+            "polygonalApproxAccuracyRate",
+            float(seed["polygonalApproxAccuracyRate"]),
+            round_index,
+        )
+        for min_rate in min_rate_values:
+            for poly in poly_values:
+                variant = dict(seed)
+                variant["minMarkerPerimeterRate"] = min_rate
+                variant["polygonalApproxAccuracyRate"] = poly
+                add_variant(variant)
+
+        max_rate_values = _refinement_float_values(
+            "maxMarkerPerimeterRate",
+            float(seed["maxMarkerPerimeterRate"]),
+            round_index,
+        )
+        for max_rate in max_rate_values:
+            variant = dict(seed)
+            variant["maxMarkerPerimeterRate"] = max_rate
+            add_variant(variant)
+
+        win_min_values = _refinement_int_values(
+            "adaptiveThreshWinSizeMin",
+            int(seed["adaptiveThreshWinSizeMin"]),
+            round_index,
+        )
+        win_max_values = _refinement_int_values(
+            "adaptiveThreshWinSizeMax",
+            int(seed["adaptiveThreshWinSizeMax"]),
+            round_index,
+        )
+        for win_min in win_min_values:
+            for win_max in win_max_values:
+                variant = dict(seed)
+                variant["adaptiveThreshWinSizeMin"] = win_min
+                variant["adaptiveThreshWinSizeMax"] = win_max
+                add_variant(variant)
+
+        for key in ("adaptiveThreshWinSizeStep", "adaptiveThreshConstant"):
+            for value in _refinement_int_values(key, int(seed[key]), round_index):
+                variant = dict(seed)
+                variant[key] = value
+                add_variant(variant)
+
+    if not candidates:
+        raise RuntimeError("Refinement parameter grid is empty after validation.")
+    return candidates
+
+
+def suggest_min_marker_perimeter_rates_from_measurement(perimeter_rate: float) -> list[float]:
+    measured = float(perimeter_rate)
+    if measured <= 0:
+        raise ValueError("perimeter_rate must be > 0")
+    # Measured tags should be the smallest real tags users care about detecting.
+    # Keep suggestions below that measured size so the initial pass does not filter them out.
+    multipliers = (0.30, 0.45, 0.60, 0.75, 0.90)
+    return sorted(
+        {
+            round(min(0.08, max(0.0005, measured * multiplier)), 6)
+            for multiplier in multipliers
+        }
+    )
+
+
+def suggest_marker_perimeter_rate_sweeps_from_measurements(
+    smallest_perimeter_rate: float,
+    largest_perimeter_rate: float,
+) -> tuple[list[float], list[float]]:
+    smallest = float(smallest_perimeter_rate)
+    largest = float(largest_perimeter_rate)
+    if smallest <= 0 or largest <= 0:
+        raise ValueError("smallest and largest perimeter rates must be > 0")
+    if largest < smallest:
+        smallest, largest = largest, smallest
+
+    min_values = suggest_min_marker_perimeter_rates_from_measurement(smallest)
+    max_values = sorted(
+        {
+            round(min(DEFAULT_MAX_MARKER_PERIMETER_RATE, max(0.001, largest * multiplier)), 6)
+            for multiplier in (1.10, 1.30, 1.60, 2.00)
+        }
+    )
+    max_values = [value for value in max_values if value > min_values[-1]]
+    if not max_values:
+        max_values = [round(min(DEFAULT_MAX_MARKER_PERIMETER_RATE, max(min_values[-1] * 1.5, largest * 1.25)), 6)]
+    return min_values, max_values
+
+
+def load_candidate_params_from_scores(path: str | Path, *, limit: int = 5) -> list[dict[str, float | int]]:
+    resolved = _resolve_user_path(path)
+    if resolved.is_dir():
+        resolved = resolved / "candidate_scores.csv"
+    if not resolved.exists():
+        raise FileNotFoundError(f"Candidate score file does not exist: {resolved}")
+
+    if resolved.suffix.lower() == ".json":
+        with resolved.open() as f:
+            payload = json.load(f)
+        raw_candidates = payload.get("top_candidates") or []
+        params = [candidate.get("params", {}) for candidate in raw_candidates[:limit]]
+        return normalize_candidate_param_grid(params)
+
+    candidates: list[tuple[int, float, dict[str, Any]]] = []
+    with resolved.open(newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            params_json = row.get("params_json") or "{}"
+            try:
+                params = json.loads(params_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid params_json in {resolved}: {params_json}") from exc
+            rank_text = row.get("rank") or "999999"
+            score_text = row.get("score") or "0"
+            candidates.append((int(float(rank_text)), float(score_text), params))
+
+    if not candidates:
+        raise RuntimeError(f"No candidates found in {resolved}")
+    candidates.sort(key=lambda item: (item[0], -item[1]))
+    return normalize_candidate_param_grid([params for _rank, _score, params in candidates[:limit]])
 
 
 def _classify_input_path(path: Path) -> str:
@@ -346,7 +676,7 @@ def _load_sample_frames_from_image_dir(image_dir: Path, sample_count: int) -> tu
 
 
 def load_sample_frames_with_indices(input_path: str | Path, sample_count: int) -> tuple[list, str, int, list[int]]:
-    path = Path(input_path).expanduser().resolve()
+    path = _resolve_user_path(input_path)
     input_type = _classify_input_path(path)
     if input_type == "video":
         frames, total_count, sample_indices = _load_sample_frames_from_video(path, sample_count)
@@ -494,6 +824,75 @@ def _write_candidates_csv(candidates: Sequence[OptimizationCandidate], csv_path:
             )
 
 
+def _top_candidate_snapshots(
+    candidates: Sequence[OptimizationCandidate],
+    *,
+    limit: int = 5,
+) -> list[ProgressCandidateSnapshot]:
+    ranked = sorted(
+        candidates,
+        key=lambda item: (item.score, item.mean_detected, -item.mean_rejected, item.eval_fps),
+        reverse=True,
+    )
+    snapshots = []
+    for rank, candidate in enumerate(ranked[: max(1, limit)], start=1):
+        snapshots.append(
+            {
+                "rank": rank,
+                "score": candidate.score,
+                "mean_detected": candidate.mean_detected,
+                "mean_rejected": candidate.mean_rejected,
+                "stability": candidate.stability,
+                "eval_fps": candidate.eval_fps,
+                "runtime_seconds": candidate.runtime_seconds,
+                "params": dict(candidate.params),
+            }
+        )
+    return snapshots
+
+
+def _highest_detection_candidate_snapshot(
+    candidates: Sequence[OptimizationCandidate],
+) -> Optional[ProgressCandidateSnapshot]:
+    if not candidates:
+        return None
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            item.mean_detected,
+            item.score,
+            -item.mean_rejected,
+            item.stability,
+            item.eval_fps,
+        ),
+        reverse=True,
+    )
+    best = ranked[0]
+    rank_by_score = sorted(
+        candidates,
+        key=lambda item: (item.score, item.mean_detected, -item.mean_rejected, item.eval_fps),
+        reverse=True,
+    ).index(best) + 1
+    return _candidate_progress_snapshot(best, rank=rank_by_score)
+
+
+def _candidate_progress_snapshot(
+    candidate: OptimizationCandidate,
+    *,
+    rank: int,
+) -> ProgressCandidateSnapshot:
+    return {
+        "rank": rank,
+        "score": candidate.score,
+        "mean_detected": candidate.mean_detected,
+        "mean_rejected": candidate.mean_rejected,
+        "stability": candidate.stability,
+        "eval_fps": candidate.eval_fps,
+        "runtime_seconds": candidate.runtime_seconds,
+        "params": dict(candidate.params),
+    }
+
+
 def _iter_input_frames(input_path: Path):
     input_type = _classify_input_path(input_path)
     if input_type == "video":
@@ -526,8 +925,8 @@ def write_preview_video(
     output_path: str | Path,
     max_frames: int = 240,
 ) -> Optional[Path]:
-    path = Path(input_path).expanduser().resolve()
-    output = Path(output_path).expanduser().resolve()
+    path = _resolve_user_path(input_path)
+    output = _resolve_user_path(output_path)
 
     detector_params = cv2.aruco.DetectorParameters()
     for key, value in best_params.items():
@@ -628,24 +1027,44 @@ def write_top_candidate_review_artifacts(
     output_dir: str | Path,
     max_candidates: int = 5,
     max_frames: int = 12,
+    extra_candidates: Optional[Sequence[tuple[str, OptimizationCandidate]]] = None,
 ) -> Optional[Path]:
     if not sampled_frames or not candidates:
         return None
 
     selected_candidate_count = max(1, min(int(max_candidates), len(candidates)))
+    selected_candidates: list[tuple[str, OptimizationCandidate]] = [
+        ("Top score candidate", candidate)
+        for candidate in candidates[:selected_candidate_count]
+    ]
+    seen_ranks = {candidate.rank for _label, candidate in selected_candidates}
+    for label, candidate in extra_candidates or []:
+        if candidate.rank in seen_ranks:
+            selected_candidates = [
+                (
+                    f"{existing_label} + {label}"
+                    if existing_candidate.rank == candidate.rank and label not in existing_label
+                    else existing_label,
+                    existing_candidate,
+                )
+                for existing_label, existing_candidate in selected_candidates
+            ]
+            continue
+        selected_candidates.append((label, candidate))
+        seen_ranks.add(candidate.rank)
     selected_frame_positions = _sample_indices(len(sampled_frames), min(max_frames, len(sampled_frames)))
 
-    review_dir = Path(output_dir).expanduser().resolve() / "top_candidate_review"
+    review_dir = _resolve_user_path(output_dir) / "top_candidate_review"
     review_dir.mkdir(parents=True, exist_ok=True)
 
     dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionary_name))
     manifest: dict[str, object] = {
-        "candidate_count": selected_candidate_count,
+        "candidate_count": len(selected_candidates),
         "frame_count": len(selected_frame_positions),
         "candidates": [],
     }
 
-    for candidate in candidates[:selected_candidate_count]:
+    for review_label, candidate in selected_candidates:
         detector_params = cv2.aruco.DetectorParameters()
         for key, value in candidate.params.items():
             if hasattr(detector_params, key):
@@ -687,6 +1106,7 @@ def write_top_candidate_review_artifacts(
         manifest["candidates"].append(
             {
                 "rank": candidate.rank,
+                "review_label": review_label,
                 "score": candidate.score,
                 "mean_detected": candidate.mean_detected,
                 "std_detected": candidate.std_detected,
@@ -714,6 +1134,7 @@ def optimize_tracking(
     dictionary_name: str = DEFAULT_DICTIONARY,
     tag_size_mm: float = DEFAULT_TAG_SIZE_MM,
     sweep_overrides: Optional[dict[str, Sequence[float | int]]] = None,
+    candidate_param_grid: Optional[Sequence[dict[str, Any]]] = None,
     execution_target: str = DEFAULT_EXECUTION_TARGET,
     workers: Optional[int] = None,
     expected_tags: Optional[float] = None,
@@ -724,6 +1145,7 @@ def optimize_tracking(
     preview_frames: int = 240,
     top_k: int = 10,
     progress_callback: Optional[ProgressCallback] = None,
+    stop_requested: Optional[StopRequestedCallback] = None,
 ) -> TrackingOptimizationResult:
     _require_aruco()
 
@@ -750,19 +1172,24 @@ def optimize_tracking(
         raise ValueError("early_stop_min_improvement must be >= 0")
 
     normalized_dictionary = normalize_dictionary_name(dictionary_name)
-    resolved_input = Path(input_path).expanduser().resolve()
+    resolved_input = _resolve_user_path(input_path)
     sampled_frames, input_type, total_input_frames, sample_indices = load_sample_frames_with_indices(
         resolved_input,
         sample_frames,
     )
     frame_height, frame_width = sampled_frames[0].shape[:2]
-    param_grid = build_parameter_grid(
-        profile_key,
-        tag_size_mm=tag_size_mm,
-        frame_width=frame_width,
-        frame_height=frame_height,
-        sweep_overrides=sweep_overrides,
-    )
+    if candidate_param_grid is not None:
+        param_grid = normalize_candidate_param_grid(candidate_param_grid)
+        parameter_source = "explicit candidate grid"
+    else:
+        param_grid = build_parameter_grid(
+            profile_key,
+            tag_size_mm=tag_size_mm,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            sweep_overrides=sweep_overrides,
+        )
+        parameter_source = "profile sweep grid"
     resolved_workers = recommended_worker_count(target_key, workers)
 
     evaluated: list[OptimizationCandidate] = []
@@ -772,13 +1199,28 @@ def optimize_tracking(
     best_seen_score = float("-inf")
     since_improvement = 0
     early_stopped = False
+    stopped_by_user = False
+
+    def should_stop() -> bool:
+        try:
+            return bool(stop_requested and stop_requested())
+        except Exception:
+            return False
 
     def register_candidate(candidate: OptimizationCandidate) -> None:
-        nonlocal done, best_seen_score, since_improvement, early_stopped
+        nonlocal done, best_seen_score, since_improvement, early_stopped, stopped_by_user
         evaluated.append(candidate)
         done += 1
         if progress_callback:
-            progress_callback(done, total)
+            progress_callback(
+                done,
+                total,
+                _top_candidate_snapshots(evaluated, limit=5),
+                {
+                    **_candidate_progress_snapshot(candidate, rank=done),
+                    "highest_detection_candidate": _highest_detection_candidate_snapshot(evaluated),
+                },
+            )
         if candidate.score > (best_seen_score + early_stop_min_improvement):
             best_seen_score = candidate.score
             since_improvement = 0
@@ -786,17 +1228,19 @@ def optimize_tracking(
             since_improvement += 1
         if early_stop_enabled and since_improvement >= early_stop_patience:
             early_stopped = True
+        if should_stop():
+            stopped_by_user = True
 
     if resolved_workers == 1:
         for params in param_grid:
             candidate = _evaluate_candidate(params, sampled_frames, normalized_dictionary, expected_tags)
             register_candidate(candidate)
-            if early_stopped:
+            if early_stopped or stopped_by_user:
                 break
     else:
         cursor = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=resolved_workers) as executor:
-            while cursor < total and not early_stopped:
+            while cursor < total and not early_stopped and not stopped_by_user:
                 batch = param_grid[cursor : cursor + resolved_workers]
                 futures = [
                     executor.submit(
@@ -810,7 +1254,14 @@ def optimize_tracking(
                 ]
                 for future in concurrent.futures.as_completed(futures):
                     register_candidate(future.result())
+                    if stopped_by_user:
+                        for pending in futures:
+                            pending.cancel()
+                        break
                 cursor += len(batch)
+
+    if not evaluated:
+        raise RuntimeError("Optimization stopped before any parameter combinations completed.")
 
     evaluated.sort(
         key=lambda item: (item.score, item.mean_detected, -item.mean_rejected, item.eval_fps),
@@ -820,9 +1271,19 @@ def optimize_tracking(
         item.rank = rank
 
     best = evaluated[0]
+    highest_detection_candidate = max(
+        evaluated,
+        key=lambda item: (
+            item.mean_detected,
+            item.score,
+            -item.mean_rejected,
+            item.stability,
+            item.eval_fps,
+        ),
+    )
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = (
-        Path(output_dir).expanduser().resolve()
+        _resolve_user_path(output_dir)
         if output_dir
         else _default_output_root(resolved_input).resolve()
     )
@@ -848,7 +1309,8 @@ def optimize_tracking(
         candidates=evaluated,
         output_dir=run_dir,
         max_candidates=5,
-        max_frames=12,
+        max_frames=24,
+        extra_candidates=[("Highest mean detections overall", highest_detection_candidate)],
     )
 
     top_candidates = evaluated[: max(top_k, 1)]
@@ -859,14 +1321,17 @@ def optimize_tracking(
         dictionary=normalized_dictionary,
         tag_size_mm=tag_size_mm,
         profile=profile_key,
+        parameter_source=parameter_source,
         execution_target=target_key,
         workers=resolved_workers,
         sample_frames_requested=sample_frames,
         sample_frames_used=len(sampled_frames),
+        parameter_combinations_total=total,
         combinations_evaluated=len(evaluated),
         early_stop_patience=early_stop_patience,
         early_stop_min_improvement=early_stop_min_improvement,
         early_stopped=early_stopped,
+        stopped_by_user=stopped_by_user,
         sweep_overrides={
             key: list(values)
             for key, values in (sweep_overrides or {}).items()
@@ -881,17 +1346,169 @@ def optimize_tracking(
         best_params=best.params,
         best_score=best.score,
         best_mean_detected=best.mean_detected,
+        highest_detection_candidate=highest_detection_candidate,
         top_candidates=top_candidates,
     )
 
     summary = result.to_dict()
     summary["total_input_frames"] = total_input_frames
     summary["all_candidates_count"] = len(evaluated)
+    summary["parameter_combinations_total"] = total
     summary["all_candidates_csv"] = str(csv_path)
 
     with Path(result.summary_json_path).open("w") as f:
         json.dump(summary, f, indent=2)
 
+    return result
+
+
+def optimize_tracking_iterative_refinement(
+    *,
+    input_path: str | Path,
+    seed_params: Sequence[dict[str, Any]],
+    rounds: int = 2,
+    seed_candidate_count: int = 5,
+    sample_frames: int = 80,
+    validation_sample_frames: Optional[int] = None,
+    profile: str = DEFAULT_PROFILE,
+    dictionary_name: str = DEFAULT_DICTIONARY,
+    tag_size_mm: float = DEFAULT_TAG_SIZE_MM,
+    execution_target: str = DEFAULT_EXECUTION_TARGET,
+    workers: Optional[int] = None,
+    expected_tags: Optional[float] = None,
+    output_dir: Optional[str | Path] = None,
+    write_preview: bool = False,
+    preview_frames: int = 240,
+    top_k: int = 10,
+    progress_callback: Optional[ProgressCallback] = None,
+    stop_requested: Optional[StopRequestedCallback] = None,
+) -> IterativeTrackingRefinementResult:
+    if rounds <= 0:
+        raise ValueError("rounds must be >= 1")
+    if seed_candidate_count <= 0:
+        raise ValueError("seed_candidate_count must be >= 1")
+    if sample_frames <= 0:
+        raise ValueError("sample_frames must be >= 1")
+
+    normalized_seed_params = normalize_candidate_param_grid(seed_params)[:seed_candidate_count]
+    if not normalized_seed_params:
+        raise ValueError("At least one valid seed candidate is required.")
+
+    validation_frames = (
+        int(validation_sample_frames)
+        if validation_sample_frames is not None
+        else max(sample_frames, sample_frames * 2)
+    )
+    if validation_frames <= 0:
+        raise ValueError("validation_sample_frames must be >= 1")
+
+    resolved_input = _resolve_user_path(input_path)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_root = (
+        _resolve_user_path(output_dir)
+        if output_dir
+        else _default_output_root(resolved_input).resolve()
+    )
+    run_root = output_root / f"iterative_tracking_refinement_{timestamp}"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    round_results: list[TrackingOptimizationResult] = []
+    current_seeds = normalized_seed_params
+
+    def stage_callback(stage: str) -> Optional[ProgressCallback]:
+        if progress_callback is None:
+            return None
+
+        def callback(
+            done: int,
+            total: int,
+            top_candidates: list[ProgressCandidateSnapshot],
+            latest_candidate: ProgressCandidateSnapshot,
+        ) -> None:
+            latest = dict(latest_candidate)
+            latest["stage"] = stage
+            progress_callback(done, total, top_candidates, latest)
+
+        return callback
+
+    for round_index in range(1, rounds + 1):
+        grid = build_refinement_parameter_grid(current_seeds, round_index=round_index)
+        result = optimize_tracking(
+            input_path=resolved_input,
+            profile=profile,
+            sample_frames=sample_frames,
+            dictionary_name=dictionary_name,
+            tag_size_mm=tag_size_mm,
+            candidate_param_grid=grid,
+            execution_target=execution_target,
+            workers=workers,
+            expected_tags=expected_tags,
+            early_stop_patience=0,
+            early_stop_min_improvement=0.0,
+            output_dir=run_root / f"round_{round_index:02d}",
+            write_preview=False,
+            preview_frames=preview_frames,
+            top_k=max(top_k, seed_candidate_count),
+            progress_callback=stage_callback(f"Refinement round {round_index}/{rounds}"),
+            stop_requested=stop_requested,
+        )
+        round_results.append(result)
+        current_seeds = [
+            dict(candidate.params)
+            for candidate in result.top_candidates[:seed_candidate_count]
+        ]
+        if result.stopped_by_user:
+            break
+
+    if not round_results:
+        raise RuntimeError("Iterative refinement ended before any round completed.")
+
+    validation_result: Optional[TrackingOptimizationResult] = None
+    final_result = round_results[-1]
+    stopped_by_user = any(result.stopped_by_user for result in round_results)
+
+    if not stopped_by_user:
+        validation_grid = normalize_candidate_param_grid(current_seeds)
+        validation_result = optimize_tracking(
+            input_path=resolved_input,
+            profile=profile,
+            sample_frames=validation_frames,
+            dictionary_name=dictionary_name,
+            tag_size_mm=tag_size_mm,
+            candidate_param_grid=validation_grid,
+            execution_target=execution_target,
+            workers=workers,
+            expected_tags=expected_tags,
+            early_stop_patience=0,
+            early_stop_min_improvement=0.0,
+            output_dir=run_root / "validation",
+            write_preview=write_preview,
+            preview_frames=preview_frames,
+            top_k=max(top_k, seed_candidate_count),
+            progress_callback=stage_callback("Validation pass"),
+            stop_requested=stop_requested,
+        )
+        final_result = validation_result
+        stopped_by_user = validation_result.stopped_by_user
+
+    summary_json_path = run_root / "iterative_refinement_summary.json"
+    result = IterativeTrackingRefinementResult(
+        created_at=datetime.now().isoformat(timespec="seconds"),
+        input_path=str(resolved_input),
+        output_dir=str(run_root),
+        rounds_requested=rounds,
+        rounds_completed=len(round_results),
+        seed_candidate_count=len(normalized_seed_params),
+        sample_frames=sample_frames,
+        validation_sample_frames=validation_frames,
+        summary_json_path=str(summary_json_path),
+        round_results=round_results,
+        validation_result=validation_result,
+        final_result=final_result,
+        stopped_by_user=stopped_by_user,
+    )
+    with summary_json_path.open("w") as f:
+        json.dump(result.to_dict(), f, indent=2)
     return result
 
 
@@ -904,10 +1521,11 @@ def format_optimization_report(result: TrackingOptimizationResult, top_k: int = 
         f"Dictionary: {result.dictionary}",
         f"Tag size: {result.tag_size_mm:.3f} mm",
         f"Profile: {result.profile}",
+        f"Parameter source: {result.parameter_source}",
         f"Execution target: {result.execution_target}",
         f"Workers used: {result.workers}",
         f"Sample frames: {result.sample_frames_used}/{result.sample_frames_requested}",
-        f"Parameter sets evaluated: {result.combinations_evaluated}",
+        f"Parameter sets evaluated: {result.combinations_evaluated}/{result.parameter_combinations_total}",
         (
             "Early stop: disabled"
             if result.early_stop_patience <= 0
@@ -917,12 +1535,33 @@ def format_optimization_report(result: TrackingOptimizationResult, top_k: int = 
             )
         ),
         (
-            "Sweep overrides: none"
+            "Completion reason: early stop ended the sweep before testing every combination"
+            if result.early_stopped
+            else (
+                "Completion reason: user ended optimization early"
+                if result.stopped_by_user
+                else "Completion reason: all parameter combinations were evaluated"
+            )
+        ),
+        f"Stopped by user: {'yes' if result.stopped_by_user else 'no'}",
+        (
+            "Sweep overrides: not used for explicit candidate grid"
+            if result.parameter_source == "explicit candidate grid"
+            else "Sweep overrides: none"
             if not result.sweep_overrides
             else f"Sweep overrides: {json.dumps(result.sweep_overrides, sort_keys=True)}"
         ),
         f"Best score: {result.best_score:.4f}",
         f"Best mean detections/frame: {result.best_mean_detected:.3f}",
+        (
+            "Highest mean detections overall: "
+            f"rank={result.highest_detection_candidate.rank}, "
+            f"detected={result.highest_detection_candidate.mean_detected:.3f}, "
+            f"score={result.highest_detection_candidate.score:.4f}, "
+            f"rejected={result.highest_detection_candidate.mean_rejected:.3f}, "
+            f"stability={result.highest_detection_candidate.stability:.3f}"
+        ),
+        f"Highest-detection params: {json.dumps(result.highest_detection_candidate.params, sort_keys=True)}",
         f"Best params: {json.dumps(result.best_params, sort_keys=True)}",
         f"Output dir: {result.output_dir}",
         f"Summary JSON: {result.summary_json_path}",
@@ -943,6 +1582,51 @@ def format_optimization_report(result: TrackingOptimizationResult, top_k: int = 
                 f"fps={candidate.eval_fps:.2f}, params={json.dumps(candidate.params, sort_keys=True)}"
             )
         )
+    return "\n".join(lines)
+
+
+def format_iterative_refinement_report(result: IterativeTrackingRefinementResult) -> str:
+    lines = [
+        "Iterative Refinement Report",
+        "---------------------------",
+        f"Created: {result.created_at}",
+        f"Input: {result.input_path}",
+        f"Output dir: {result.output_dir}",
+        f"Seed candidates: {result.seed_candidate_count}",
+        f"Refinement rounds completed: {result.rounds_completed}/{result.rounds_requested}",
+        f"Sample frames per refinement round: {result.sample_frames}",
+        f"Validation sample frames: {result.validation_sample_frames}",
+        f"Stopped by user: {'yes' if result.stopped_by_user else 'no'}",
+        f"Summary JSON: {result.summary_json_path}",
+        "",
+        "Round outputs:",
+    ]
+    for index, round_result in enumerate(result.round_results, start=1):
+        lines.append(
+            (
+                f"- Round {index}: evaluated "
+                f"{round_result.combinations_evaluated}/{round_result.parameter_combinations_total}, "
+                f"best score={round_result.best_score:.4f}, "
+                f"dir={round_result.output_dir}"
+            )
+        )
+    if result.validation_result:
+        lines.append(
+            (
+                "- Validation: evaluated "
+                f"{result.validation_result.combinations_evaluated}/"
+                f"{result.validation_result.parameter_combinations_total}, "
+                f"best score={result.validation_result.best_score:.4f}, "
+                f"dir={result.validation_result.output_dir}"
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "Final selected candidate source:",
+            f"- {result.final_result.output_dir}",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -995,6 +1679,11 @@ def legacy_entrypoint(argv: Optional[Sequence[str]] = None) -> int:
         "--sweep-min-marker-perimeter-rate",
         default="",
         help="Optional comma-separated minMarkerPerimeterRate override values.",
+    )
+    parser.add_argument(
+        "--sweep-max-marker-perimeter-rate",
+        default="",
+        help="Optional comma-separated maxMarkerPerimeterRate override values.",
     )
     parser.add_argument(
         "--sweep-adaptive-thresh-win-size-min",
@@ -1050,6 +1739,14 @@ def legacy_entrypoint(argv: Optional[Sequence[str]] = None) -> int:
         )
         if min_perimeter:
             sweep_overrides["minMarkerPerimeterRate"] = min_perimeter
+
+        max_perimeter = _parse_csv_values(
+            args.sweep_max_marker_perimeter_rate,
+            "--sweep-max-marker-perimeter-rate",
+            "float",
+        )
+        if max_perimeter:
+            sweep_overrides["maxMarkerPerimeterRate"] = max_perimeter
 
         win_min = _parse_csv_values(
             args.sweep_adaptive_thresh_win_size_min,
