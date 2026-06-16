@@ -33,6 +33,7 @@ SCORE_EXPECTED_ERROR_WEIGHT = 0.10
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mjpeg", ".avi", ".mov", ".mkv"}
+GENERATED_OPTIMIZER_DIR_NAMES = {"tracking_optimization", "top_candidate_review"}
 VALID_PROFILES = {"quick", "balanced", "deep"}
 VALID_EXECUTION_TARGETS = {"pi_safe", "desktop"}
 
@@ -593,11 +594,27 @@ def _classify_input_path(path: Path) -> str:
     raise FileNotFoundError(f"Input path does not exist: {path}")
 
 
+def _is_generated_optimizer_artifact_path(path: Path, *, root: Path) -> bool:
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = path.parts
+    root_name = root.name
+    return any(
+        part in GENERATED_OPTIMIZER_DIR_NAMES
+        or part.startswith("optimize_tracking_")
+        or part.startswith("iterative_tracking_refinement_")
+        for part in (root_name, *parts)
+    )
+
+
 def find_supported_image_paths(image_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in image_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_EXTENSIONS
+        and not _is_generated_optimizer_artifact_path(path, root=image_dir)
     )
 
 

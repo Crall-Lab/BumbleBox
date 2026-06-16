@@ -3866,7 +3866,8 @@ class BumbleBoxV2GUI(tk.Tk):
             help_title="Optimization Input",
             help_details=(
                 "Path to a representative video or image folder used to test ArUco parameter sweeps. "
-                "Image folders are searched recursively, so you can point this at a day/colony folder containing PNG frames."
+                "Image folders are searched recursively, so you can point this at a day/colony folder containing PNG frames. "
+                "Generated optimizer output folders are skipped to avoid re-optimizing annotated review images."
             ),
         )
         input_frame = ttk.Frame(top)
