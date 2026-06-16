@@ -4,6 +4,7 @@ import concurrent.futures
 import csv
 import itertools
 import json
+import math
 import os
 import statistics
 import time
@@ -23,6 +24,12 @@ DEFAULT_TAG_SIZE_MM = 2.5
 DEFAULT_EARLY_STOP_PATIENCE = 0
 DEFAULT_EARLY_STOP_MIN_IMPROVEMENT = 0.0
 DEFAULT_MAX_MARKER_PERIMETER_RATE = 4.0
+SCORE_DETECTION_WEIGHT = 1.0
+SCORE_STABILITY_WEIGHT = 0.10
+SCORE_FPS_WEIGHT = 0.10
+SCORE_REJECTED_WEIGHT = 0.005
+SCORE_STD_DETECTED_WEIGHT = 0.01
+SCORE_EXPECTED_ERROR_WEIGHT = 0.10
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mjpeg", ".avi", ".mov", ".mkv"}
@@ -130,11 +137,13 @@ class TrackingOptimizationResult:
     best_score: float
     best_mean_detected: float
     highest_detection_candidate: OptimizationCandidate
+    top_detection_candidates: list[OptimizationCandidate]
     top_candidates: list[OptimizationCandidate]
 
     def to_dict(self) -> dict:
         payload = asdict(self)
         payload["highest_detection_candidate"] = asdict(self.highest_detection_candidate)
+        payload["top_detection_candidates"] = [asdict(item) for item in self.top_detection_candidates]
         payload["top_candidates"] = [asdict(item) for item in self.top_candidates]
         return payload
 
@@ -518,14 +527,8 @@ def suggest_min_marker_perimeter_rates_from_measurement(perimeter_rate: float) -
     if measured <= 0:
         raise ValueError("perimeter_rate must be > 0")
     # Measured tags should be the smallest real tags users care about detecting.
-    # Keep suggestions below that measured size so the initial pass does not filter them out.
-    multipliers = (0.30, 0.45, 0.60, 0.75, 0.90)
-    return sorted(
-        {
-            round(min(0.08, max(0.0005, measured * multiplier)), 6)
-            for multiplier in multipliers
-        }
-    )
+    # Keep the guard just below that measured size without sweeping much smaller false positives.
+    return [round(min(0.08, max(0.0005, measured * 0.90)), 6)]
 
 
 def suggest_marker_perimeter_rate_sweeps_from_measurements(
@@ -540,12 +543,7 @@ def suggest_marker_perimeter_rate_sweeps_from_measurements(
         smallest, largest = largest, smallest
 
     min_values = suggest_min_marker_perimeter_rates_from_measurement(smallest)
-    max_values = sorted(
-        {
-            round(min(DEFAULT_MAX_MARKER_PERIMETER_RATE, max(0.001, largest * multiplier)), 6)
-            for multiplier in (1.10, 1.30, 1.60, 2.00)
-        }
-    )
+    max_values = [round(min(DEFAULT_MAX_MARKER_PERIMETER_RATE, max(0.001, largest * 1.10)), 6)]
     max_values = [value for value in max_values if value > min_values[-1]]
     if not max_values:
         max_values = [round(min(DEFAULT_MAX_MARKER_PERIMETER_RATE, max(min_values[-1] * 1.5, largest * 1.25)), 6)]
@@ -593,6 +591,14 @@ def _classify_input_path(path: Path) -> str:
     if path.is_dir():
         return "image_dir"
     raise FileNotFoundError(f"Input path does not exist: {path}")
+
+
+def find_supported_image_paths(image_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in image_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
 
 def _sample_indices(total_count: int, sample_count: int) -> list[int]:
@@ -654,11 +660,9 @@ def _load_sample_frames_from_video(video_path: Path, sample_count: int) -> tuple
 
 
 def _load_sample_frames_from_image_dir(image_dir: Path, sample_count: int) -> tuple[list, int, list[int]]:
-    all_images = sorted(
-        path for path in image_dir.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-    )
+    all_images = find_supported_image_paths(image_dir)
     if not all_images:
-        raise RuntimeError(f"No supported image files found in directory: {image_dir}")
+        raise RuntimeError(f"No supported image files found recursively in directory: {image_dir}")
 
     indices = _sample_indices(len(all_images), sample_count)
     frames = []
@@ -698,14 +702,14 @@ def _score_candidate(
     eval_fps: float,
     expected_tags: Optional[float],
 ) -> float:
-    score = mean_detected
-    score += 0.35 * stability
-    score += 0.10 * min(eval_fps, 90.0) / 90.0
-    score -= 0.08 * mean_rejected
-    score -= 0.05 * std_detected
+    score = SCORE_DETECTION_WEIGHT * mean_detected
+    score += SCORE_STABILITY_WEIGHT * stability
+    score += SCORE_FPS_WEIGHT * min(eval_fps, 90.0) / 90.0
+    score -= SCORE_REJECTED_WEIGHT * mean_rejected
+    score -= SCORE_STD_DETECTED_WEIGHT * std_detected
     if expected_tags is not None and expected_tags > 0:
         expected_error = abs(mean_detected - expected_tags) / expected_tags
-        score -= 0.40 * expected_error
+        score -= SCORE_EXPECTED_ERROR_WEIGHT * expected_error
     return score
 
 
@@ -851,11 +855,23 @@ def _top_candidate_snapshots(
     return snapshots
 
 
-def _highest_detection_candidate_snapshot(
+def _score_rank_lookup(candidates: Sequence[OptimizationCandidate]) -> dict[int, int]:
+    ranked_by_score = sorted(
+        candidates,
+        key=lambda item: (item.score, item.mean_detected, -item.mean_rejected, item.eval_fps),
+        reverse=True,
+    )
+    return {id(candidate): rank for rank, candidate in enumerate(ranked_by_score, start=1)}
+
+
+def _top_detection_candidates(
     candidates: Sequence[OptimizationCandidate],
-) -> Optional[ProgressCandidateSnapshot]:
+    *,
+    limit: int = 5,
+) -> list[OptimizationCandidate]:
     if not candidates:
-        return None
+        return []
+    # Detection ties are resolved by score, fewer rejected candidates, stability, then speed.
     ranked = sorted(
         candidates,
         key=lambda item: (
@@ -867,13 +883,28 @@ def _highest_detection_candidate_snapshot(
         ),
         reverse=True,
     )
-    best = ranked[0]
-    rank_by_score = sorted(
-        candidates,
-        key=lambda item: (item.score, item.mean_detected, -item.mean_rejected, item.eval_fps),
-        reverse=True,
-    ).index(best) + 1
-    return _candidate_progress_snapshot(best, rank=rank_by_score)
+    return ranked[: max(1, limit)]
+
+
+def _top_detection_candidate_snapshots(
+    candidates: Sequence[OptimizationCandidate],
+) -> list[ProgressCandidateSnapshot]:
+    if not candidates:
+        return []
+    score_ranks = _score_rank_lookup(candidates)
+    snapshots = []
+    for detection_rank, candidate in enumerate(_top_detection_candidates(candidates, limit=5), start=1):
+        snapshot = _candidate_progress_snapshot(candidate, rank=score_ranks.get(id(candidate), 0))
+        snapshot["detection_rank"] = detection_rank
+        snapshots.append(snapshot)
+    return snapshots
+
+
+def _highest_detection_candidate_snapshot(
+    candidates: Sequence[OptimizationCandidate],
+) -> Optional[ProgressCandidateSnapshot]:
+    snapshots = _top_detection_candidate_snapshots(candidates)
+    return snapshots[0] if snapshots else None
 
 
 def _candidate_progress_snapshot(
@@ -909,13 +940,63 @@ def _iter_input_frames(input_path: Path):
         cap.release()
         return
 
-    image_paths = sorted(
-        path for path in input_path.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-    )
+    image_paths = find_supported_image_paths(input_path)
     for path in image_paths:
         frame = cv2.imread(str(path))
         if frame is not None:
             yield frame, 6.0
+
+
+def _corner_perimeter_rate(corner: Any, *, frame_width: int, frame_height: int) -> float:
+    points = corner.reshape(-1, 2)
+    if len(points) < 4:
+        return 0.0
+    perimeter = 0.0
+    for idx in range(4):
+        x1, y1 = points[idx]
+        x2, y2 = points[(idx + 1) % 4]
+        perimeter += math.hypot(float(x2) - float(x1), float(y2) - float(y1))
+    return perimeter / float(max(1, max(frame_width, frame_height)))
+
+
+def _draw_perimeter_flag(
+    frame_bgr: Any,
+    corner: Any,
+    *,
+    marker_id: int,
+    perimeter_rate: float,
+    label: str,
+    color: tuple[int, int, int],
+) -> None:
+    points = corner.reshape(-1, 2).astype("int32")
+    if len(points) < 4:
+        return
+    cv2.polylines(frame_bgr, [points], True, color, 5, cv2.LINE_AA)
+    center_x = int(round(float(points[:, 0].mean())))
+    center_y = int(round(float(points[:, 1].mean())))
+    cv2.circle(frame_bgr, (center_x, center_y), 8, color, -1, cv2.LINE_AA)
+    text = f"{marker_id} {label} {perimeter_rate:.4f}"
+    text_origin = (int(points[:, 0].min()), max(18, int(points[:, 1].min()) - 8))
+    cv2.putText(
+        frame_bgr,
+        text,
+        text_origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 0, 0),
+        4,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame_bgr,
+        text,
+        text_origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def write_preview_video(
@@ -970,18 +1051,58 @@ def _annotate_review_frame(
     *,
     sample_position: int,
     source_index: int,
-) -> tuple[Any, int, int]:
+    perimeter_flag_bounds: Optional[tuple[float, float]] = None,
+) -> tuple[Any, int, int, int, int]:
     corners, ids, rejected = detector.detectMarkers(frame_gray)
     detected_count = 0 if ids is None else int(len(ids))
     rejected_count = 0 if rejected is None else int(len(rejected))
+    below_min_count = 0
+    above_max_count = 0
 
     annotated = cv2.cvtColor(frame_gray, cv2.COLOR_GRAY2BGR)
     if ids is not None and len(ids) > 0:
         cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
+        frame_height, frame_width = frame_gray.shape[:2]
+        if perimeter_flag_bounds is not None:
+            min_rate, max_rate = perimeter_flag_bounds
+        else:
+            min_rate = float(candidate.params.get("minMarkerPerimeterRate", 0.0) or 0.0)
+            max_rate = float(
+                candidate.params.get("maxMarkerPerimeterRate", DEFAULT_MAX_MARKER_PERIMETER_RATE)
+                or DEFAULT_MAX_MARKER_PERIMETER_RATE
+            )
+        for corner, marker_id_raw in zip(corners, ids.flatten().tolist()):
+            perimeter_rate = _corner_perimeter_rate(
+                corner,
+                frame_width=frame_width,
+                frame_height=frame_height,
+            )
+            marker_id = int(marker_id_raw)
+            if min_rate > 0 and perimeter_rate < min_rate:
+                below_min_count += 1
+                _draw_perimeter_flag(
+                    annotated,
+                    corner,
+                    marker_id=marker_id,
+                    perimeter_rate=perimeter_rate,
+                    label="small",
+                    color=(255, 0, 255),
+                )
+            elif max_rate > 0 and perimeter_rate > max_rate:
+                above_max_count += 1
+                _draw_perimeter_flag(
+                    annotated,
+                    corner,
+                    marker_id=marker_id,
+                    perimeter_rate=perimeter_rate,
+                    label="large",
+                    color=(255, 255, 0),
+                )
 
     overlay_lines = [
         f"Candidate #{candidate.rank}  score={candidate.score:.3f}",
         f"sample={sample_position} source={source_index} detected={detected_count} rejected={rejected_count}",
+        f"perimeter flags: magenta small={below_min_count}  cyan large={above_max_count}",
     ]
     for idx, line in enumerate(overlay_lines):
         y = 34 + (idx * 34)
@@ -1005,7 +1126,7 @@ def _annotate_review_frame(
             2,
             cv2.LINE_AA,
         )
-    return annotated, detected_count, rejected_count
+    return annotated, detected_count, rejected_count, below_min_count, above_max_count
 
 
 def _resize_review_image(frame_bgr: Any, *, max_width: int = 1280, max_height: int = 900) -> Any:
@@ -1028,6 +1149,7 @@ def write_top_candidate_review_artifacts(
     max_candidates: int = 5,
     max_frames: int = 12,
     extra_candidates: Optional[Sequence[tuple[str, OptimizationCandidate]]] = None,
+    perimeter_flag_bounds: Optional[tuple[float, float]] = None,
 ) -> Optional[Path]:
     if not sampled_frames or not candidates:
         return None
@@ -1061,6 +1183,17 @@ def write_top_candidate_review_artifacts(
     manifest: dict[str, object] = {
         "candidate_count": len(selected_candidates),
         "frame_count": len(selected_frame_positions),
+        "perimeter_flag_bounds": (
+            {
+                "min_perimeter_rate": perimeter_flag_bounds[0],
+                "max_perimeter_rate": perimeter_flag_bounds[1],
+                "source": "measured_tag_bounds",
+            }
+            if perimeter_flag_bounds is not None
+            else {
+                "source": "candidate_min_max_marker_perimeter_rate",
+            }
+        ),
         "candidates": [],
     }
 
@@ -1075,19 +1208,30 @@ def write_top_candidate_review_artifacts(
         candidate_dir.mkdir(parents=True, exist_ok=True)
 
         frame_entries = []
+        total_below_min_count = 0
+        total_above_max_count = 0
         for review_frame_idx, sample_position in enumerate(selected_frame_positions, start=1):
             source_index = (
                 int(sample_indices[sample_position])
                 if sample_position < len(sample_indices)
                 else int(sample_position)
             )
-            annotated, detected_count, rejected_count = _annotate_review_frame(
+            (
+                annotated,
+                detected_count,
+                rejected_count,
+                below_min_count,
+                above_max_count,
+            ) = _annotate_review_frame(
                 sampled_frames[sample_position],
                 detector,
                 candidate,
                 sample_position=sample_position,
                 source_index=source_index,
+                perimeter_flag_bounds=perimeter_flag_bounds,
             )
+            total_below_min_count += below_min_count
+            total_above_max_count += above_max_count
             preview_frame = _resize_review_image(annotated)
             output_path = candidate_dir / f"frame_{review_frame_idx:03d}.png"
             if not cv2.imwrite(str(output_path), preview_frame):
@@ -1099,6 +1243,8 @@ def write_top_candidate_review_artifacts(
                     "source_index": source_index,
                     "detected_count": detected_count,
                     "rejected_count": rejected_count,
+                    "below_min_perimeter_count": below_min_count,
+                    "above_max_perimeter_count": above_max_count,
                     "path": str(output_path),
                 }
             )
@@ -1116,6 +1262,8 @@ def write_top_candidate_review_artifacts(
                 "eval_fps": candidate.eval_fps,
                 "runtime_seconds": candidate.runtime_seconds,
                 "average_frame_ms": ((candidate.runtime_seconds / len(sampled_frames)) * 1000.0),
+                "below_min_perimeter_count": total_below_min_count,
+                "above_max_perimeter_count": total_above_max_count,
                 "params": candidate.params,
                 "frames": frame_entries,
             }
@@ -1144,6 +1292,7 @@ def optimize_tracking(
     write_preview: bool = False,
     preview_frames: int = 240,
     top_k: int = 10,
+    review_perimeter_bounds: Optional[tuple[float, float]] = None,
     progress_callback: Optional[ProgressCallback] = None,
     stop_requested: Optional[StopRequestedCallback] = None,
 ) -> TrackingOptimizationResult:
@@ -1170,6 +1319,12 @@ def optimize_tracking(
         raise ValueError("early_stop_patience must be >= 0")
     if early_stop_min_improvement < 0:
         raise ValueError("early_stop_min_improvement must be >= 0")
+    if review_perimeter_bounds is not None:
+        min_review_rate, max_review_rate = review_perimeter_bounds
+        if min_review_rate <= 0 or max_review_rate <= 0:
+            raise ValueError("review_perimeter_bounds values must be > 0")
+        if max_review_rate <= min_review_rate:
+            raise ValueError("review_perimeter_bounds max must be greater than min")
 
     normalized_dictionary = normalize_dictionary_name(dictionary_name)
     resolved_input = _resolve_user_path(input_path)
@@ -1219,6 +1374,7 @@ def optimize_tracking(
                 {
                     **_candidate_progress_snapshot(candidate, rank=done),
                     "highest_detection_candidate": _highest_detection_candidate_snapshot(evaluated),
+                    "top_detection_candidates": _top_detection_candidate_snapshots(evaluated),
                 },
             )
         if candidate.score > (best_seen_score + early_stop_min_improvement):
@@ -1271,16 +1427,8 @@ def optimize_tracking(
         item.rank = rank
 
     best = evaluated[0]
-    highest_detection_candidate = max(
-        evaluated,
-        key=lambda item: (
-            item.mean_detected,
-            item.score,
-            -item.mean_rejected,
-            item.stability,
-            item.eval_fps,
-        ),
-    )
+    top_detection_candidates = _top_detection_candidates(evaluated, limit=5)
+    highest_detection_candidate = top_detection_candidates[0]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = (
         _resolve_user_path(output_dir)
@@ -1310,7 +1458,11 @@ def optimize_tracking(
         output_dir=run_dir,
         max_candidates=5,
         max_frames=24,
-        extra_candidates=[("Highest mean detections overall", highest_detection_candidate)],
+        extra_candidates=[
+            (f"Top mean detections #{idx}", candidate)
+            for idx, candidate in enumerate(top_detection_candidates, start=1)
+        ],
+        perimeter_flag_bounds=review_perimeter_bounds,
     )
 
     top_candidates = evaluated[: max(top_k, 1)]
@@ -1347,6 +1499,7 @@ def optimize_tracking(
         best_score=best.score,
         best_mean_detected=best.mean_detected,
         highest_detection_candidate=highest_detection_candidate,
+        top_detection_candidates=top_detection_candidates,
         top_candidates=top_candidates,
     )
 
@@ -1355,6 +1508,15 @@ def optimize_tracking(
     summary["all_candidates_count"] = len(evaluated)
     summary["parameter_combinations_total"] = total
     summary["all_candidates_csv"] = str(csv_path)
+    summary["review_perimeter_bounds"] = (
+        {
+            "min_perimeter_rate": review_perimeter_bounds[0],
+            "max_perimeter_rate": review_perimeter_bounds[1],
+            "source": "measured_tag_bounds",
+        }
+        if review_perimeter_bounds is not None
+        else None
+    )
 
     with Path(result.summary_json_path).open("w") as f:
         json.dump(summary, f, indent=2)
@@ -1380,6 +1542,7 @@ def optimize_tracking_iterative_refinement(
     write_preview: bool = False,
     preview_frames: int = 240,
     top_k: int = 10,
+    review_perimeter_bounds: Optional[tuple[float, float]] = None,
     progress_callback: Optional[ProgressCallback] = None,
     stop_requested: Optional[StopRequestedCallback] = None,
 ) -> IterativeTrackingRefinementResult:
@@ -1449,6 +1612,7 @@ def optimize_tracking_iterative_refinement(
             write_preview=False,
             preview_frames=preview_frames,
             top_k=max(top_k, seed_candidate_count),
+            review_perimeter_bounds=review_perimeter_bounds,
             progress_callback=stage_callback(f"Refinement round {round_index}/{rounds}"),
             stop_requested=stop_requested,
         )
@@ -1485,6 +1649,7 @@ def optimize_tracking_iterative_refinement(
             write_preview=write_preview,
             preview_frames=preview_frames,
             top_k=max(top_k, seed_candidate_count),
+            review_perimeter_bounds=review_perimeter_bounds,
             progress_callback=stage_callback("Validation pass"),
             stop_requested=stop_requested,
         )
@@ -1527,6 +1692,15 @@ def format_optimization_report(result: TrackingOptimizationResult, top_k: int = 
         f"Sample frames: {result.sample_frames_used}/{result.sample_frames_requested}",
         f"Parameter sets evaluated: {result.combinations_evaluated}/{result.parameter_combinations_total}",
         (
+            "Score weights: "
+            f"detect=+{SCORE_DETECTION_WEIGHT:g}, "
+            f"stability=+{SCORE_STABILITY_WEIGHT:g}, "
+            f"fps=+{SCORE_FPS_WEIGHT:g}, "
+            f"rejected=-{SCORE_REJECTED_WEIGHT:g}, "
+            f"std_detected=-{SCORE_STD_DETECTED_WEIGHT:g}, "
+            f"expected_error=-{SCORE_EXPECTED_ERROR_WEIGHT:g}"
+        ),
+        (
             "Early stop: disabled"
             if result.early_stop_patience <= 0
             else (
@@ -1552,16 +1726,7 @@ def format_optimization_report(result: TrackingOptimizationResult, top_k: int = 
             else f"Sweep overrides: {json.dumps(result.sweep_overrides, sort_keys=True)}"
         ),
         f"Best score: {result.best_score:.4f}",
-        f"Best mean detections/frame: {result.best_mean_detected:.3f}",
-        (
-            "Highest mean detections overall: "
-            f"rank={result.highest_detection_candidate.rank}, "
-            f"detected={result.highest_detection_candidate.mean_detected:.3f}, "
-            f"score={result.highest_detection_candidate.score:.4f}, "
-            f"rejected={result.highest_detection_candidate.mean_rejected:.3f}, "
-            f"stability={result.highest_detection_candidate.stability:.3f}"
-        ),
-        f"Highest-detection params: {json.dumps(result.highest_detection_candidate.params, sort_keys=True)}",
+        f"Best-score candidate mean detections/frame: {result.best_mean_detected:.3f}",
         f"Best params: {json.dumps(result.best_params, sort_keys=True)}",
         f"Output dir: {result.output_dir}",
         f"Summary JSON: {result.summary_json_path}",
@@ -1573,13 +1738,24 @@ def format_optimization_report(result: TrackingOptimizationResult, top_k: int = 
         lines.append(f"Review manifest: {result.review_manifest_json_path}")
 
     lines.append("")
-    lines.append("Top candidates:")
+    lines.append("Top score candidates:")
     for candidate in result.top_candidates[: max(1, top_k)]:
         lines.append(
             (
                 f"{candidate.rank}. score={candidate.score:.4f}, detected={candidate.mean_detected:.3f}, "
                 f"rejected={candidate.mean_rejected:.3f}, stability={candidate.stability:.3f}, "
                 f"fps={candidate.eval_fps:.2f}, params={json.dumps(candidate.params, sort_keys=True)}"
+            )
+        )
+    lines.append("")
+    lines.append("Top mean-detection candidates:")
+    for detection_rank, candidate in enumerate(result.top_detection_candidates[:5], start=1):
+        lines.append(
+            (
+                f"{detection_rank}. score_rank={candidate.rank}, detected={candidate.mean_detected:.3f}, "
+                f"score={candidate.score:.4f}, rejected={candidate.mean_rejected:.3f}, "
+                f"stability={candidate.stability:.3f}, fps={candidate.eval_fps:.2f}, "
+                f"params={json.dumps(candidate.params, sort_keys=True)}"
             )
         )
     return "\n".join(lines)

@@ -3848,11 +3848,13 @@ class BumbleBoxV2GUI(tk.Tk):
         self.opt_top_k_var = tk.StringVar(value="5")
         self.opt_refinement_rounds_var = tk.StringVar(value="2")
         self.opt_refinement_seed_count_var = tk.StringVar(value="5")
+        self.opt_refinement_seed_source_var = tk.StringVar(value="mean_detection")
         self.opt_refinement_validation_multiplier_var = tk.StringVar(value="2")
         self._opt_sweep_profile_vars: dict[str, dict[str, tk.StringVar]] = {}
         self._opt_profile_notebook: ttk.Notebook | None = None
         self._opt_profile_tabs: dict[str, ttk.Frame] = {}
         self._opt_profile_syncing = False
+        self._opt_review_perimeter_bounds: dict[str, object] | None = None
         self.opt_status_var = tk.StringVar(value="Idle")
         self._optimize_top_k = 5
 
@@ -3862,7 +3864,10 @@ class BumbleBoxV2GUI(tk.Tk):
             column=0,
             text="Input path (video or image folder)",
             help_title="Optimization Input",
-            help_details="Path to representative video (or image folder) used to test ArUco parameter sweeps.",
+            help_details=(
+                "Path to a representative video or image folder used to test ArUco parameter sweeps. "
+                "Image folders are searched recursively, so you can point this at a day/colony folder containing PNG frames."
+            ),
         )
         input_frame = ttk.Frame(top)
         input_frame.grid(row=0, column=1, sticky="ew", padx=8, pady=4)
@@ -4083,6 +4088,14 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Entry(refinement_options, textvariable=self.opt_refinement_rounds_var, width=5).pack(side=tk.LEFT)
         ttk.Label(refinement_options, text="seed candidates").pack(side=tk.LEFT, padx=(10, 2))
         ttk.Entry(refinement_options, textvariable=self.opt_refinement_seed_count_var, width=5).pack(side=tk.LEFT)
+        ttk.Label(refinement_options, text="seed source").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Combobox(
+            refinement_options,
+            textvariable=self.opt_refinement_seed_source_var,
+            values=["mean_detection", "score"],
+            state="readonly",
+            width=15,
+        ).pack(side=tk.LEFT)
         ttk.Label(refinement_options, text="validation frame multiplier").pack(side=tk.LEFT, padx=(10, 2))
         ttk.Entry(refinement_options, textvariable=self.opt_refinement_validation_multiplier_var, width=5).pack(side=tk.LEFT)
         self._make_help_button(
@@ -4090,6 +4103,8 @@ class BumbleBoxV2GUI(tk.Tk):
             title="Iterative Refinement",
             details=(
                 "After a broad optimization run, this can refine around the current top candidates. "
+                "Use mean_detection to refine around the highest-detection candidates, or score to refine around "
+                "the objective-function winners. "
                 "Round 1 uses wider nearby values, later rounds use narrower values, and the final "
                 "validation pass re-scores finalists on more sampled frames."
             ),
@@ -4132,7 +4147,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self.optimize_run_btn.pack(side=tk.LEFT)
         self.optimize_refine_btn = ttk.Button(
             controls,
-            text="Run Iterative Refinement From Top 5",
+            text="Run Iterative Refinement From Selected Top 5",
             command=self._start_optimize_refinement,
             state=tk.DISABLED,
         )
@@ -4332,17 +4347,19 @@ class BumbleBoxV2GUI(tk.Tk):
     def _build_optimizer_measurement_frame_refs(self, input_path: str, *, max_frames: int = 25) -> list[dict[str, object]]:
         import cv2
 
-        from .tracking_optimizer import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, _resolve_user_path, _sample_indices
+        from .tracking_optimizer import (
+            IMAGE_EXTENSIONS,
+            VIDEO_EXTENSIONS,
+            find_supported_image_paths,
+            _resolve_user_path,
+            _sample_indices,
+        )
 
         resolved = _resolve_user_path(input_path)
         if resolved.is_dir():
-            image_paths = sorted(
-                path
-                for path in resolved.iterdir()
-                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-            )
+            image_paths = find_supported_image_paths(resolved)
             if not image_paths:
-                raise RuntimeError(f"No supported image files found in: {resolved}")
+                raise RuntimeError(f"No supported image files found recursively in: {resolved}")
             indices = _sample_indices(len(image_paths), min(max_frames, len(image_paths)))
             return [
                 {
@@ -4831,6 +4848,10 @@ class BumbleBoxV2GUI(tk.Tk):
             max_text = self._format_optimize_sweep_values(max_values)
             profile_vars["minMarkerPerimeterRate"].set(min_text)
             profile_vars["maxMarkerPerimeterRate"].set(max_text)
+            self._opt_review_perimeter_bounds = {
+                "profile": profile,
+                "bounds": (float(small_rate), float(large_rate)),
+            }
             self._select_optimize_profile_tab(profile)
             self.optimize_output.delete("1.0", tk.END)
             self.optimize_output.insert(
@@ -4862,6 +4883,24 @@ class BumbleBoxV2GUI(tk.Tk):
         apply_button.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(footer, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
         load_frame(0)
+
+    def _current_opt_review_perimeter_bounds(self, profile: str) -> tuple[float, float] | None:
+        entry = getattr(self, "_opt_review_perimeter_bounds", None)
+        if not isinstance(entry, dict):
+            return None
+        if str(entry.get("profile", "")).strip().lower() != str(profile).strip().lower():
+            return None
+        bounds = entry.get("bounds")
+        if not isinstance(bounds, tuple) or len(bounds) != 2:
+            return None
+        try:
+            low = float(bounds[0])
+            high = float(bounds[1])
+        except Exception:
+            return None
+        if low <= 0 or high <= low:
+            return None
+        return low, high
 
     def _start_optimize_tracking(self) -> None:
         if self._optimize_thread and self._optimize_thread.is_alive():
@@ -4968,6 +5007,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "write_preview": bool(self.opt_preview_var.get()),
             "preview_frames": preview_frames,
             "top_k": max(top_k, 10),
+            "review_perimeter_bounds": self._current_opt_review_perimeter_bounds(profile),
         }
         self.optimize_output.delete("1.0", tk.END)
         self.optimize_output.insert(
@@ -5077,12 +5117,21 @@ class BumbleBoxV2GUI(tk.Tk):
                 raise ValueError("top results must be >= 1")
 
             profile = self.opt_profile_var.get().strip().lower()
+            seed_source = self.opt_refinement_seed_source_var.get().strip().lower() or "mean_detection"
+            if seed_source not in {"mean_detection", "score"}:
+                raise ValueError("refinement seed source must be mean_detection or score")
+            if seed_source == "mean_detection":
+                source_candidates = list(getattr(self._optimize_result, "top_detection_candidates", []) or [])
+                source_label = "top mean-detection candidates"
+            else:
+                source_candidates = list(getattr(self._optimize_result, "top_candidates", []) or [])
+                source_label = "top score candidates"
             seed_params = [
                 dict(candidate.params)
-                for candidate in self._optimize_result.top_candidates[:seed_count]
+                for candidate in source_candidates[:seed_count]
             ]
             if not seed_params:
-                raise ValueError("The previous optimization result has no candidates to refine.")
+                raise ValueError(f"The previous optimization result has no {source_label} to refine.")
         except Exception as exc:
             self._show_error("Invalid refinement settings", str(exc))
             return
@@ -5121,6 +5170,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "write_preview": bool(self.opt_preview_var.get()),
             "preview_frames": preview_frames,
             "top_k": max(top_k, seed_count, 10),
+            "review_perimeter_bounds": self._current_opt_review_perimeter_bounds(profile),
         }
 
         self.optimize_output.delete("1.0", tk.END)
@@ -5128,11 +5178,12 @@ class BumbleBoxV2GUI(tk.Tk):
             tk.END,
             "Running iterative tracking refinement...\n"
             f"Seed candidates: {len(seed_params)}\n"
+            f"Seed source: {source_label}\n"
             f"Refinement rounds: {rounds}\n"
             f"Validation sample frames: {validation_sample_frames}\n"
             "Live round timing and top-five details will appear after the first candidate finishes.\n",
         )
-        self.opt_status_var.set("Running iterative refinement...")
+        self.opt_status_var.set(f"Running iterative refinement from {source_label}...")
         self.optimize_run_btn.config(state=tk.DISABLED)
         self.optimize_refine_btn.config(state=tk.DISABLED)
         self.optimize_stop_btn.config(state=tk.NORMAL)
@@ -5183,7 +5234,7 @@ class BumbleBoxV2GUI(tk.Tk):
             return
         confirmed = messagebox.askyesno(
             "Review optimization candidates",
-            "Do you want to review the top five score candidates and the highest-detection candidate?",
+            "Do you want to review the top five score candidates and the top five mean-detection candidates?",
             parent=self,
         )
         if confirmed:
@@ -5346,7 +5397,9 @@ class BumbleBoxV2GUI(tk.Tk):
                 f"sample index {frame_entry['sample_position']} | "
                 f"source index {frame_entry['source_index']} | "
                 f"detected {frame_entry['detected_count']} | "
-                f"rejected {frame_entry['rejected_count']}"
+                f"rejected {frame_entry['rejected_count']} | "
+                f"small flags {frame_entry.get('below_min_perimeter_count', 0)} | "
+                f"large flags {frame_entry.get('above_max_perimeter_count', 0)}"
             )
 
         def _update_candidate(*_args: object) -> None:
@@ -5362,6 +5415,8 @@ class BumbleBoxV2GUI(tk.Tk):
                 f"Stability: {candidate['stability']:.3f}\n"
                 f"Unique IDs: {candidate['unique_ids']}\n"
                 f"Review frames: {len(frames)}\n"
+                f"Small perimeter flags: {candidate.get('below_min_perimeter_count', 0)}\n"
+                f"Large perimeter flags: {candidate.get('above_max_perimeter_count', 0)}\n"
                 f"Average frame time: {avg_frame_ms:.2f} ms\n"
                 f"Eval FPS: {candidate['eval_fps']:.2f}"
             )
@@ -5456,6 +5511,13 @@ class BumbleBoxV2GUI(tk.Tk):
             if isinstance(latest_candidate, dict)
             else None
         )
+        top_detection_candidates = (
+            latest_candidate.get("top_detection_candidates")
+            if isinstance(latest_candidate, dict)
+            else None
+        )
+        if not isinstance(top_detection_candidates, list):
+            top_detection_candidates = [highest_detection] if isinstance(highest_detection, dict) else []
 
         lines = [
             "Running optimize-tracking..." if not stage else f"Running optimize-tracking... {stage}",
@@ -5472,7 +5534,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 f"ETA: {self._format_seconds(eta_s) if eta_s > 0 else 'n/a'}"
             ),
             "",
-            "Current top five candidates:",
+            "Current top five score candidates:",
         ]
         if not top_candidates:
             lines.append("No candidates have finished yet.")
@@ -5532,24 +5594,54 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Parameter columns: minPerim/maxPerim are marker perimeter-rate bounds, poly=polygonalApproxAccuracyRate.",
             ]
         )
-        if isinstance(highest_detection, dict):
-            params = highest_detection.get("params", {})
-            if not isinstance(params, dict):
-                params = {}
+        if top_detection_candidates:
             lines.extend(
                 [
                     "",
-                    "Highest mean detections so far:",
-                    (
-                        f"rank={int(highest_detection.get('rank', 0))} | "
-                        f"detected={float(highest_detection.get('mean_detected', 0.0)):0.3f} | "
-                        f"score={float(highest_detection.get('score', 0.0)):0.4f} | "
-                        f"rejected={float(highest_detection.get('mean_rejected', 0.0)):0.3f} | "
-                        f"stability={float(highest_detection.get('stability', 0.0)):0.3f}"
-                    ),
-                    f"params={json.dumps(params, sort_keys=True)}",
+                    "Top five by mean detections so far:",
                 ]
             )
+            detection_header_parts = [
+                f"{'det#':>4}",
+                f"{'score#':>6}",
+                f"{'score':>8}",
+                f"{'detect':>7}",
+                f"{'reject':>7}",
+                f"{'stable':>7}",
+                f"{'ms/frame':>8}",
+            ]
+            for _key, label, width, _kind in param_columns:
+                detection_header_parts.append(f"{label:>{width}}")
+            detection_header = "  ".join(detection_header_parts)
+            lines.append(detection_header)
+            lines.append("-" * len(detection_header))
+
+        for candidate in top_detection_candidates[:5]:
+            if not isinstance(candidate, dict):
+                continue
+            params = candidate.get("params", {})
+            if not isinstance(params, dict):
+                params = {}
+            eval_fps = float(candidate.get("eval_fps", 0.0) or 0.0)
+            avg_frame_ms = (1000.0 / eval_fps) if eval_fps > 0 else 0.0
+            row_parts = [
+                f"{int(candidate.get('detection_rank', 0)):>4}",
+                f"{int(candidate.get('rank', 0)):>6}",
+                f"{float(candidate.get('score', 0.0)):>8.4f}",
+                f"{float(candidate.get('mean_detected', 0.0)):>7.3f}",
+                f"{float(candidate.get('mean_rejected', 0.0)):>7.3f}",
+                f"{float(candidate.get('stability', 0.0)):>7.3f}",
+                f"{avg_frame_ms:>8.2f}",
+            ]
+            for key, _label, width, kind in param_columns:
+                value = params.get(key, "")
+                if value == "":
+                    row_parts.append(f"{'':>{width}}")
+                elif kind == "int":
+                    row_parts.append(f"{int(float(value)):>{width}}")
+                else:
+                    row_parts.append(f"{float(value):>{width}.4g}")
+            lines.append("  ".join(row_parts))
         return "\n".join(lines)
 
     @staticmethod

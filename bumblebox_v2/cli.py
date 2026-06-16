@@ -2224,7 +2224,7 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_parser.add_argument(
         "--input",
         required=True,
-        help="Path to input video (.mp4/.mjpeg/...) or image directory.",
+        help="Path to input video (.mp4/.mjpeg/...) or image directory. Image directories are searched recursively.",
     )
     optimize_parser.add_argument(
         "--profile",
