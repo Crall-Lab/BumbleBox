@@ -1632,7 +1632,7 @@ def write_top_candidate_review_artifacts(
 def optimize_tracking(
     input_path: str | Path,
     profile: str = DEFAULT_PROFILE,
-    sample_frames: int = 80,
+    sample_frames: int = 40,
     dictionary_name: str = DEFAULT_DICTIONARY,
     tag_size_mm: float = DEFAULT_TAG_SIZE_MM,
     sweep_overrides: Optional[dict[str, Sequence[float | int]]] = None,
@@ -1911,7 +1911,7 @@ def optimize_tracking_iterative_refinement(
     seed_params: Sequence[dict[str, Any]],
     rounds: int = 2,
     seed_candidate_count: int = 5,
-    sample_frames: int = 80,
+    sample_frames: int = 40,
     validation_sample_frames: Optional[int] = None,
     profile: str = DEFAULT_PROFILE,
     dictionary_name: str = DEFAULT_DICTIONARY,
@@ -2243,7 +2243,7 @@ def legacy_entrypoint(argv: Optional[Sequence[str]] = None) -> int:
         default=DEFAULT_PROFILE,
         help="Grid profile size.",
     )
-    parser.add_argument("--sample-frames", type=int, default=80, help="Number of frames/images to sample.")
+    parser.add_argument("--sample-frames", type=int, required=True, help="Number of frames/images to sample. Recommended: 40.")
     parser.add_argument("--dictionary", default=DEFAULT_DICTIONARY, help="ArUco dictionary (for example 4X4_50).")
     parser.add_argument("--tag-size-mm", type=float, default=DEFAULT_TAG_SIZE_MM, help="Physical tag size in mm.")
     parser.add_argument(

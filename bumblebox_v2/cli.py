@@ -1463,6 +1463,12 @@ def _cmd_track_videos(args: argparse.Namespace) -> int:
             for token in str(args.extensions or "").split(",")
             if token.strip()
         ]
+        if bool(args.optimize_per_date) and args.optimization_sample_frames is None:
+            print(
+                "Argument error: --optimization-sample-frames is required when "
+                "--optimize-per-date is used. Recommended: --optimization-sample-frames 40"
+            )
+            return 2
 
         def _posthoc_progress(message: str) -> None:
             print(message, flush=True)
@@ -1483,13 +1489,14 @@ def _cmd_track_videos(args: argparse.Namespace) -> int:
             optimize_per_date=bool(args.optimize_per_date),
             force_optimize_per_date=bool(args.force_optimize_per_date),
             optimization_profile=args.optimization_profile,
-            optimization_sample_frames=args.optimization_sample_frames,
+            optimization_sample_frames=args.optimization_sample_frames or 40,
             optimization_tag_size_mm=args.optimization_tag_size_mm,
             optimization_expected_tags=args.optimization_expected_tags,
             optimization_max_combinations=args.optimization_max_combinations,
             optimization_execution_target=args.optimization_execution_target,
             optimization_workers=args.optimization_workers,
             optimization_selection=args.optimization_selection,
+            resume_tracking=not bool(args.force_retrack),
             progress_callback=_posthoc_progress,
         )
     except Exception as exc:
@@ -2002,6 +2009,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip data-cleaning outputs and only write raw/noID tracking CSVs.",
     )
     track_videos_parser.add_argument(
+        "--force-retrack",
+        action="store_true",
+        help="Ignore completed per-video tracking markers and regenerate tracking outputs.",
+    )
+    track_videos_parser.add_argument(
         "--optimize-per-date",
         action="store_true",
         help=(
@@ -2023,8 +2035,11 @@ def build_parser() -> argparse.ArgumentParser:
     track_videos_parser.add_argument(
         "--optimization-sample-frames",
         type=int,
-        default=80,
-        help="Representative frames sampled across each date's videos for per-date optimization.",
+        default=None,
+        help=(
+            "Required with --optimize-per-date. Representative frames sampled across each "
+            "date's videos for per-date optimization. Recommended: 40."
+        ),
     )
     track_videos_parser.add_argument(
         "--optimization-tag-size-mm",
@@ -2492,8 +2507,8 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_parser.add_argument(
         "--sample-frames",
         type=int,
-        default=80,
-        help="How many sampled frames/images to evaluate.",
+        required=True,
+        help="How many sampled frames/images to evaluate. Recommended: 40.",
     )
     optimize_parser.add_argument(
         "--dictionary",

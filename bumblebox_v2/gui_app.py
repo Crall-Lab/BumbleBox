@@ -3950,7 +3950,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self.opt_profile_var = tk.StringVar(value="quick")
         self.opt_dictionary_var = tk.StringVar(value=self._current_config_tag_dictionary())
         self.opt_tag_size_mm_var = tk.StringVar(value="2.5")
-        self.opt_sample_frames_var = tk.StringVar(value="80")
+        self.opt_sample_frames_var = tk.StringVar(value="40")
         self.opt_execution_target_var = tk.StringVar(value="pi_safe")
         self.opt_workers_var = tk.StringVar(value="")
         self.opt_expected_tags_var = tk.StringVar(value="")

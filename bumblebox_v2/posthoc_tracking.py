@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -11,6 +12,7 @@ from typing import Any, Callable, Iterable, Optional
 
 DEFAULT_VIDEO_EXTENSIONS = (".mp4", ".mjpeg", ".mjpe", ".avi", ".mov", ".mkv")
 DEFAULT_TRACKING_EXTENSIONS = (".mp4", ".mjpeg", ".mjpe")
+TRACKING_COMPLETION_SCHEMA_VERSION = 1
 PosthocProgressCallback = Callable[[str], None]
 ARUCO_PARAM_KEYS = {
     "adaptiveThreshConstant",
@@ -62,6 +64,8 @@ class PosthocVideoResult:
     allowed_tag_count: Optional[int]
     elapsed_seconds: float
     success: bool
+    skipped: bool
+    completion_marker_path: Optional[str]
     warnings: list[str]
     errors: list[str]
 
@@ -91,11 +95,13 @@ class PosthocTrackingReport:
     output_root: Optional[str]
     videos_found: int
     videos_processed: int
+    videos_skipped: int
     videos_failed: int
     dictionary: str
     render_tracked_video: bool
     run_cleaning: bool
     run_metrics: bool
+    resume_tracking: bool
     report_path: Optional[str]
     optimizations: list[PosthocDateOptimizationResult]
     results: list[PosthocVideoResult]
@@ -361,6 +367,105 @@ def _config_with_params(config: dict[str, Any], params: Optional[dict[str, Any]]
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
+
+
+def _file_signature(path: Path) -> dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _json_hash(payload: dict[str, Any]) -> str:
+    stable = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
+def _tracking_resume_signature_payload(
+    *,
+    video_path: Path,
+    params: Optional[dict[str, Any]],
+    dictionary: str,
+    box_preset: Any,
+    render: bool,
+    run_cleaning: bool,
+    metrics: bool,
+    allowed_tag_ids: set[int],
+    excluded_tag_ids: set[int],
+) -> dict[str, Any]:
+    return {
+        "schema_version": TRACKING_COMPLETION_SCHEMA_VERSION,
+        "source_video": _file_signature(video_path),
+        "dictionary": dictionary,
+        "box_preset": box_preset,
+        "aruco_params": dict(params or {}),
+        "render_tracked_video": bool(render),
+        "run_cleaning": bool(run_cleaning),
+        "run_metrics": bool(metrics),
+        "allowed_tag_ids": sorted(int(tag_id) for tag_id in allowed_tag_ids),
+        "excluded_tag_ids": sorted(int(tag_id) for tag_id in excluded_tag_ids),
+    }
+
+
+def _same_resolved_path(left: object, right: Path) -> bool:
+    text = str(left or "").strip()
+    if not text:
+        return False
+    try:
+        return Path(text).expanduser().resolve() == right.expanduser().resolve()
+    except OSError:
+        return False
+
+
+def _existing_file_from_payload(payload: dict[str, Any], key: str) -> Optional[str]:
+    text = str(payload.get(key) or "").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    return str(path) if path.exists() and path.is_file() else None
+
+
+def _load_valid_tracking_completion(
+    marker_path: Path,
+    *,
+    expected_signature_hash: str,
+    raw_csv_path: Path,
+    noid_csv_path: Path,
+    run_cleaning: bool,
+    render: bool,
+) -> tuple[Optional[dict[str, Any]], str]:
+    if not marker_path.exists():
+        return None, "no completion marker"
+    try:
+        payload = _read_json(marker_path)
+    except Exception as exc:
+        return None, f"could not read completion marker: {exc}"
+    if not isinstance(payload, dict):
+        return None, "completion marker is not a JSON object"
+    if payload.get("schema_version") != TRACKING_COMPLETION_SCHEMA_VERSION:
+        return None, "completion marker version does not match"
+    if payload.get("success") is not True:
+        return None, "completion marker is not successful"
+    if payload.get("resume_signature_hash") != expected_signature_hash:
+        return None, "tracking settings or source video changed"
+    if not _same_resolved_path(payload.get("raw_csv_path"), raw_csv_path):
+        return None, "completion marker raw CSV path does not match current output"
+    if not _same_resolved_path(payload.get("noid_csv_path"), noid_csv_path):
+        return None, "completion marker noID CSV path does not match current output"
+    if not _existing_file_from_payload(payload, "raw_csv_path"):
+        return None, "raw CSV is missing"
+    if not _existing_file_from_payload(payload, "noid_csv_path"):
+        return None, "noID CSV is missing"
+
+    raw_after = int(payload.get("raw_rows_after_filters") or 0)
+    if run_cleaning and raw_after > 0 and not _existing_file_from_payload(payload, "cleaned_csv_path"):
+        return None, "cleaned CSV is missing"
+    if render and raw_after > 0 and not _existing_file_from_payload(payload, "tracked_video_path"):
+        return None, "tracked video is missing"
+    return payload, ""
 
 
 def _date_output_base(date_dir: Path, output_root_path: Optional[Path]) -> Path:
@@ -713,13 +818,14 @@ def run_posthoc_tracking(
     optimize_per_date: bool = False,
     force_optimize_per_date: bool = False,
     optimization_profile: str = "daily",
-    optimization_sample_frames: int = 80,
+    optimization_sample_frames: int = 40,
     optimization_tag_size_mm: float = 2.5,
     optimization_expected_tags: Optional[float] = None,
     optimization_max_combinations: int = 750,
     optimization_execution_target: str = "pi_safe",
     optimization_workers: Optional[int] = None,
     optimization_selection: str = "mean_detection",
+    resume_tracking: bool = True,
     progress_callback: Optional[PosthocProgressCallback] = None,
 ) -> PosthocTrackingReport:
     from .run_engine import (
@@ -747,6 +853,7 @@ def run_posthoc_tracking(
     _emit_progress(progress_callback, f"[posthoc] Input: {root}")
     _emit_progress(progress_callback, f"[posthoc] Videos found: {len(videos)}")
     _emit_progress(progress_callback, f"[posthoc] Output root: {output_root_path or 'date-local tracking folders'}")
+    _emit_progress(progress_callback, f"[posthoc] Resume completed videos: {'yes' if resume_tracking else 'no'}")
     _emit_progress(
         progress_callback,
         f"[posthoc] Allowed tag IDs: {len(allowed_tag_ids) if allowed_tag_ids else 'none'}",
@@ -829,6 +936,7 @@ def run_posthoc_tracking(
 
         raw_csv_path = output_dir / f"{session_name}_raw.csv"
         noid_csv_path = output_dir / f"{session_name}_noID.csv"
+        completion_marker_path = output_dir / f"{session_name}_tracking_complete.json"
         cleaned_csv_path: Optional[Path] = None
         tracked_video_path: Optional[Path] = None
         frame_count = 0
@@ -842,6 +950,73 @@ def run_posthoc_tracking(
         removed_excluded = 0
         removed_disallowed = 0
         success = False
+        skipped = False
+
+        resume_signature: Optional[dict[str, Any]] = None
+        resume_signature_hash: Optional[str] = None
+        if not dry_run:
+            try:
+                resume_signature = _tracking_resume_signature_payload(
+                    video_path=video_path,
+                    params=params,
+                    dictionary=dictionary,
+                    box_preset=box_preset,
+                    render=render,
+                    run_cleaning=run_cleaning,
+                    metrics=metrics,
+                    allowed_tag_ids=allowed_tag_ids,
+                    excluded_tag_ids=excluded_tag_ids,
+                )
+                resume_signature_hash = _json_hash(resume_signature)
+            except Exception as exc:
+                item_warnings.append(f"Could not build resume signature; this video will be reprocessed: {exc}")
+
+        if resume_tracking and resume_signature_hash and not dry_run:
+            completed_payload, resume_reason = _load_valid_tracking_completion(
+                completion_marker_path,
+                expected_signature_hash=resume_signature_hash,
+                raw_csv_path=raw_csv_path,
+                noid_csv_path=noid_csv_path,
+                run_cleaning=run_cleaning,
+                render=render,
+            )
+            if completed_payload is not None:
+                skipped = True
+                success = True
+                item_warnings.append("Skipped existing completed tracking result. Use --force-retrack to regenerate.")
+                _emit_progress(progress_callback, f"[track] {session_name}: skipping completed result ({completion_marker_path})")
+                results.append(
+                    PosthocVideoResult(
+                        video_path=str(video_path),
+                        session_name=session_name,
+                        output_dir=str(output_dir),
+                        params_path=str(completed_payload.get("params_path") or (used_params_path if used_params_path else "")) or None,
+                        raw_csv_path=_existing_file_from_payload(completed_payload, "raw_csv_path"),
+                        noid_csv_path=_existing_file_from_payload(completed_payload, "noid_csv_path"),
+                        cleaned_csv_path=_existing_file_from_payload(completed_payload, "cleaned_csv_path"),
+                        tracked_video_path=_existing_file_from_payload(completed_payload, "tracked_video_path"),
+                        frame_count=int(completed_payload.get("frame_count") or 0),
+                        fps=float(completed_payload.get("fps") or fps),
+                        raw_rows_before_filters=int(completed_payload.get("raw_rows_before_filters") or 0),
+                        raw_rows_after_filters=int(completed_payload.get("raw_rows_after_filters") or 0),
+                        removed_excluded_id_rows=int(completed_payload.get("removed_excluded_id_rows") or 0),
+                        removed_disallowed_id_rows=int(completed_payload.get("removed_disallowed_id_rows") or 0),
+                        allowed_tag_count=(
+                            int(completed_payload["allowed_tag_count"])
+                            if completed_payload.get("allowed_tag_count") is not None
+                            else (len(allowed_tag_ids) if allowed_tag_ids else None)
+                        ),
+                        elapsed_seconds=0.0,
+                        success=success,
+                        skipped=skipped,
+                        completion_marker_path=str(completion_marker_path),
+                        warnings=item_warnings,
+                        errors=item_errors,
+                    )
+                )
+                continue
+            if completion_marker_path.exists():
+                _emit_progress(progress_callback, f"[track] {session_name}: not resuming existing marker: {resume_reason}")
 
         try:
             if dry_run:
@@ -911,29 +1086,42 @@ def run_posthoc_tracking(
             errors.append(f"{video_path}: {exc}")
             _emit_progress(progress_callback, f"[track] {session_name}: failed: {exc}")
 
-        results.append(
-            PosthocVideoResult(
-                video_path=str(video_path),
-                session_name=session_name,
-                output_dir=str(output_dir),
-                params_path=str(used_params_path) if used_params_path else None,
-                raw_csv_path=str(raw_csv_path) if raw_csv_path.exists() else None,
-                noid_csv_path=str(noid_csv_path) if noid_csv_path.exists() else None,
-                cleaned_csv_path=str(cleaned_csv_path) if cleaned_csv_path and cleaned_csv_path.exists() else None,
-                tracked_video_path=str(tracked_video_path) if tracked_video_path and tracked_video_path.exists() else None,
-                frame_count=int(frame_count),
-                fps=float(fps),
-                raw_rows_before_filters=raw_before,
-                raw_rows_after_filters=raw_after,
-                removed_excluded_id_rows=int(removed_excluded),
-                removed_disallowed_id_rows=int(removed_disallowed),
-                allowed_tag_count=len(allowed_tag_ids) if allowed_tag_ids else None,
-                elapsed_seconds=float(time.perf_counter() - item_start),
-                success=success,
-                warnings=item_warnings,
-                errors=item_errors,
-            )
+        video_result = PosthocVideoResult(
+            video_path=str(video_path),
+            session_name=session_name,
+            output_dir=str(output_dir),
+            params_path=str(used_params_path) if used_params_path else None,
+            raw_csv_path=str(raw_csv_path) if raw_csv_path.exists() else None,
+            noid_csv_path=str(noid_csv_path) if noid_csv_path.exists() else None,
+            cleaned_csv_path=str(cleaned_csv_path) if cleaned_csv_path and cleaned_csv_path.exists() else None,
+            tracked_video_path=str(tracked_video_path) if tracked_video_path and tracked_video_path.exists() else None,
+            frame_count=int(frame_count),
+            fps=float(fps),
+            raw_rows_before_filters=raw_before,
+            raw_rows_after_filters=raw_after,
+            removed_excluded_id_rows=int(removed_excluded),
+            removed_disallowed_id_rows=int(removed_disallowed),
+            allowed_tag_count=len(allowed_tag_ids) if allowed_tag_ids else None,
+            elapsed_seconds=float(time.perf_counter() - item_start),
+            success=success,
+            skipped=skipped,
+            completion_marker_path=str(completion_marker_path) if completion_marker_path.exists() else None,
+            warnings=item_warnings,
+            errors=item_errors,
         )
+        if success and not skipped and not dry_run and resume_signature is not None and resume_signature_hash is not None:
+            marker_payload = {
+                **asdict(video_result),
+                "schema_version": TRACKING_COMPLETION_SCHEMA_VERSION,
+                "completed_at": _now_iso(),
+                "resume_signature": resume_signature,
+                "resume_signature_hash": resume_signature_hash,
+                "completion_marker_path": str(completion_marker_path),
+            }
+            _write_json(completion_marker_path, marker_payload)
+            video_result.completion_marker_path = str(completion_marker_path)
+            _emit_progress(progress_callback, f"[track] {session_name}: wrote completion marker {completion_marker_path}")
+        results.append(video_result)
 
     report_path: Optional[Path] = None
     if output_root_path is not None:
@@ -950,11 +1138,13 @@ def run_posthoc_tracking(
         output_root=str(output_root_path) if output_root_path else None,
         videos_found=len(videos),
         videos_processed=sum(1 for item in results if item.success),
+        videos_skipped=sum(1 for item in results if item.skipped),
         videos_failed=sum(1 for item in results if not item.success),
         dictionary=dictionary,
         render_tracked_video=render,
         run_cleaning=run_cleaning,
         run_metrics=metrics,
+        resume_tracking=resume_tracking,
         report_path=str(report_path) if report_path else None,
         optimizations=optimization_results,
         results=results,
@@ -968,7 +1158,8 @@ def run_posthoc_tracking(
         progress_callback,
         (
             f"[posthoc] Finished: processed={report.videos_processed}, "
-            f"failed={report.videos_failed}, elapsed={time.perf_counter() - run_start:.1f}s"
+            f"skipped={report.videos_skipped}, failed={report.videos_failed}, "
+            f"elapsed={time.perf_counter() - run_start:.1f}s"
         ),
     )
     return report
@@ -981,11 +1172,13 @@ def format_posthoc_tracking_report(report: PosthocTrackingReport) -> str:
         f"Input: {report.input_path}",
         f"Videos found: {report.videos_found}",
         f"Videos processed: {report.videos_processed}",
+        f"Videos skipped by resume: {report.videos_skipped}",
         f"Videos failed: {report.videos_failed}",
         f"Dictionary: {report.dictionary}",
         f"Render tracked video: {report.render_tracked_video}",
         f"Run cleaning: {report.run_cleaning}",
         f"Run metrics: {report.run_metrics}",
+        f"Resume completed videos: {report.resume_tracking}",
         f"Report JSON: {report.report_path or 'none'}",
     ]
 
@@ -1007,7 +1200,7 @@ def format_posthoc_tracking_report(report: PosthocTrackingReport) -> str:
 
         lines.extend(["", "Videos"])
         for item in report.results:
-            status = "ok" if item.success else "failed"
+            status = "skipped" if item.skipped else "ok" if item.success else "failed"
             lines.append(
                 f"- {item.session_name} | {status} | frames={item.frame_count} | "
                 f"detections={item.raw_rows_before_filters}->{item.raw_rows_after_filters} | "
@@ -1018,6 +1211,8 @@ def format_posthoc_tracking_report(report: PosthocTrackingReport) -> str:
             lines.append(f"  tracked video: {item.tracked_video_path or 'none'}")
             if item.params_path:
                 lines.append(f"  params: {item.params_path}")
+            if item.completion_marker_path:
+                lines.append(f"  completion marker: {item.completion_marker_path}")
             if item.warnings:
                 lines.append("  warnings: " + "; ".join(item.warnings[:3]))
             if item.errors:
