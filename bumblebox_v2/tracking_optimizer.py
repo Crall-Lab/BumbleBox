@@ -72,7 +72,7 @@ PROFILE_PARAMETER_SPACE = {
         "adaptiveThreshWinSizeMax": [29, 36, 41, 57, 73, 81, 105, 127, 151],
         "adaptiveThreshWinSizeStep": [2, 3],
         "polygonalApproxAccuracyRate": [0.06, 0.08],
-        "adaptiveThreshConstant": [1, 3, 5, 7, 9],
+        "adaptiveThreshConstant": [1, 3, 5, 7, 9, 11],
     },
 }
 VALID_SWEEP_OVERRIDE_KEYS = {
