@@ -104,6 +104,35 @@ from .thermal_camera import (
 )
 
 
+class _LiveProgressPrinter:
+    """Print progress normally, but redraw optimizer tables in-place on TTYs."""
+
+    _LIVE_TABLE_MARKER = "top mean-detection candidates so far"
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = bool(enabled and sys.stdout.isatty())
+        self._live_lines = 0
+
+    def __call__(self, message: str) -> None:
+        text = str(message)
+        is_live_table = self._LIVE_TABLE_MARKER in text
+        if self.enabled and is_live_table:
+            self._clear_live_block()
+            sys.stdout.write(text.rstrip("\n") + "\n")
+            sys.stdout.flush()
+            self._live_lines = max(1, len(text.rstrip("\n").splitlines()))
+            return
+
+        self._live_lines = 0
+        print(text, flush=True)
+
+    def _clear_live_block(self) -> None:
+        if self._live_lines <= 0:
+            return
+        # Move to the first line of the previous live block and clear downward.
+        sys.stdout.write(f"\033[{self._live_lines}F\033[J")
+
+
 def _load_or_defaults(config_path: Path):
     if config_path.exists():
         return load_config(config_path)
@@ -1470,8 +1499,7 @@ def _cmd_track_videos(args: argparse.Namespace) -> int:
             )
             return 2
 
-        def _posthoc_progress(message: str) -> None:
-            print(message, flush=True)
+        _posthoc_progress = _LiveProgressPrinter(enabled=not bool(args.no_live_progress))
 
         report = run_posthoc_tracking(
             config,
@@ -2021,6 +2049,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Temporary bridge for pre-marker runs: skip a video when existing raw/noID tracking CSVs "
             "are present, then write a completion marker for future safe resume."
         ),
+    )
+    track_videos_parser.add_argument(
+        "--no-live-progress",
+        action="store_true",
+        help="Disable in-place terminal updates and print every optimization progress table separately.",
     )
     track_videos_parser.add_argument(
         "--optimize-per-date",
