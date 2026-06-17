@@ -1312,8 +1312,12 @@ def _cmd_optimize_tracking(args: argparse.Namespace) -> int:
         format_optimization_report,
         optimize_tracking,
     )
+    from .tracking_index import format_local_index_result, sync_optimization_result
 
     try:
+        from .posthoc_tracking import load_tag_ids
+
+        config_for_filters = _load_or_defaults(Path(args.config))
         sweep_overrides = {}
         min_perimeter = _parse_comma_numeric_values(
             args.sweep_min_marker_perimeter_rate,
@@ -1355,6 +1359,31 @@ def _cmd_optimize_tracking(args: argparse.Namespace) -> int:
         if win_step:
             sweep_overrides["adaptiveThreshWinSizeStep"] = win_step
 
+        allowed_tag_ids = set()
+        tracking_filter_config = (
+            config_for_filters.get("tracking", {})
+            if isinstance(config_for_filters.get("tracking", {}), dict)
+            else {}
+        )
+        raw_config_allowed = tracking_filter_config.get("allowed_tag_ids", [])
+        if isinstance(raw_config_allowed, list):
+            for raw_id in raw_config_allowed:
+                try:
+                    allowed_tag_ids.add(int(raw_id))
+                except (TypeError, ValueError):
+                    continue
+        raw_config_tag_list = str(tracking_filter_config.get("allowed_tag_ids_path") or "").strip()
+        if raw_config_tag_list:
+            allowed_tag_ids.update(load_tag_ids(raw_config_tag_list))
+        cli_allowed_ids = _parse_comma_numeric_values(
+            args.allowed_tag_ids,
+            label="--allowed-tag-ids",
+            value_type="int",
+        )
+        allowed_tag_ids.update(int(value) for value in cli_allowed_ids)
+        if args.tag_list:
+            allowed_tag_ids.update(load_tag_ids(args.tag_list))
+
         result = optimize_tracking(
             input_path=args.input,
             profile=args.profile,
@@ -1362,6 +1391,7 @@ def _cmd_optimize_tracking(args: argparse.Namespace) -> int:
             dictionary_name=args.dictionary,
             tag_size_mm=args.tag_size_mm,
             sweep_overrides=sweep_overrides or None,
+            max_parameter_combinations=args.max_combinations,
             execution_target=args.execution_target,
             workers=args.workers,
             expected_tags=args.expected_tags,
@@ -1371,12 +1401,21 @@ def _cmd_optimize_tracking(args: argparse.Namespace) -> int:
             write_preview=args.write_preview,
             preview_frames=args.preview_frames,
             top_k=args.top_k,
+            valid_tag_ids=allowed_tag_ids or None,
         )
     except Exception as exc:
         print(f"Tracking optimization failed: {exc}")
         return 1
 
     print(format_optimization_report(result, top_k=args.top_k))
+
+    try:
+        index_config = _load_or_defaults(Path(args.config))
+        index_result = sync_optimization_result(index_config, result)
+        print("")
+        print(format_local_index_result(index_result))
+    except Exception as exc:
+        print(f"\nLocal tracking index update failed: {exc}")
 
     if args.apply_best:
         config_path = Path(args.config)
@@ -1385,11 +1424,88 @@ def _cmd_optimize_tracking(args: argparse.Namespace) -> int:
             updated = apply_best_params_to_config(config, result.best_params)
             save_config(config_path, updated)
             print(f"Applied best parameters to config: {config_path}")
+            try:
+                selected_index_result = sync_optimization_result(
+                    updated,
+                    result,
+                    selected_params=result.best_params,
+                    selected_label="apply_best",
+                )
+                print("")
+                print(format_local_index_result(selected_index_result))
+            except Exception as index_exc:
+                print(f"Applied best parameters, but failed to update selected params in local index: {index_exc}")
         except Exception as exc:
             print(f"Optimization completed, but failed to apply config update: {exc}")
             return 1
 
     return 0
+
+
+def _cmd_track_videos(args: argparse.Namespace) -> int:
+    from .posthoc_tracking import format_posthoc_tracking_report, run_posthoc_tracking
+
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    try:
+        allowed_ids = _parse_comma_numeric_values(
+            args.allowed_tag_ids,
+            label="--allowed-tag-ids",
+            value_type="int",
+        )
+        extensions = [
+            token.strip()
+            for token in str(args.extensions or "").split(",")
+            if token.strip()
+        ]
+
+        def _posthoc_progress(message: str) -> None:
+            print(message, flush=True)
+
+        report = run_posthoc_tracking(
+            config,
+            input_path=args.input,
+            output_root=args.output_root,
+            params_path=args.params,
+            allowed_ids=[int(value) for value in allowed_ids] if allowed_ids else None,
+            tag_list_path=args.tag_list,
+            render_tracked_video=args.render_tracked_video,
+            run_cleaning=not bool(args.no_cleaning),
+            run_metrics=args.metrics,
+            recursive=not bool(args.no_recursive),
+            extensions=extensions,
+            dry_run=bool(args.dry_run),
+            optimize_per_date=bool(args.optimize_per_date),
+            force_optimize_per_date=bool(args.force_optimize_per_date),
+            optimization_profile=args.optimization_profile,
+            optimization_sample_frames=args.optimization_sample_frames,
+            optimization_tag_size_mm=args.optimization_tag_size_mm,
+            optimization_expected_tags=args.optimization_expected_tags,
+            optimization_max_combinations=args.optimization_max_combinations,
+            optimization_execution_target=args.optimization_execution_target,
+            optimization_workers=args.optimization_workers,
+            optimization_selection=args.optimization_selection,
+            progress_callback=_posthoc_progress,
+        )
+    except Exception as exc:
+        print(f"Post-hoc tracking failed: {exc}")
+        return 1
+
+    print(format_posthoc_tracking_report(report))
+    if not bool(args.dry_run):
+        try:
+            from .tracking_index import format_local_index_result, sync_posthoc_tracking_report
+
+            print("")
+            print(format_local_index_result(sync_posthoc_tracking_report(config, report)))
+        except Exception as exc:
+            print(f"\nLocal tracking index update failed: {exc}")
+    return 1 if report.videos_failed > 0 else 0
 
 
 def _cmd_schedule_check(args: argparse.Namespace) -> int:
@@ -1804,6 +1920,144 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_once_parser.set_defaults(visualization=None)
     run_once_parser.set_defaults(func=_cmd_run_once)
+
+    track_videos_parser = subparsers.add_parser(
+        "track-videos",
+        help="Run post-hoc ArUco tracking on existing videos without opening the live camera.",
+    )
+    _add_common_config_arg(track_videos_parser)
+    track_videos_parser.add_argument(
+        "--input",
+        required=True,
+        help="Video file, date folder, or colony parent folder containing recorded videos.",
+    )
+    track_videos_parser.add_argument(
+        "--output-root",
+        help=(
+            "Optional output root. If omitted, each date folder gets a tracking/ subfolder. "
+            "If set, outputs go to <output-root>/<date>/tracking/."
+        ),
+    )
+    track_videos_parser.add_argument(
+        "--params",
+        help=(
+            "Optional selected tracking parameter JSON. If omitted, BumbleBox looks for "
+            "<date>/optimization/selected_tracking_params.json, then top_mean_detection_params.json, "
+            "then best_score_params.json, then falls back to tracking.aruco_params in config."
+        ),
+    )
+    track_videos_parser.add_argument(
+        "--tag-list",
+        help=(
+            "Optional colony allowlist file. Supports JSON list/object, CSV-ish text, or newline-separated IDs. "
+            "Detections outside the allowlist are removed after ArUco detection."
+        ),
+    )
+    track_videos_parser.add_argument(
+        "--allowed-tag-ids",
+        default="",
+        help="Optional comma-separated colony allowlist IDs, combined with --tag-list and config tracking.allowed_tag_ids.",
+    )
+    track_videos_parser.add_argument(
+        "--extensions",
+        default="mp4,mjpeg,mjpe",
+        help="Comma-separated video extensions to track (default: mp4,mjpeg,mjpe).",
+    )
+    track_videos_parser.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Only scan the input directory itself, not nested date/session folders.",
+    )
+    visualization_group = track_videos_parser.add_mutually_exclusive_group()
+    visualization_group.add_argument(
+        "--render-tracked-video",
+        dest="render_tracked_video",
+        action="store_true",
+        help="Write annotated tracked MP4 videos next to the tracking CSVs.",
+    )
+    visualization_group.add_argument(
+        "--no-render-tracked-video",
+        dest="render_tracked_video",
+        action="store_false",
+        help="Do not write annotated tracked MP4 videos.",
+    )
+    track_videos_parser.set_defaults(render_tracked_video=None)
+    metrics_group = track_videos_parser.add_mutually_exclusive_group()
+    metrics_group.add_argument(
+        "--metrics",
+        dest="metrics",
+        action="store_true",
+        help="Run behavior metrics after tracking.",
+    )
+    metrics_group.add_argument(
+        "--no-metrics",
+        dest="metrics",
+        action="store_false",
+        help="Skip behavior metrics after tracking.",
+    )
+    track_videos_parser.set_defaults(metrics=None)
+    track_videos_parser.add_argument(
+        "--no-cleaning",
+        action="store_true",
+        help="Skip data-cleaning outputs and only write raw/noID tracking CSVs.",
+    )
+    track_videos_parser.add_argument(
+        "--optimize-per-date",
+        action="store_true",
+        help=(
+            "Before tracking, optimize ArUco parameters once per date folder, write "
+            "<date>/optimization/selected_tracking_params.json, then track that date with those params."
+        ),
+    )
+    track_videos_parser.add_argument(
+        "--force-optimize-per-date",
+        action="store_true",
+        help="Regenerate per-date selected_tracking_params.json even if one already exists.",
+    )
+    track_videos_parser.add_argument(
+        "--optimization-profile",
+        choices=["quick", "balanced", "deep", "daily"],
+        default="daily",
+        help="Optimization sweep profile used by --optimize-per-date (default: daily, 360 combinations before caps).",
+    )
+    track_videos_parser.add_argument(
+        "--optimization-sample-frames",
+        type=int,
+        default=80,
+        help="Representative frames sampled across each date's videos for per-date optimization.",
+    )
+    track_videos_parser.add_argument(
+        "--optimization-tag-size-mm",
+        type=float,
+        default=2.5,
+        help="Physical tag size passed to the optimizer when size thresholds are not fixed by existing params.",
+    )
+    track_videos_parser.add_argument(
+        "--optimization-expected-tags",
+        type=float,
+        help="Optional expected average visible tag count per optimization sample frame.",
+    )
+    track_videos_parser.add_argument(
+        "--optimization-max-combinations",
+        type=int,
+        default=750,
+        help="Maximum parameter combinations per date optimization (default: 750).",
+    )
+    track_videos_parser.add_argument(
+        "--optimization-execution-target",
+        choices=["pi_safe", "desktop"],
+        default="pi_safe",
+        help="Worker-count defaults for per-date optimization.",
+    )
+    track_videos_parser.add_argument("--optimization-workers", type=int, help="Explicit worker count for per-date optimization.")
+    track_videos_parser.add_argument(
+        "--optimization-selection",
+        choices=["mean_detection", "best_score"],
+        default="mean_detection",
+        help="Which optimizer winner to write as selected_tracking_params.json (default: mean_detection).",
+    )
+    track_videos_parser.add_argument("--dry-run", action="store_true", help="Show planned videos without tracking them.")
+    track_videos_parser.set_defaults(func=_cmd_track_videos)
 
     fleet_parser = subparsers.add_parser(
         "fleet",
@@ -2231,7 +2485,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     optimize_parser.add_argument(
         "--profile",
-        choices=["quick", "balanced", "deep"],
+        choices=["quick", "balanced", "deep", "daily"],
         default="quick",
         help="Grid profile size (quick is fastest).",
     )
@@ -2298,11 +2552,28 @@ def build_parser() -> argparse.ArgumentParser:
         default="pi_safe",
         help="pi_safe uses conservative worker defaults. desktop uses more cores.",
     )
+    optimize_parser.add_argument(
+        "--max-combinations",
+        type=int,
+        help="Optional cap on parameter combinations to evaluate after building the sweep.",
+    )
     optimize_parser.add_argument("--workers", type=int, help="Optional explicit worker count override.")
     optimize_parser.add_argument(
         "--expected-tags",
         type=float,
         help="Optional expected average visible tag count per frame to guide scoring.",
+    )
+    optimize_parser.add_argument(
+        "--tag-list",
+        help=(
+            "Optional colony allowlist file. Supports JSON list/object, CSV-ish text, or newline-separated IDs. "
+            "Optimizer mean detections count only decoded tags inside this list."
+        ),
+    )
+    optimize_parser.add_argument(
+        "--allowed-tag-ids",
+        default="",
+        help="Optional comma-separated colony allowlist IDs for optimizer scoring.",
     )
     optimize_parser.add_argument(
         "--early-stop-patience",

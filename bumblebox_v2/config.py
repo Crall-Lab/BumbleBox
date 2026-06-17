@@ -119,6 +119,7 @@ def validate_config(config: Dict[str, Any]) -> None:
         config,
         [
             "system",
+            "local_index",
             "camera",
             "thermal",
             "pipeline",
@@ -132,6 +133,24 @@ def validate_config(config: Dict[str, Any]) -> None:
             "fleet",
         ],
     )
+
+    local_index = config.get("local_index", {})
+    if not isinstance(local_index, dict):
+        raise ConfigError("local_index must be a mapping/object")
+    for key in (
+        "enabled",
+        "copy_tracking_csvs",
+        "copy_run_summaries",
+        "copy_optimization_results",
+        "copy_config_snapshots",
+        "copy_fps_reports",
+    ):
+        value = local_index.get(key, True)
+        if not isinstance(value, bool):
+            raise ConfigError(f"local_index.{key} must be true or false")
+    local_index_path = local_index.get("path", "LocalTrackingIndex")
+    if local_index_path is not None and not isinstance(local_index_path, str):
+        raise ConfigError("local_index.path must be null or a string path")
 
     mode = config["pipeline"].get("mode")
     if mode not in VALID_PIPELINE_MODES:
@@ -156,6 +175,20 @@ def validate_config(config: Dict[str, Any]) -> None:
             raise ConfigError(
                 f"tracking.excluded_tag_ids[{idx}] must be an integer-like tag ID"
             ) from exc
+
+    allowed_tag_ids = config.get("tracking", {}).get("allowed_tag_ids", [])
+    if not isinstance(allowed_tag_ids, list):
+        raise ConfigError("tracking.allowed_tag_ids must be a list of tag IDs")
+    for idx, tag_id in enumerate(allowed_tag_ids):
+        try:
+            int(tag_id)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"tracking.allowed_tag_ids[{idx}] must be an integer-like tag ID"
+            ) from exc
+    allowed_tag_ids_path = config.get("tracking", {}).get("allowed_tag_ids_path")
+    if allowed_tag_ids_path is not None and not isinstance(allowed_tag_ids_path, str):
+        raise ConfigError("tracking.allowed_tag_ids_path must be null or a string path")
 
     tag_dictionary = str(config.get("tracking", {}).get("tag_dictionary", "4X4_50")).strip().upper()
     if tag_dictionary.startswith("DICT_"):

@@ -64,8 +64,8 @@ def _overlay_metrics(width: int, height: int) -> tuple[int, int, int, float, int
     line_thickness = max(3, int(round(base * 3)))
     dot_radius = max(6, int(round(base * 5)))
     front_radius = max(4, int(round(base * 3.5)))
-    label_scale = max(0.9, min(1.6, base * 1.15))
-    label_thickness = max(2, int(round(base * 2.0)))
+    label_scale = max(1.4, min(3.2, base * 1.8))
+    label_thickness = max(3, int(round(base * 2.8)))
     return line_thickness, dot_radius, front_radius, label_scale, label_thickness
 
 

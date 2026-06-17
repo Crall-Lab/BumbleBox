@@ -46,5 +46,11 @@ Thumbs.db
 /bumblebox_v2/config.yaml
 *.log
 
+# Project-local tracking index artifacts.
+# Keep the folder/readme in the repo, but keep each user's generated index local.
+/LocalTrackingIndex/*
+!/LocalTrackingIndex/README.txt
+!/LocalTrackingIndex/.gitkeep
+
 # Keep legacy marker ignored
 testing

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .thermal_camera import resolve_thermal_device_path, _set_v4l2_y16_format
+from .tracking_index import sync_run_summary_file
 from .tuning import resolve_camera_tuning_file
 
 CAMERA_REOPEN_RETRY_ATTEMPTS = 3
@@ -64,6 +65,8 @@ class RunSummary:
     cleaned_csv_path: Optional[str]
     fps_report_json: Optional[str]
     config_snapshot_path: Optional[str]
+    local_index_path: Optional[str]
+    local_index_manifest_path: Optional[str]
     warnings: List[str]
     errors: List[str]
     success: bool
@@ -2337,6 +2340,8 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         cleaned_csv_path=str(cleaned_csv) if cleaned_csv else None,
         fps_report_json=str(fps_report_json) if fps_report_json else None,
         config_snapshot_path=str(config_snapshot_path) if config_snapshot_path else None,
+        local_index_path=None,
+        local_index_manifest_path=None,
         warnings=warnings,
         errors=errors,
         success=(len(errors) == 0),
@@ -2344,6 +2349,28 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
 
     summary_path = Path(summary.session_dir) / f"{summary.session_name}_run_summary.json"
     summary_path.write_text(json.dumps(asdict(summary), indent=2))
+    try:
+        index_result = sync_run_summary_file(
+            config,
+            summary_path,
+            summary_payload=asdict(summary),
+        )
+        if index_result.enabled:
+            summary.local_index_path = index_result.index_root
+            summary.local_index_manifest_path = index_result.manifest_path
+            for warning in index_result.warnings:
+                summary.warnings.append(f"Local tracking index warning: {warning}")
+            summary.success = len(summary.errors) == 0
+            summary_path.write_text(json.dumps(asdict(summary), indent=2))
+            sync_run_summary_file(
+                config,
+                summary_path,
+                summary_payload=asdict(summary),
+            )
+    except Exception as exc:
+        summary.warnings.append(f"Local tracking index update failed: {exc}")
+        summary.success = len(summary.errors) == 0
+        summary_path.write_text(json.dumps(asdict(summary), indent=2))
     return summary
 
 
@@ -2384,6 +2411,8 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Cleaned CSV: {summary.cleaned_csv_path or 'none'}",
         f"FPS report: {summary.fps_report_json or 'none'}",
         f"Config snapshot: {summary.config_snapshot_path or 'none'}",
+        f"Local tracking index: {summary.local_index_path or 'none'}",
+        f"Local index manifest: {summary.local_index_manifest_path or 'none'}",
         f"Warnings: {len(summary.warnings)}",
         f"Errors: {len(summary.errors)}",
         f"Success: {summary.success}",

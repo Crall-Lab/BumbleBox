@@ -200,6 +200,9 @@ class BumbleBoxV2GUI(tk.Tk):
         self._run_history_thread: threading.Thread | None = None
         self._run_history_error: str | None = None
         self._run_history_records = None
+        self._tracking_index_thread: threading.Thread | None = None
+        self._tracking_index_output_text: str | None = None
+        self._tracking_index_error: str | None = None
         self._nest_label_pid: int | None = None
         self._calibration_label_pid: int | None = None
         self._optimize_thread: threading.Thread | None = None
@@ -209,6 +212,8 @@ class BumbleBoxV2GUI(tk.Tk):
         self._optimize_result = None
         self._optimize_refinement_result = None
         self._optimize_applied_config: str | None = None
+        self._optimize_index_result = None
+        self._optimize_index_error: str | None = None
         self._optimize_review_dialog: tk.Toplevel | None = None
         self._optimize_stop_event = threading.Event()
         self._optimize_progress_q: queue.Queue[
@@ -1055,6 +1060,8 @@ class BumbleBoxV2GUI(tk.Tk):
         fill: str = tk.BOTH,
         expand: bool = True,
         pady: tuple[int, int] = (10, 0),
+        wrap: str = tk.WORD,
+        horizontal_scroll: bool = False,
     ) -> tk.Text:
         container = ttk.Frame(parent)
         container.pack(fill=(tk.BOTH if expand else tk.X), expand=expand, pady=pady)
@@ -1067,9 +1074,13 @@ class BumbleBoxV2GUI(tk.Tk):
             ttk.Label(header, textvariable=status_var).pack(side=tk.LEFT, padx=(8, 0))
 
         body = ttk.Frame(container)
-        text_widget = tk.Text(body, wrap=tk.WORD, height=text_height)
-        text_widget.pack(fill=fill, expand=expand)
+        text_widget = tk.Text(body, wrap=wrap, height=text_height)
+        text_widget.pack(side=tk.TOP, fill=fill, expand=expand)
         self._style_output_text(text_widget)
+        if horizontal_scroll:
+            x_scroll = ttk.Scrollbar(body, orient=tk.HORIZONTAL, command=text_widget.xview)
+            x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+            text_widget.configure(xscrollcommand=x_scroll.set)
 
         toggle_btn = ttk.Button(header, text="Show Results")
         toggle_btn.pack(side=tk.RIGHT)
@@ -1092,6 +1103,37 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._set_results_section_visible(text_widget, default_visible)
         return text_widget
+
+    def _replace_text_preserving_scroll(
+        self,
+        text_widget: tk.Text,
+        content: str,
+        *,
+        follow_bottom_threshold: float = 0.02,
+    ) -> None:
+        try:
+            first, last = text_widget.yview()
+        except Exception:
+            first, last = 0.0, 1.0
+        try:
+            had_content = bool(text_widget.get("1.0", tk.END).strip())
+        except Exception:
+            had_content = False
+        was_near_bottom = had_content and (1.0 - float(last)) <= follow_bottom_threshold
+
+        text_widget.delete("1.0", tk.END)
+        text_widget.insert(tk.END, content)
+
+        def restore_view() -> None:
+            try:
+                if was_near_bottom:
+                    text_widget.yview_moveto(1.0)
+                else:
+                    text_widget.yview_moveto(max(0.0, min(1.0, float(first))))
+            except Exception:
+                pass
+
+        self.after_idle(restore_view)
 
     def _set_results_section_visible(self, text_widget: tk.Text, visible: bool) -> None:
         meta = self._results_sections.get(text_widget)
@@ -2568,6 +2610,8 @@ class BumbleBoxV2GUI(tk.Tk):
                 [
                     ("Colony ID", "system.colony_id", str, None, None),
                     ("Data root", "system.data_root", str, None, None),
+                    ("Use local tracking index", "local_index.enabled", bool, None, None),
+                    ("Local tracking index", "local_index.path", str, None, None),
                     ("Pi model", "system.pi_model", str, ["auto", "pi4", "pi5"], None),
                     ("Camera model", "camera.model", str, camera_models, None),
                     ("Fleet role", "fleet.role", str, ["standalone", "queen", "worker"], None),
@@ -2680,6 +2724,23 @@ class BumbleBoxV2GUI(tk.Tk):
             pass
         return "4X4_50"
 
+    def _tracking_allowed_tag_ids_from_config(self, config: dict) -> set[int]:
+        tracking = config.get("tracking", {}) if isinstance(config.get("tracking", {}), dict) else {}
+        out: set[int] = set()
+        raw_ids = tracking.get("allowed_tag_ids", [])
+        if isinstance(raw_ids, list):
+            for raw_id in raw_ids:
+                try:
+                    out.add(int(raw_id))
+                except (TypeError, ValueError):
+                    continue
+        raw_path = str(tracking.get("allowed_tag_ids_path") or "").strip()
+        if raw_path:
+            from .posthoc_tracking import load_tag_ids
+
+            out.update(load_tag_ids(raw_path))
+        return out
+
     def _sync_dictionary_selectors_from_config(self) -> None:
         dictionary = self._current_config_tag_dictionary()
         for attr_name in ("opt_dictionary_var", "camera_test_dictionary_var"):
@@ -2692,7 +2753,7 @@ class BumbleBoxV2GUI(tk.Tk):
             longest = max((len(str(choice)) for choice in choices), default=12)
             return max(10, min(24, longest + 3))
 
-        if key in {"system.data_root", "camera.tuning_file"}:
+        if key in {"system.data_root", "local_index.path", "camera.tuning_file"}:
             return 24
         if key in {"system.colony_id"}:
             return 10
@@ -2706,6 +2767,14 @@ class BumbleBoxV2GUI(tk.Tk):
         details = {
             "system.colony_id": "Short identifier used in output filenames and metadata.",
             "system.data_root": "Root folder where recordings and outputs are written.",
+            "local_index.enabled": (
+                "Keep a lightweight local copy of run summaries, tracking CSVs, and optimization results "
+                "on this computer."
+            ),
+            "local_index.path": (
+                "Local folder for the lightweight tracking index. Default: LocalTrackingIndex inside the BumbleBox repo. "
+                "Generated index artifacts are ignored by Git, and large videos are intentionally not copied here."
+            ),
             "system.pi_model": "Hardware target hint. Use auto unless you need to force Pi4/Pi5 assumptions.",
             "camera.model": "Camera hardware model hint. Affects defaults and camera-specific assumptions.",
             "fleet.role": "Choose standalone, queen, or worker behavior mode.",
@@ -3829,8 +3898,52 @@ class BumbleBoxV2GUI(tk.Tk):
             self._show_error("Schedule check failed", str(exc))
 
     def _build_optimize_tracking_tab(self) -> None:
-        top = ttk.Frame(self.optimize_tracking_tab)
-        top.pack(fill=tk.X)
+        controls_container = ttk.Frame(self.optimize_tracking_tab)
+        controls_container.pack(fill=tk.BOTH, expand=True)
+
+        controls_canvas = tk.Canvas(
+            controls_container,
+            highlightthickness=0,
+            bg=self._palette["panel_bg"],
+            bd=0,
+        )
+        controls_scrollbar = ttk.Scrollbar(
+            controls_container,
+            orient=tk.VERTICAL,
+            command=controls_canvas.yview,
+        )
+        top = ttk.Frame(controls_canvas)
+        top.bind(
+            "<Configure>",
+            lambda _event: controls_canvas.configure(scrollregion=controls_canvas.bbox("all")),
+        )
+        controls_window = controls_canvas.create_window((0, 0), window=top, anchor="nw")
+        controls_canvas.bind(
+            "<Configure>",
+            lambda event, item=controls_window, widget=controls_canvas: widget.itemconfigure(
+                item,
+                width=max(1, int(event.width)),
+            ),
+        )
+        controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+        controls_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        controls_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def scroll_optimize_controls(event: tk.Event) -> str:
+            delta = getattr(event, "delta", 0)
+            if delta:
+                steps = -1 if delta > 0 else 1
+            else:
+                steps = -1 if getattr(event, "num", 0) == 4 else 1
+            controls_canvas.yview_scroll(steps * 3, "units")
+            return "break"
+
+        def bind_optimize_control_scroll(widget: tk.Widget) -> None:
+            widget.bind("<MouseWheel>", scroll_optimize_controls, add="+")
+            widget.bind("<Button-4>", scroll_optimize_controls, add="+")
+            widget.bind("<Button-5>", scroll_optimize_controls, add="+")
+            for child in widget.winfo_children():
+                bind_optimize_control_scroll(child)
 
         self.opt_input_path_var = tk.StringVar(value="")
         self.opt_output_dir_var = tk.StringVar(value="")
@@ -3881,12 +3994,15 @@ class BumbleBoxV2GUI(tk.Tk):
             column=0,
             text="Profile",
             help_title="Optimization Profile",
-            help_details="Quick tests fewer combinations; Deep explores more combinations and takes longer.",
+            help_details=(
+                "Quick tests fewer combinations; Daily keeps measured size bounds fixed and sweeps "
+                "lighting-sensitive parameters; Deep explores more combinations and takes longer."
+            ),
         )
         profile_combo = ttk.Combobox(
             top,
             textvariable=self.opt_profile_var,
-            values=["quick", "balanced", "deep"],
+            values=["quick", "balanced", "deep", "daily"],
             state="readonly",
             width=20,
         )
@@ -4127,7 +4243,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._opt_profile_notebook = ttk.Notebook(sweep_frame)
         self._opt_profile_notebook.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         self._opt_profile_notebook.bind("<<NotebookTabChanged>>", self._on_optimize_profile_tab_changed)
-        for profile in ("quick", "balanced", "deep"):
+        for profile in ("quick", "balanced", "deep", "daily"):
             tab = self._build_optimize_sweep_profile_tab(self._opt_profile_notebook, profile)
             self._opt_profile_tabs[profile] = tab
             self._opt_profile_notebook.add(tab, text=profile)
@@ -4163,6 +4279,8 @@ class BumbleBoxV2GUI(tk.Tk):
         ttk.Label(controls, textvariable=self.opt_status_var).pack(side=tk.LEFT, padx=10)
 
         top.columnconfigure(1, weight=1)
+        bind_optimize_control_scroll(controls_canvas)
+        bind_optimize_control_scroll(top)
 
         self.optimize_output = self._create_results_section(
             self.optimize_tracking_tab,
@@ -4173,6 +4291,9 @@ class BumbleBoxV2GUI(tk.Tk):
             auto_height=True,
             min_text_lines=4,
             max_text_lines=16,
+            expand=False,
+            wrap=tk.NONE,
+            horizontal_scroll=True,
         )
 
     def _save_optimizer_dictionary_to_config(self) -> None:
@@ -4467,7 +4588,8 @@ class BumbleBoxV2GUI(tk.Tk):
         note = (
             "Use the frame controls to find good examples. Measure the SMALLEST real tag you want BumbleBox "
             "to detect and the LARGEST real tag you expect to accept. Avoid measuring artifacts. Drag any "
-            "placed point to adjust it. Scroll over the image or use the zoom buttons for more precise placement."
+            "placed point to adjust it. Scroll over the image to zoom at the cursor. Right-drag, middle-drag, "
+            "or enable Pan mode to move around while zoomed in."
         )
         ttk.Label(outer, text=note, wraplength=1080, justify=tk.LEFT).pack(anchor="w")
 
@@ -4476,12 +4598,19 @@ class BumbleBoxV2GUI(tk.Tk):
         frame_info_var = tk.StringVar(value="")
         zoom_var = tk.StringVar(value="Zoom: 100%")
         active_role_var = tk.StringVar(value="smallest")
+        pan_mode_var = tk.BooleanVar(value=False)
         ttk.Button(frame_controls, text="Prev Frame", command=lambda: shift_frame(-1)).pack(side=tk.LEFT)
         ttk.Button(frame_controls, text="Next Frame", command=lambda: shift_frame(1)).pack(side=tk.LEFT, padx=(6, 12))
-        ttk.Button(frame_controls, text="Zoom -", command=lambda: adjust_zoom(1 / 1.25)).pack(side=tk.LEFT)
-        ttk.Button(frame_controls, text="Zoom +", command=lambda: adjust_zoom(1.25)).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(frame_controls, text="Fit", command=lambda: set_zoom(1.0)).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Button(frame_controls, text="Zoom Out", command=lambda: adjust_zoom(1 / 1.35)).pack(side=tk.LEFT)
+        ttk.Button(frame_controls, text="Zoom In", command=lambda: adjust_zoom(1.35)).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(frame_controls, text="Fit", command=lambda: set_zoom(1.0)).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(frame_controls, text="100%", command=lambda: zoom_to_actual()).pack(side=tk.LEFT, padx=(4, 12))
         ttk.Label(frame_controls, textvariable=zoom_var).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            frame_controls,
+            text="Pan mode",
+            variable=pan_mode_var,
+        ).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Radiobutton(
             frame_controls,
             text="Measure smallest tag",
@@ -4551,6 +4680,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "frame_bgr": None,
         }
         drag_state: dict[str, int | None] = {"index": None}
+        pan_state: dict[str, bool] = {"active": False}
 
         result_label = ttk.Label(outer, textvariable=result_var, justify=tk.LEFT, wraplength=1080)
         result_label.pack(anchor="w", pady=(8, 0))
@@ -4674,7 +4804,10 @@ class BumbleBoxV2GUI(tk.Tk):
             current_frame["display_width"] = display_width
             current_frame["display_height"] = display_height
             canvas.configure(scrollregion=(0, 0, display_width, display_height))
-            zoom_var.set(f"Zoom: {float(current_frame['zoom']) * 100:.0f}%")
+            zoom_var.set(
+                f"Zoom: {float(current_frame['zoom']) * 100:.0f}% fit | "
+                f"{float(current_frame['scale']) * 100:.0f}% actual"
+            )
 
         def redraw_points() -> None:
             canvas.delete("measurement")
@@ -4721,7 +4854,20 @@ class BumbleBoxV2GUI(tk.Tk):
             render_current_frame()
             redraw_points()
 
-        def set_zoom(zoom: float, *, focus: tuple[float, float] | None = None) -> None:
+        def current_view_focus() -> tuple[float, float, float, float] | None:
+            scale = float(current_frame["scale"])
+            if scale <= 0:
+                return None
+            view_x = max(1, int(canvas.winfo_width())) / 2.0
+            view_y = max(1, int(canvas.winfo_height())) / 2.0
+            return (
+                canvas.canvasx(view_x) / scale,
+                canvas.canvasy(view_y) / scale,
+                view_x,
+                view_y,
+            )
+
+        def set_zoom(zoom: float, *, focus: tuple[float, float, float, float] | None = None) -> None:
             current_frame["zoom"] = max(1.0, min(8.0, float(zoom)))
             current_frame["scale"] = float(current_frame["fit_scale"]) * float(current_frame["zoom"])
             redraw_image_and_points()
@@ -4730,10 +4876,8 @@ class BumbleBoxV2GUI(tk.Tk):
                 display_height = max(1, int(current_frame["display_height"]))
                 target_x = max(0.0, min(display_width, focus[0] * float(current_frame["scale"])))
                 target_y = max(0.0, min(display_height, focus[1] * float(current_frame["scale"])))
-                visible_width = max(1, int(canvas.winfo_width()))
-                visible_height = max(1, int(canvas.winfo_height()))
-                canvas.xview_moveto(max(0.0, min(1.0, (target_x - visible_width / 2.0) / display_width)))
-                canvas.yview_moveto(max(0.0, min(1.0, (target_y - visible_height / 2.0) / display_height)))
+                canvas.xview_moveto(max(0.0, min(1.0, (target_x - focus[2]) / display_width)))
+                canvas.yview_moveto(max(0.0, min(1.0, (target_y - focus[3]) / display_height)))
 
         def adjust_zoom(factor: float, *, focus_event: tk.Event | None = None) -> None:
             focus = None
@@ -4742,8 +4886,16 @@ class BumbleBoxV2GUI(tk.Tk):
                 canvas_y = canvas.canvasy(focus_event.y)
                 scale = float(current_frame["scale"])
                 if scale > 0:
-                    focus = (canvas_x / scale, canvas_y / scale)
+                    focus = (canvas_x / scale, canvas_y / scale, float(focus_event.x), float(focus_event.y))
+            else:
+                focus = current_view_focus()
             set_zoom(float(current_frame["zoom"]) * factor, focus=focus)
+
+        def zoom_to_actual() -> None:
+            fit_scale = float(current_frame["fit_scale"])
+            if fit_scale <= 0:
+                return
+            set_zoom(1.0 / fit_scale, focus=current_view_focus())
 
         def load_frame(position: int) -> None:
             position = max(0, min(len(frame_refs) - 1, int(position)))
@@ -4781,15 +4933,39 @@ class BumbleBoxV2GUI(tk.Tk):
         def shift_frame(delta: int) -> None:
             load_frame(int(current_frame["position"]) + delta)
 
-        def on_press(event: tk.Event) -> None:
+        def update_canvas_cursor(*_args: object) -> None:
+            canvas.configure(cursor="fleur" if pan_mode_var.get() else "")
+
+        pan_mode_var.trace_add("write", update_canvas_cursor)
+
+        def begin_pan(event: tk.Event) -> str:
+            pan_state["active"] = True
+            drag_state["index"] = None
+            canvas.scan_mark(event.x, event.y)
+            canvas.configure(cursor="fleur")
+            return "break"
+
+        def drag_pan(event: tk.Event) -> str:
+            if pan_state.get("active"):
+                canvas.scan_dragto(event.x, event.y, gain=1)
+            return "break"
+
+        def end_pan(_event: tk.Event) -> str:
+            pan_state["active"] = False
+            update_canvas_cursor()
+            return "break"
+
+        def on_press(event: tk.Event) -> str | None:
+            if pan_mode_var.get():
+                return begin_pan(event)
             x, y = clamp_point(canvas.canvasx(event.x), canvas.canvasy(event.y))
             index = nearest_point_index(x, y)
             points = current_points()
             if index is not None:
                 drag_state["index"] = index
-                return
+                return None
             if len(points) >= 4:
-                return
+                return None
             scale = float(current_frame["scale"])
             if current_state().get("frame_position") != current_frame["position"]:
                 points = []
@@ -4797,23 +4973,30 @@ class BumbleBoxV2GUI(tk.Tk):
             set_current_points(points)
             drag_state["index"] = len(points) - 1
             redraw_points()
+            return None
 
-        def on_drag(event: tk.Event) -> None:
+        def on_drag(event: tk.Event) -> str | None:
+            if pan_state.get("active"):
+                return drag_pan(event)
             index = drag_state.get("index")
             if index is None:
-                return
+                return None
             points = current_points()
             if not (0 <= int(index) < len(points)):
-                return
+                return None
             x, y = clamp_point(canvas.canvasx(event.x), canvas.canvasy(event.y))
             scale = float(current_frame["scale"])
             points[int(index)] = (x / scale, y / scale)
             set_current_points(points)
             redraw_points()
+            return None
 
-        def on_release(_event: tk.Event) -> None:
+        def on_release(_event: tk.Event) -> str | None:
+            if pan_state.get("active"):
+                return end_pan(_event)
             drag_state["index"] = None
             update_active_measurement()
+            return None
 
         def reset_points() -> None:
             state = current_state()
@@ -4875,9 +5058,20 @@ class BumbleBoxV2GUI(tk.Tk):
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
+        canvas.bind("<ButtonPress-2>", begin_pan)
+        canvas.bind("<B2-Motion>", drag_pan)
+        canvas.bind("<ButtonRelease-2>", end_pan)
+        canvas.bind("<ButtonPress-3>", begin_pan)
+        canvas.bind("<B3-Motion>", drag_pan)
+        canvas.bind("<ButtonRelease-3>", end_pan)
         canvas.bind("<MouseWheel>", lambda event: adjust_zoom(1.25 if event.delta > 0 else 1 / 1.25, focus_event=event))
         canvas.bind("<Button-4>", lambda event: adjust_zoom(1.25, focus_event=event))
         canvas.bind("<Button-5>", lambda event: adjust_zoom(1 / 1.25, focus_event=event))
+        dialog.bind("<plus>", lambda _event: adjust_zoom(1.35))
+        dialog.bind("<equal>", lambda _event: adjust_zoom(1.35))
+        dialog.bind("<minus>", lambda _event: adjust_zoom(1 / 1.35))
+        dialog.bind("<KeyPress-0>", lambda _event: zoom_to_actual())
+        dialog.bind("<KeyPress-f>", lambda _event: set_zoom(1.0))
 
         ttk.Button(footer, text="Reset Active Points", command=reset_points).pack(side=tk.LEFT)
         apply_button.configure(command=apply_measurement)
@@ -4970,6 +5164,8 @@ class BumbleBoxV2GUI(tk.Tk):
                 )
                 if current_values != default_values:
                     sweep_overrides[key] = current_values
+            config_for_index, _config_path_for_index = self._load_config_or_defaults()
+            valid_tag_ids = self._tracking_allowed_tag_ids_from_config(config_for_index)
         except Exception as exc:
             self._show_error("Invalid settings", str(exc))
             return
@@ -4986,6 +5182,8 @@ class BumbleBoxV2GUI(tk.Tk):
         self._optimize_result = None
         self._optimize_refinement_result = None
         self._optimize_applied_config = None
+        self._optimize_index_result = None
+        self._optimize_index_error = None
         self._optimize_top_k = top_k
         self._optimize_stop_event.clear()
         self._optimize_started_monotonic = time.monotonic()
@@ -5009,6 +5207,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "preview_frames": preview_frames,
             "top_k": max(top_k, 10),
             "review_perimeter_bounds": self._current_opt_review_perimeter_bounds(profile),
+            "valid_tag_ids": valid_tag_ids or None,
         }
         self.optimize_output.delete("1.0", tk.END)
         self.optimize_output.insert(
@@ -5025,7 +5224,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._optimize_thread = threading.Thread(
             target=self._run_optimize_tracking_worker,
-            args=(optimize_kwargs,),
+            args=(optimize_kwargs, config_for_index),
             daemon=True,
         )
         self._optimize_thread.start()
@@ -5038,8 +5237,9 @@ class BumbleBoxV2GUI(tk.Tk):
         self.optimize_stop_btn.config(state=tk.DISABLED)
         self.opt_status_var.set("Stopping after current parameter combination finishes...")
 
-    def _run_optimize_tracking_worker(self, optimize_kwargs: dict) -> None:
+    def _run_optimize_tracking_worker(self, optimize_kwargs: dict, config_for_index: dict) -> None:
         from .tracking_optimizer import optimize_tracking
+        from .tracking_index import sync_optimization_result
 
         def progress_callback(
             done: int,
@@ -5056,6 +5256,10 @@ class BumbleBoxV2GUI(tk.Tk):
                 **optimize_kwargs,
             )
             self._optimize_result = result
+            try:
+                self._optimize_index_result = sync_optimization_result(config_for_index, result)
+            except Exception as exc:
+                self._optimize_index_error = str(exc)
         except Exception as exc:
             self._optimize_error = str(exc)
             return
@@ -5133,6 +5337,8 @@ class BumbleBoxV2GUI(tk.Tk):
             ]
             if not seed_params:
                 raise ValueError(f"The previous optimization result has no {source_label} to refine.")
+            config_for_index, _config_path_for_index = self._load_config_or_defaults()
+            valid_tag_ids = self._tracking_allowed_tag_ids_from_config(config_for_index)
         except Exception as exc:
             self._show_error("Invalid refinement settings", str(exc))
             return
@@ -5148,6 +5354,8 @@ class BumbleBoxV2GUI(tk.Tk):
         self._optimize_extra_report = None
         self._optimize_refinement_result = None
         self._optimize_applied_config = None
+        self._optimize_index_result = None
+        self._optimize_index_error = None
         self._optimize_top_k = top_k
         self._optimize_stop_event.clear()
         self._optimize_started_monotonic = time.monotonic()
@@ -5172,6 +5380,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "preview_frames": preview_frames,
             "top_k": max(top_k, seed_count, 10),
             "review_perimeter_bounds": self._current_opt_review_perimeter_bounds(profile),
+            "valid_tag_ids": valid_tag_ids or None,
         }
 
         self.optimize_output.delete("1.0", tk.END)
@@ -5191,17 +5400,18 @@ class BumbleBoxV2GUI(tk.Tk):
 
         self._optimize_thread = threading.Thread(
             target=self._run_optimize_refinement_worker,
-            args=(refine_kwargs,),
+            args=(refine_kwargs, config_for_index),
             daemon=True,
         )
         self._optimize_thread.start()
         self.after(200, self._poll_optimize_tracking)
 
-    def _run_optimize_refinement_worker(self, refine_kwargs: dict) -> None:
+    def _run_optimize_refinement_worker(self, refine_kwargs: dict, config_for_index: dict) -> None:
         from .tracking_optimizer import (
             format_iterative_refinement_report,
             optimize_tracking_iterative_refinement,
         )
+        from .tracking_index import sync_optimization_result
 
         def progress_callback(
             done: int,
@@ -5220,6 +5430,10 @@ class BumbleBoxV2GUI(tk.Tk):
             self._optimize_refinement_result = refinement_result
             self._optimize_result = refinement_result.final_result
             self._optimize_extra_report = format_iterative_refinement_report(refinement_result)
+            try:
+                self._optimize_index_result = sync_optimization_result(config_for_index, refinement_result.final_result)
+            except Exception as exc:
+                self._optimize_index_error = str(exc)
         except Exception as exc:
             self._optimize_error = str(exc)
             return
@@ -5243,7 +5457,9 @@ class BumbleBoxV2GUI(tk.Tk):
 
     def _apply_selected_optimization_candidate(self, params: dict[str, float | int]) -> None:
         from .tracking_optimizer import apply_best_params_to_config
+        from .tracking_index import format_local_index_result, sync_optimization_result
 
+        index_note = ""
         try:
             config_path_obj = Path(self.config_path_var.get().strip() or str(DEFAULT_USER_CONFIG_PATH))
             if config_path_obj.exists():
@@ -5259,6 +5475,17 @@ class BumbleBoxV2GUI(tk.Tk):
             )
             self._optimize_applied_config = str(config_path_obj)
             self._load_config_into_editor()
+            if self._optimize_result is not None:
+                try:
+                    index_result = sync_optimization_result(
+                        updated,
+                        self._optimize_result,
+                        selected_params=dict(params),
+                        selected_label="selected_from_review",
+                    )
+                    index_note = "\n\n" + format_local_index_result(index_result)
+                except Exception as exc:
+                    index_note = f"\n\nLocal tracking index update failed: {exc}"
         except Exception as exc:
             self._show_error("Optimization apply failed", str(exc))
             return
@@ -5267,11 +5494,13 @@ class BumbleBoxV2GUI(tk.Tk):
         history_note = self._format_config_history_note(snapshot_path, history_warning)
         if history_note:
             message += f"\n\n{history_note}"
+        if index_note:
+            message += index_note
         self._show_info("Optimization parameters applied", message)
 
         self.optimize_output.insert(
             tk.END,
-            f"\n\nApplied selected optimization parameters to config: {config_path_obj}",
+            f"\n\nApplied selected optimization parameters to config: {config_path_obj}{index_note}",
         )
 
     def _open_optimize_review_dialog(self, manifest_path: Path) -> None:
@@ -5487,6 +5716,8 @@ class BumbleBoxV2GUI(tk.Tk):
         top_candidates: list[dict[str, object]],
         latest_candidate: dict[str, object] | None = None,
     ) -> str:
+        from .tracking_optimizer import format_candidate_results_table
+
         now = time.monotonic()
         elapsed_s = (
             now - self._optimize_started_monotonic
@@ -5535,114 +5766,35 @@ class BumbleBoxV2GUI(tk.Tk):
                 f"ETA: {self._format_seconds(eta_s) if eta_s > 0 else 'n/a'}"
             ),
             "",
-            "Current top five score candidates:",
+            "Current top score candidates:",
         ]
         if not top_candidates:
             lines.append("No candidates have finished yet.")
             return "\n".join(lines)
 
-        param_columns = [
-            ("minMarkerPerimeterRate", "minPerim", 8, "float"),
-            ("maxMarkerPerimeterRate", "maxPerim", 8, "float"),
-            ("adaptiveThreshWinSizeMin", "winMin", 6, "int"),
-            ("adaptiveThreshWinSizeMax", "winMax", 6, "int"),
-            ("adaptiveThreshWinSizeStep", "winStep", 7, "int"),
-            ("polygonalApproxAccuracyRate", "poly", 7, "float"),
-            ("adaptiveThreshConstant", "const", 5, "int"),
-        ]
-        header_parts = [
-            f"{'#':>2}",
-            f"{'score':>8}",
-            f"{'detect':>7}",
-            f"{'reject':>7}",
-            f"{'stable':>7}",
-            f"{'ms/frame':>8}",
-        ]
-        for _key, label, width, _kind in param_columns:
-            header_parts.append(f"{label:>{width}}")
-        header = "  ".join(header_parts)
-        lines.append(header)
-        lines.append("-" * len(header))
-
-        for candidate in top_candidates[:5]:
-            params = candidate.get("params", {})
-            if not isinstance(params, dict):
-                params = {}
-            eval_fps = float(candidate.get("eval_fps", 0.0) or 0.0)
-            avg_frame_ms = (1000.0 / eval_fps) if eval_fps > 0 else 0.0
-            row_parts = [
-                f"{int(candidate.get('rank', 0)):>2}",
-                f"{float(candidate.get('score', 0.0)):>8.4f}",
-                f"{float(candidate.get('mean_detected', 0.0)):>7.3f}",
-                f"{float(candidate.get('mean_rejected', 0.0)):>7.3f}",
-                f"{float(candidate.get('stability', 0.0)):>7.3f}",
-                f"{avg_frame_ms:>8.2f}",
-            ]
-            for key, _label, width, kind in param_columns:
-                value = params.get(key, "")
-                if value == "":
-                    row_parts.append(f"{'':>{width}}")
-                elif kind == "int":
-                    row_parts.append(f"{int(float(value)):>{width}}")
-                else:
-                    row_parts.append(f"{float(value):>{width}.4g}")
-            lines.append("  ".join(row_parts))
+        lines.append(format_candidate_results_table(top_candidates, ranking="score", max_rows=5))
 
         lines.extend(
             [
                 "",
-                "Columns: detect/reject are average counts per sampled frame.",
-                "Parameter columns: minPerim/maxPerim are marker perimeter-rate bounds, poly=polygonalApproxAccuracyRate.",
+                "Table notes: detect/reject/std are average counts per sampled frame; "
+                "test_s is wall time for that parameter set.",
+                "Parameter columns: minPerim/maxPerim are marker perimeter-rate bounds, "
+                "poly=polygonalApproxAccuracyRate, const=adaptiveThreshConstant.",
             ]
         )
         if top_detection_candidates:
             lines.extend(
                 [
                     "",
-                    "Top five by mean detections so far:",
+                    "Top mean-detection candidates so far:",
+                    format_candidate_results_table(
+                        top_detection_candidates,
+                        ranking="detection",
+                        max_rows=5,
+                    ),
                 ]
             )
-            detection_header_parts = [
-                f"{'det#':>4}",
-                f"{'score#':>6}",
-                f"{'score':>8}",
-                f"{'detect':>7}",
-                f"{'reject':>7}",
-                f"{'stable':>7}",
-                f"{'ms/frame':>8}",
-            ]
-            for _key, label, width, _kind in param_columns:
-                detection_header_parts.append(f"{label:>{width}}")
-            detection_header = "  ".join(detection_header_parts)
-            lines.append(detection_header)
-            lines.append("-" * len(detection_header))
-
-        for candidate in top_detection_candidates[:5]:
-            if not isinstance(candidate, dict):
-                continue
-            params = candidate.get("params", {})
-            if not isinstance(params, dict):
-                params = {}
-            eval_fps = float(candidate.get("eval_fps", 0.0) or 0.0)
-            avg_frame_ms = (1000.0 / eval_fps) if eval_fps > 0 else 0.0
-            row_parts = [
-                f"{int(candidate.get('detection_rank', 0)):>4}",
-                f"{int(candidate.get('rank', 0)):>6}",
-                f"{float(candidate.get('score', 0.0)):>8.4f}",
-                f"{float(candidate.get('mean_detected', 0.0)):>7.3f}",
-                f"{float(candidate.get('mean_rejected', 0.0)):>7.3f}",
-                f"{float(candidate.get('stability', 0.0)):>7.3f}",
-                f"{avg_frame_ms:>8.2f}",
-            ]
-            for key, _label, width, kind in param_columns:
-                value = params.get(key, "")
-                if value == "":
-                    row_parts.append(f"{'':>{width}}")
-                elif kind == "int":
-                    row_parts.append(f"{int(float(value)):>{width}}")
-                else:
-                    row_parts.append(f"{float(value):>{width}.4g}")
-            lines.append("  ".join(row_parts))
         return "\n".join(lines)
 
     @staticmethod
@@ -5660,6 +5812,7 @@ class BumbleBoxV2GUI(tk.Tk):
 
     def _poll_optimize_tracking(self) -> None:
         from .tracking_optimizer import format_optimization_report
+        from .tracking_index import format_local_index_result
 
         latest_progress = None
         while True:
@@ -5678,23 +5831,20 @@ class BumbleBoxV2GUI(tk.Tk):
                 )
             else:
                 self.opt_status_var.set(f"Running... evaluated {done}/{total} parameter combinations")
-            self.optimize_output.delete("1.0", tk.END)
-            self.optimize_output.insert(
-                tk.END,
+            self._replace_text_preserving_scroll(
+                self.optimize_output,
                 self._format_optimize_live_progress(done, total, top_candidates, latest_candidate),
             )
         elif self._optimize_thread and self._optimize_thread.is_alive() and self._optimize_latest_progress:
             done, total, top_candidates, latest_candidate = self._optimize_latest_progress
-            self.optimize_output.delete("1.0", tk.END)
-            self.optimize_output.insert(
-                tk.END,
+            self._replace_text_preserving_scroll(
+                self.optimize_output,
                 self._format_optimize_live_progress(done, total, top_candidates, latest_candidate),
             )
         elif self._optimize_thread and self._optimize_thread.is_alive() and self._optimize_started_monotonic:
             elapsed_s = time.monotonic() - self._optimize_started_monotonic
-            self.optimize_output.delete("1.0", tk.END)
-            self.optimize_output.insert(
-                tk.END,
+            self._replace_text_preserving_scroll(
+                self.optimize_output,
                 "Running optimize-tracking...\n"
                 "Evaluated parameter combinations: 0/?\n"
                 f"Elapsed: {self._format_seconds(elapsed_s)}\n"
@@ -5725,17 +5875,19 @@ class BumbleBoxV2GUI(tk.Tk):
 
         stopped_by_user = bool(getattr(self._optimize_result, "stopped_by_user", False))
         self.opt_status_var.set("Ended early" if stopped_by_user else "Completed")
-        self.optimize_output.delete("1.0", tk.END)
+        final_text_parts = []
         if self._optimize_extra_report:
-            self.optimize_output.insert(tk.END, self._optimize_extra_report)
-            self.optimize_output.insert(tk.END, "\n\nFinal Optimization Report\n-------------------------\n")
-        self.optimize_output.insert(
-            tk.END,
-            format_optimization_report(self._optimize_result, top_k=self._optimize_top_k),
-        )
+            final_text_parts.append(self._optimize_extra_report)
+            final_text_parts.append("Final Optimization Report\n-------------------------")
+        final_text_parts.append(format_optimization_report(self._optimize_result, top_k=self._optimize_top_k))
+        if self._optimize_index_result is not None:
+            final_text_parts.append("Local Tracking Index\n--------------------\n" + format_local_index_result(self._optimize_index_result))
+        if self._optimize_index_error:
+            final_text_parts.append(f"Local tracking index update failed: {self._optimize_index_error}")
         if self._optimize_warning:
             self.opt_status_var.set("Completed with warning")
-            self.optimize_output.insert(tk.END, f"\n\nWarning: {self._optimize_warning}")
+            final_text_parts.append(f"Warning: {self._optimize_warning}")
+        self._replace_text_preserving_scroll(self.optimize_output, "\n\n".join(final_text_parts))
         self.notebook.select(self.optimize_tracking_tab)
         self._prompt_optimize_review()
 
@@ -6522,8 +6674,35 @@ class BumbleBoxV2GUI(tk.Tk):
         ).pack(side=tk.LEFT, padx=(8, 0))
         automation_box.columnconfigure(0, weight=1)
 
+        index_box = ttk.LabelFrame(top, text="Local Tracking Index", padding=6)
+        index_box.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Label(
+            index_box,
+            text=(
+                "BumbleBox keeps a lightweight local copy of run summaries, tracking CSVs, and optimization "
+                "results in repo-local LocalTrackingIndex by default. Generated artifacts are ignored by Git, "
+                "and large videos are intentionally not copied here."
+            ),
+            wraplength=900,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky="w")
+        index_actions = ttk.Frame(index_box)
+        index_actions.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        ttk.Button(
+            index_actions,
+            text="Open Tracking Index",
+            command=self._open_local_tracking_index,
+        ).pack(side=tk.LEFT)
+        self.tracking_index_sync_btn = ttk.Button(
+            index_actions,
+            text="Sync Recent Runs To Index",
+            command=self._sync_recent_runs_to_tracking_index,
+        )
+        self.tracking_index_sync_btn.pack(side=tk.LEFT, padx=(8, 0))
+        index_box.columnconfigure(0, weight=1)
+
         systemd_advanced = ttk.LabelFrame(top, text="Advanced Timer Controls", padding=6)
-        systemd_advanced.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        systemd_advanced.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         ttk.Label(systemd_advanced, text="Timer/unit file output dir").grid(row=0, column=0, sticky="w")
         ttk.Entry(systemd_advanced, textvariable=self.systemd_output_dir_var, width=70).grid(
             row=0, column=1, columnspan=2, sticky="ew", padx=8, pady=4
@@ -6634,6 +6813,90 @@ class BumbleBoxV2GUI(tk.Tk):
         self._set_run_history_detail_text("")
         self._register_advanced_widget(export_controls)
         self.after(100, self._refresh_run_history)
+
+    def _open_path_in_file_manager(self, path: Path) -> None:
+        if sys.platform == "darwin":
+            command = ["open", str(path)]
+        elif os.name == "nt":
+            command = ["explorer", str(path)]
+        else:
+            command = ["xdg-open", str(path)]
+        subprocess.Popen(command)
+
+    def _open_local_tracking_index(self) -> None:
+        from .tracking_index import ensure_local_index_root
+
+        try:
+            config, _config_path = self._load_config_or_defaults()
+            root = ensure_local_index_root(config)
+            self._open_path_in_file_manager(root)
+            self.run_output.delete("1.0", tk.END)
+            self.run_output.insert(tk.END, f"Opened local tracking index:\n{root}")
+        except Exception as exc:
+            self._show_error("Open tracking index failed", str(exc))
+
+    def _sync_recent_runs_to_tracking_index(self) -> None:
+        if self._tracking_index_thread and self._tracking_index_thread.is_alive():
+            self._show_info("Tracking index sync", "A tracking index sync is already running.")
+            return
+
+        try:
+            config, _config_path = self._load_config_or_defaults()
+            data_root = str(config.get("system", {}).get("data_root", "")).strip()
+            if not data_root:
+                raise ValueError("system.data_root is empty in config.")
+        except Exception as exc:
+            self._show_error("Tracking index sync failed", str(exc))
+            return
+
+        self._tracking_index_output_text = None
+        self._tracking_index_error = None
+        self.tracking_index_sync_btn.config(state=tk.DISABLED)
+        self.run_output.delete("1.0", tk.END)
+        self.run_output.insert(tk.END, "Syncing recent runs to local tracking index...\n")
+
+        def _worker() -> None:
+            from .tracking_index import summarize_index_results, sync_run_summary_file
+
+            try:
+                records = list_recent_run_records(data_root, limit=80)
+                results = []
+                for record in records:
+                    payload = load_run_summary(record.summary_path)
+                    results.append(
+                        sync_run_summary_file(
+                            config,
+                            record.summary_path,
+                            summary_payload=payload,
+                        )
+                    )
+                self._tracking_index_output_text = summarize_index_results(results)
+            except Exception as exc:
+                self._tracking_index_error = str(exc)
+
+        self._tracking_index_thread = threading.Thread(target=_worker, daemon=True)
+        self._tracking_index_thread.start()
+        self.after(150, self._poll_tracking_index_sync)
+
+    def _poll_tracking_index_sync(self) -> None:
+        thread = self._tracking_index_thread
+        if thread and thread.is_alive():
+            self.after(150, self._poll_tracking_index_sync)
+            return
+
+        self._tracking_index_thread = None
+        self.tracking_index_sync_btn.config(state=tk.NORMAL)
+        if self._tracking_index_error:
+            error = self._tracking_index_error
+            self._tracking_index_error = None
+            self._show_error("Tracking index sync failed", error)
+            self.run_output.insert(tk.END, f"\nError: {error}\n")
+            return
+
+        text = self._tracking_index_output_text or "Tracking index sync finished."
+        self._tracking_index_output_text = None
+        self.run_output.delete("1.0", tk.END)
+        self.run_output.insert(tk.END, text)
 
     def _load_config_or_defaults(self):
         config_path = Path(self.config_path_var.get()).expanduser()

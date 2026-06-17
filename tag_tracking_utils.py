@@ -7,6 +7,9 @@ import numpy as np
 import os
 import time
 
+def _marker_id_value(ids, index):
+    return int(np.asarray(ids).reshape(-1)[index])
+
 def load_actual_fps(filepath):
     try:
         fps_path = filepath
@@ -99,7 +102,7 @@ def trackTagsFromVid(filepath, todays_folder_path, filename, tag_dictionary, box
                 ymean = c[:,1].mean()
                 xmean_top_point = (c[0,0] + c[1,0]) / 2
                 ymean_top_point = (c[0,1] + c[1,1]) / 2
-                raw.append([filename, colony_number, now, frame_num, int(ids[i]), xmean, ymean, xmean_top_point, ymean_top_point])
+                raw.append([filename, colony_number, now, frame_num, _marker_id_value(ids, i), xmean, ymean, xmean_top_point, ymean_top_point])
 
         frame_num += 1
 
@@ -194,7 +197,7 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
                 ymean = c[:,1].mean()
                 xmean_top_point = (c[0,0] + c[1,0]) / 2
                 ymean_top_point = (c[0,1] + c[1,1]) / 2
-                raw.append([filename, colony_number, now, frame_num, int(ids[i]), xmean, ymean, xmean_top_point, ymean_top_point])
+                raw.append([filename, colony_number, now, frame_num, _marker_id_value(ids, i), xmean, ymean, xmean_top_point, ymean_top_point])
 
         frame_num += 1
 
@@ -248,7 +251,7 @@ def _process_frame_chunk(args):
                 ymean = c[:, 1].mean()
                 xmean_top = (c[0, 0] + c[1, 0]) / 2
                 ymean_top = (c[0, 1] + c[1, 1]) / 2
-                raw.append([filename, colony_number, now, frame_num, int(ids[j]), xmean, ymean, xmean_top, ymean_top])
+                raw.append([filename, colony_number, now, frame_num, _marker_id_value(ids, j), xmean, ymean, xmean_top, ymean_top])
 
     return raw, noID
 

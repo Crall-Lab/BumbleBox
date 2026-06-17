@@ -603,14 +603,18 @@ def annotate_registration_overlay_with_session_tracking(
         label = " ".join(label_parts)
         text_x = max(0, cx + 8)
         text_y = max(12, cy - 8)
+        overlay_h, overlay_w = overlay.shape[:2]
+        label_base = max(1.0, min(overlay_w, overlay_h) / 1800.0)
+        label_scale = max(0.9, min(2.2, label_base * 1.25))
+        label_thickness = max(2, int(round(label_base * 2.0)))
         cv2.putText(
             overlay,
             label,
             (text_x, text_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
+            label_scale,
             (0, 0, 0),
-            3,
+            label_thickness + 3,
             cv2.LINE_AA,
         )
         cv2.putText(
@@ -618,9 +622,9 @@ def annotate_registration_overlay_with_session_tracking(
             label,
             (text_x, text_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
+            label_scale,
             (255, 255, 255),
-            1,
+            label_thickness,
             cv2.LINE_AA,
         )
         annotations_drawn += 1

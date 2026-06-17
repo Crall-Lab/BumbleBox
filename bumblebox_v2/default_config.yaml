@@ -5,6 +5,15 @@ system:
   ram_gb_override: null
   timezone: "auto"
 
+local_index:
+  enabled: true
+  path: "LocalTrackingIndex"
+  copy_tracking_csvs: true
+  copy_run_summaries: true
+  copy_optimization_results: true
+  copy_config_snapshots: true
+  copy_fps_reports: true
+
 camera:
   model: "auto"
   width: 4056
@@ -46,6 +55,8 @@ capture:
 tracking:
   tag_dictionary: "4X4_50"
   box_preset: "custom"
+  allowed_tag_ids: []
+  allowed_tag_ids_path: null
   excluded_tag_ids:
     - 17
     - 37

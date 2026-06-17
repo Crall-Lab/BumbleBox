@@ -12,7 +12,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 import cv2
 
@@ -34,7 +34,7 @@ SCORE_EXPECTED_ERROR_WEIGHT = 0.10
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mjpeg", ".avi", ".mov", ".mkv"}
 GENERATED_OPTIMIZER_DIR_NAMES = {"tracking_optimization", "top_candidate_review"}
-VALID_PROFILES = {"quick", "balanced", "deep"}
+VALID_PROFILES = {"quick", "balanced", "deep", "daily"}
 VALID_EXECUTION_TARGETS = {"pi_safe", "desktop"}
 
 PROFILE_PARAMETER_SPACE = {
@@ -65,6 +65,15 @@ PROFILE_PARAMETER_SPACE = {
         "polygonalApproxAccuracyRate": [0.04, 0.05, 0.06, 0.08],
         "adaptiveThreshConstant": [5, 7],
     },
+    "daily": {
+        "minMarkerPerimeterRate": [0.019153],
+        "maxMarkerPerimeterRate": [0.052808],
+        "adaptiveThreshWinSizeMin": [3, 5],
+        "adaptiveThreshWinSizeMax": [29, 36, 41, 57, 73, 81, 105, 127, 151],
+        "adaptiveThreshWinSizeStep": [2, 3],
+        "polygonalApproxAccuracyRate": [0.06, 0.08],
+        "adaptiveThreshConstant": [1, 3, 5, 7, 9],
+    },
 }
 VALID_SWEEP_OVERRIDE_KEYS = {
     key
@@ -84,6 +93,15 @@ OPTIMIZED_ARUCO_PARAM_KEYS = (
     "adaptiveThreshWinSizeStep",
     "polygonalApproxAccuracyRate",
     "adaptiveThreshConstant",
+)
+CANDIDATE_TABLE_PARAM_COLUMNS = (
+    ("minMarkerPerimeterRate", "minPerim", 8, "float"),
+    ("maxMarkerPerimeterRate", "maxPerim", 8, "float"),
+    ("adaptiveThreshWinSizeMin", "winMin", 6, "int"),
+    ("adaptiveThreshWinSizeMax", "winMax", 6, "int"),
+    ("adaptiveThreshWinSizeStep", "winStep", 7, "int"),
+    ("polygonalApproxAccuracyRate", "poly", 7, "float"),
+    ("adaptiveThreshConstant", "const", 5, "int"),
 )
 
 
@@ -107,6 +125,8 @@ class OptimizationCandidate:
     unique_ids: int
     eval_fps: float
     runtime_seconds: float
+    mean_decoded: float = 0.0
+    mean_filtered: float = 0.0
 
 
 @dataclass
@@ -253,11 +273,12 @@ def resolve_profile_parameter_space(
         raise ValueError("tag_size_mm must be > 0")
 
     space = deepcopy(PROFILE_PARAMETER_SPACE[profile_key])
-    space["minMarkerPerimeterRate"] = _min_marker_rates_for_tag_size(
-        tag_size_mm=tag_size_mm,
-        frame_width=frame_width,
-        frame_height=frame_height,
-    )
+    if profile_key != "daily":
+        space["minMarkerPerimeterRate"] = _min_marker_rates_for_tag_size(
+            tag_size_mm=tag_size_mm,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
     return space
 
 
@@ -322,6 +343,43 @@ def build_parameter_grid(
     if not combinations:
         raise RuntimeError("Parameter grid is empty after validation.")
     return combinations
+
+
+def limit_parameter_grid(
+    param_grid: Sequence[dict[str, float | int]],
+    max_combinations: Optional[int],
+) -> list[dict[str, float | int]]:
+    grid = list(param_grid)
+    if max_combinations is None or int(max_combinations) <= 0:
+        return grid
+    max_count = int(max_combinations)
+    if len(grid) <= max_count:
+        return grid
+    if max_count == 1:
+        return [grid[0]]
+
+    # Evenly thin the deterministic product grid so broad parameter coverage is preserved.
+    selected_indices: list[int] = []
+    used: set[int] = set()
+    span = len(grid) - 1
+    for idx in range(max_count):
+        selected = int(round((idx * span) / float(max_count - 1)))
+        while selected in used and selected < len(grid) - 1:
+            selected += 1
+        while selected in used and selected > 0:
+            selected -= 1
+        if selected in used:
+            continue
+        used.add(selected)
+        selected_indices.append(selected)
+
+    cursor = 0
+    while len(selected_indices) < max_count and cursor < len(grid):
+        if cursor not in used:
+            selected_indices.append(cursor)
+            used.add(cursor)
+        cursor += 1
+    return [grid[index] for index in sorted(selected_indices[:max_count])]
 
 
 def _candidate_param_key(params: dict[str, float | int]) -> tuple[float | int, ...]:
@@ -730,11 +788,87 @@ def _score_candidate(
     return score
 
 
+def _normalized_valid_tag_ids(valid_tag_ids: Optional[Iterable[int]]) -> Optional[set[int]]:
+    if valid_tag_ids is None:
+        return None
+    out: set[int] = set()
+    for raw_id in valid_tag_ids:
+        try:
+            out.add(int(raw_id))
+        except (TypeError, ValueError):
+            continue
+    return out if out else None
+
+
+def _perimeter_filter_bounds(
+    params: dict[str, float | int],
+    explicit_bounds: Optional[tuple[float, float]],
+) -> Optional[tuple[float, float]]:
+    if explicit_bounds is not None:
+        min_rate, max_rate = explicit_bounds
+        return float(min_rate), float(max_rate)
+    try:
+        min_rate = float(params.get("minMarkerPerimeterRate", 0.0) or 0.0)
+        max_rate = float(params.get("maxMarkerPerimeterRate", DEFAULT_MAX_MARKER_PERIMETER_RATE) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if min_rate <= 0 and max_rate <= 0:
+        return None
+    return min_rate, max_rate
+
+
+def _valid_decoded_marker_ids(
+    *,
+    corners: Any,
+    ids: Any,
+    frame_width: int,
+    frame_height: int,
+    valid_tag_ids: Optional[set[int]],
+    perimeter_bounds: Optional[tuple[float, float]],
+) -> tuple[set[int], set[int], int]:
+    decoded_ids: set[int] = set()
+    valid_ids: set[int] = set()
+    filtered_count = 0
+    if ids is None or len(ids) <= 0:
+        return decoded_ids, valid_ids, filtered_count
+
+    for corner, marker_id_raw in zip(corners, ids.flatten().tolist()):
+        try:
+            marker_id = int(marker_id_raw)
+        except (TypeError, ValueError):
+            filtered_count += 1
+            continue
+        decoded_ids.add(marker_id)
+
+        if valid_tag_ids is not None and marker_id not in valid_tag_ids:
+            filtered_count += 1
+            continue
+
+        if perimeter_bounds is not None:
+            min_rate, max_rate = perimeter_bounds
+            perimeter_rate = _corner_perimeter_rate(
+                corner,
+                frame_width=frame_width,
+                frame_height=frame_height,
+            )
+            if min_rate > 0 and perimeter_rate < min_rate:
+                filtered_count += 1
+                continue
+            if max_rate > 0 and perimeter_rate > max_rate:
+                filtered_count += 1
+                continue
+
+        valid_ids.add(marker_id)
+    return decoded_ids, valid_ids, filtered_count
+
+
 def _evaluate_candidate(
     params: dict[str, float | int],
     frames: Sequence,
     dictionary_name: str,
     expected_tags: Optional[float],
+    valid_tag_ids: Optional[set[int]] = None,
+    perimeter_filter_bounds: Optional[tuple[float, float]] = None,
 ) -> OptimizationCandidate:
     detector_params = cv2.aruco.DetectorParameters()
     for param_name, param_value in params.items():
@@ -747,10 +881,13 @@ def _evaluate_candidate(
     detector = cv2.aruco.ArucoDetector(dictionary, detector_params)
 
     detected_counts = []
+    decoded_counts = []
+    filtered_counts = []
     rejected_counts = []
     stability_scores = []
     unique_ids = set()
     previous_ids = set()
+    bounds = _perimeter_filter_bounds(params, perimeter_filter_bounds)
 
     start = time.perf_counter()
     for frame in frames:
@@ -758,16 +895,25 @@ def _evaluate_candidate(
             gray = frame
         else:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_height, frame_width = gray.shape[:2]
 
         corners, ids, rejected = detector.detectMarkers(gray)
-        ids_set = set()
-        if ids is not None and len(ids) > 0:
-            ids_set = {int(value) for value in ids.flatten().tolist()}
-            unique_ids.update(ids_set)
+        decoded_ids, ids_set, filtered_count = _valid_decoded_marker_ids(
+            corners=corners,
+            ids=ids,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            valid_tag_ids=valid_tag_ids,
+            perimeter_bounds=bounds,
+        )
+        unique_ids.update(ids_set)
 
         detected = len(ids_set)
+        decoded_count = len(decoded_ids)
         rejected_count = len(rejected) if rejected is not None else 0
         detected_counts.append(detected)
+        decoded_counts.append(decoded_count)
+        filtered_counts.append(filtered_count)
         rejected_counts.append(rejected_count)
 
         union = previous_ids | ids_set
@@ -780,6 +926,8 @@ def _evaluate_candidate(
     runtime = max(1e-9, time.perf_counter() - start)
     frame_count = len(frames)
     mean_detected = statistics.fmean(detected_counts) if detected_counts else 0.0
+    mean_decoded = statistics.fmean(decoded_counts) if decoded_counts else 0.0
+    mean_filtered = statistics.fmean(filtered_counts) if filtered_counts else 0.0
     mean_rejected = statistics.fmean(rejected_counts) if rejected_counts else 0.0
     std_detected = statistics.pstdev(detected_counts) if len(detected_counts) > 1 else 0.0
     stability = statistics.fmean(stability_scores) if stability_scores else 0.0
@@ -803,6 +951,8 @@ def _evaluate_candidate(
         unique_ids=len(unique_ids),
         eval_fps=eval_fps,
         runtime_seconds=runtime,
+        mean_decoded=mean_decoded,
+        mean_filtered=mean_filtered,
     )
 
 
@@ -817,6 +967,8 @@ def _write_candidates_csv(candidates: Sequence[OptimizationCandidate], csv_path:
         "rank",
         "score",
         "mean_detected",
+        "mean_decoded",
+        "mean_filtered",
         "std_detected",
         "mean_rejected",
         "stability",
@@ -834,6 +986,8 @@ def _write_candidates_csv(candidates: Sequence[OptimizationCandidate], csv_path:
                     "rank": item.rank,
                     "score": f"{item.score:.6f}",
                     "mean_detected": f"{item.mean_detected:.6f}",
+                    "mean_decoded": f"{item.mean_decoded:.6f}",
+                    "mean_filtered": f"{item.mean_filtered:.6f}",
                     "std_detected": f"{item.std_detected:.6f}",
                     "mean_rejected": f"{item.mean_rejected:.6f}",
                     "stability": f"{item.stability:.6f}",
@@ -862,8 +1016,12 @@ def _top_candidate_snapshots(
                 "rank": rank,
                 "score": candidate.score,
                 "mean_detected": candidate.mean_detected,
+                "mean_decoded": candidate.mean_decoded,
+                "mean_filtered": candidate.mean_filtered,
+                "std_detected": candidate.std_detected,
                 "mean_rejected": candidate.mean_rejected,
                 "stability": candidate.stability,
+                "unique_ids": candidate.unique_ids,
                 "eval_fps": candidate.eval_fps,
                 "runtime_seconds": candidate.runtime_seconds,
                 "params": dict(candidate.params),
@@ -933,12 +1091,124 @@ def _candidate_progress_snapshot(
         "rank": rank,
         "score": candidate.score,
         "mean_detected": candidate.mean_detected,
+        "mean_decoded": candidate.mean_decoded,
+        "mean_filtered": candidate.mean_filtered,
+        "std_detected": candidate.std_detected,
         "mean_rejected": candidate.mean_rejected,
         "stability": candidate.stability,
+        "unique_ids": candidate.unique_ids,
         "eval_fps": candidate.eval_fps,
         "runtime_seconds": candidate.runtime_seconds,
         "params": dict(candidate.params),
     }
+
+
+def _candidate_table_value(candidate: object, key: str, default: object = "") -> object:
+    if isinstance(candidate, dict):
+        return candidate.get(key, default)
+    return getattr(candidate, key, default)
+
+
+def _candidate_table_params(candidate: object) -> dict[str, object]:
+    params = _candidate_table_value(candidate, "params", {})
+    return params if isinstance(params, dict) else {}
+
+
+def _format_candidate_table_float(value: object, width: int, precision: int) -> str:
+    if value in ("", None):
+        return f"{'':>{width}}"
+    try:
+        return f"{float(value):>{width}.{precision}f}"
+    except Exception:
+        return f"{str(value):>{width}}"
+
+
+def _format_candidate_table_param(value: object, width: int, kind: str) -> str:
+    if value in ("", None):
+        return f"{'':>{width}}"
+    try:
+        if kind == "int":
+            return f"{int(float(value)):>{width}}"
+        return f"{float(value):>{width}.4g}"
+    except Exception:
+        return f"{str(value):>{width}}"
+
+
+def format_candidate_results_table(
+    candidates: Sequence[object],
+    *,
+    ranking: str = "score",
+    max_rows: int = 5,
+) -> str:
+    rows = list(candidates[: max(1, int(max_rows))])
+    if not rows:
+        return "No candidates have finished yet."
+
+    detection_table = ranking == "detection"
+    header_parts = (
+        [
+            f"{'det#':>4}",
+            f"{'score#':>6}",
+        ]
+        if detection_table
+        else [f"{'#':>4}"]
+    )
+    header_parts.extend(
+        [
+            f"{'score':>9}",
+            f"{'detect':>7}",
+            f"{'decoded':>7}",
+            f"{'filt':>6}",
+            f"{'std':>6}",
+            f"{'reject':>8}",
+            f"{'stable':>7}",
+            f"{'ms/frame':>8}",
+            f"{'test_s':>7}",
+        ]
+    )
+    for _key, label, width, _kind in CANDIDATE_TABLE_PARAM_COLUMNS:
+        header_parts.append(f"{label:>{width}}")
+
+    header = "  ".join(header_parts)
+    lines = [header, "-" * len(header)]
+
+    for row_index, candidate in enumerate(rows, start=1):
+        params = _candidate_table_params(candidate)
+        eval_fps = _candidate_table_value(candidate, "eval_fps", 0.0)
+        try:
+            avg_frame_ms = (1000.0 / float(eval_fps)) if float(eval_fps) > 0 else 0.0
+        except Exception:
+            avg_frame_ms = 0.0
+
+        if detection_table:
+            detection_rank = _candidate_table_value(candidate, "detection_rank", row_index)
+            score_rank = _candidate_table_value(candidate, "rank", 0)
+            row_parts = [
+                f"{int(detection_rank or row_index):>4}",
+                f"{int(score_rank or 0):>6}",
+            ]
+        else:
+            rank = _candidate_table_value(candidate, "rank", row_index)
+            row_parts = [f"{int(rank or row_index):>4}"]
+
+        row_parts.extend(
+            [
+                _format_candidate_table_float(_candidate_table_value(candidate, "score", 0.0), 9, 4),
+                _format_candidate_table_float(_candidate_table_value(candidate, "mean_detected", 0.0), 7, 3),
+                _format_candidate_table_float(_candidate_table_value(candidate, "mean_decoded", 0.0), 7, 3),
+                _format_candidate_table_float(_candidate_table_value(candidate, "mean_filtered", 0.0), 6, 3),
+                _format_candidate_table_float(_candidate_table_value(candidate, "std_detected", ""), 6, 3),
+                _format_candidate_table_float(_candidate_table_value(candidate, "mean_rejected", 0.0), 8, 3),
+                _format_candidate_table_float(_candidate_table_value(candidate, "stability", 0.0), 7, 3),
+                f"{avg_frame_ms:>8.2f}",
+                _format_candidate_table_float(_candidate_table_value(candidate, "runtime_seconds", 0.0), 7, 2),
+            ]
+        )
+        for key, _label, width, kind in CANDIDATE_TABLE_PARAM_COLUMNS:
+            row_parts.append(_format_candidate_table_param(params.get(key, ""), width, kind))
+        lines.append("  ".join(row_parts))
+
+    return "\n".join(lines)
 
 
 def _iter_input_frames(input_path: Path):
@@ -1016,6 +1286,52 @@ def _draw_perimeter_flag(
     )
 
 
+def _draw_large_marker_ids(frame_bgr: Any, corners: Any, ids: Any) -> None:
+    if ids is None or len(ids) <= 0:
+        return
+    frame_height, frame_width = frame_bgr.shape[:2]
+    base = max(1.0, min(frame_width, frame_height) / 1800.0)
+    font_scale = max(1.25, min(3.2, base * 1.7))
+    thickness = max(3, int(round(base * 2.8)))
+    id_values = ids.flatten().tolist()
+    for corner, marker_id_raw in zip(corners, id_values):
+        points = corner.reshape(-1, 2)
+        if len(points) <= 0:
+            continue
+        marker_id = int(marker_id_raw)
+        label = str(marker_id)
+        center_x = int(round(float(points[:, 0].mean())))
+        top_y = int(round(float(points[:, 1].min())))
+        (text_w, text_h), _baseline = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            thickness,
+        )
+        text_x = max(0, min(frame_width - text_w, center_x - (text_w // 2)))
+        text_y = max(text_h + 6, top_y - 10)
+        cv2.putText(
+            frame_bgr,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (0, 0, 0),
+            thickness + 4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame_bgr,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
 def write_preview_video(
     input_path: str | Path,
     dictionary_name: str,
@@ -1048,6 +1364,7 @@ def write_preview_video(
             corners, ids, _rejected = detector.detectMarkers(gray)
             if ids is not None and len(ids) > 0:
                 cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+                _draw_large_marker_ids(frame, corners, ids)
             writer.write(frame)
             frames_written += 1
             if frames_written >= max_frames:
@@ -1069,9 +1386,28 @@ def _annotate_review_frame(
     sample_position: int,
     source_index: int,
     perimeter_flag_bounds: Optional[tuple[float, float]] = None,
-) -> tuple[Any, int, int, int, int]:
+    valid_tag_ids: Optional[set[int]] = None,
+) -> tuple[Any, int, int, int, int, int, int]:
     corners, ids, rejected = detector.detectMarkers(frame_gray)
-    detected_count = 0 if ids is None else int(len(ids))
+    frame_height, frame_width = frame_gray.shape[:2]
+    if perimeter_flag_bounds is not None:
+        min_rate, max_rate = perimeter_flag_bounds
+    else:
+        min_rate = float(candidate.params.get("minMarkerPerimeterRate", 0.0) or 0.0)
+        max_rate = float(
+            candidate.params.get("maxMarkerPerimeterRate", DEFAULT_MAX_MARKER_PERIMETER_RATE)
+            or DEFAULT_MAX_MARKER_PERIMETER_RATE
+        )
+    decoded_ids, valid_ids, filtered_count = _valid_decoded_marker_ids(
+        corners=corners,
+        ids=ids,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        valid_tag_ids=valid_tag_ids,
+        perimeter_bounds=(min_rate, max_rate),
+    )
+    detected_count = len(valid_ids)
+    decoded_count = len(decoded_ids)
     rejected_count = 0 if rejected is None else int(len(rejected))
     below_min_count = 0
     above_max_count = 0
@@ -1079,15 +1415,7 @@ def _annotate_review_frame(
     annotated = cv2.cvtColor(frame_gray, cv2.COLOR_GRAY2BGR)
     if ids is not None and len(ids) > 0:
         cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
-        frame_height, frame_width = frame_gray.shape[:2]
-        if perimeter_flag_bounds is not None:
-            min_rate, max_rate = perimeter_flag_bounds
-        else:
-            min_rate = float(candidate.params.get("minMarkerPerimeterRate", 0.0) or 0.0)
-            max_rate = float(
-                candidate.params.get("maxMarkerPerimeterRate", DEFAULT_MAX_MARKER_PERIMETER_RATE)
-                or DEFAULT_MAX_MARKER_PERIMETER_RATE
-            )
+        _draw_large_marker_ids(annotated, corners, ids)
         for corner, marker_id_raw in zip(corners, ids.flatten().tolist()):
             perimeter_rate = _corner_perimeter_rate(
                 corner,
@@ -1118,7 +1446,10 @@ def _annotate_review_frame(
 
     overlay_lines = [
         f"Candidate #{candidate.rank}  score={candidate.score:.3f}",
-        f"sample={sample_position} source={source_index} detected={detected_count} rejected={rejected_count}",
+        (
+            f"sample={sample_position} source={source_index} detected={detected_count} "
+            f"decoded={decoded_count} filtered={filtered_count} rejected={rejected_count}"
+        ),
         f"perimeter flags: magenta small={below_min_count}  cyan large={above_max_count}",
     ]
     for idx, line in enumerate(overlay_lines):
@@ -1143,7 +1474,7 @@ def _annotate_review_frame(
             2,
             cv2.LINE_AA,
         )
-    return annotated, detected_count, rejected_count, below_min_count, above_max_count
+    return annotated, detected_count, decoded_count, filtered_count, rejected_count, below_min_count, above_max_count
 
 
 def _resize_review_image(frame_bgr: Any, *, max_width: int = 1280, max_height: int = 900) -> Any:
@@ -1167,6 +1498,7 @@ def write_top_candidate_review_artifacts(
     max_frames: int = 12,
     extra_candidates: Optional[Sequence[tuple[str, OptimizationCandidate]]] = None,
     perimeter_flag_bounds: Optional[tuple[float, float]] = None,
+    valid_tag_ids: Optional[set[int]] = None,
 ) -> Optional[Path]:
     if not sampled_frames or not candidates:
         return None
@@ -1236,6 +1568,8 @@ def write_top_candidate_review_artifacts(
             (
                 annotated,
                 detected_count,
+                decoded_count,
+                filtered_count,
                 rejected_count,
                 below_min_count,
                 above_max_count,
@@ -1246,6 +1580,7 @@ def write_top_candidate_review_artifacts(
                 sample_position=sample_position,
                 source_index=source_index,
                 perimeter_flag_bounds=perimeter_flag_bounds,
+                valid_tag_ids=valid_tag_ids,
             )
             total_below_min_count += below_min_count
             total_above_max_count += above_max_count
@@ -1259,6 +1594,8 @@ def write_top_candidate_review_artifacts(
                     "sample_position": sample_position,
                     "source_index": source_index,
                     "detected_count": detected_count,
+                    "decoded_count": decoded_count,
+                    "filtered_count": filtered_count,
                     "rejected_count": rejected_count,
                     "below_min_perimeter_count": below_min_count,
                     "above_max_perimeter_count": above_max_count,
@@ -1300,6 +1637,7 @@ def optimize_tracking(
     tag_size_mm: float = DEFAULT_TAG_SIZE_MM,
     sweep_overrides: Optional[dict[str, Sequence[float | int]]] = None,
     candidate_param_grid: Optional[Sequence[dict[str, Any]]] = None,
+    max_parameter_combinations: Optional[int] = None,
     execution_target: str = DEFAULT_EXECUTION_TARGET,
     workers: Optional[int] = None,
     expected_tags: Optional[float] = None,
@@ -1310,6 +1648,7 @@ def optimize_tracking(
     preview_frames: int = 240,
     top_k: int = 10,
     review_perimeter_bounds: Optional[tuple[float, float]] = None,
+    valid_tag_ids: Optional[Iterable[int]] = None,
     progress_callback: Optional[ProgressCallback] = None,
     stop_requested: Optional[StopRequestedCallback] = None,
 ) -> TrackingOptimizationResult:
@@ -1330,6 +1669,8 @@ def optimize_tracking(
         raise ValueError("top_k must be >= 1")
     if tag_size_mm <= 0:
         raise ValueError("tag_size_mm must be > 0")
+    if max_parameter_combinations is not None and int(max_parameter_combinations) <= 0:
+        raise ValueError("max_parameter_combinations must be >= 1 when provided")
     if expected_tags is not None and expected_tags <= 0:
         raise ValueError("expected_tags must be > 0 when provided")
     if early_stop_patience < 0:
@@ -1344,6 +1685,7 @@ def optimize_tracking(
             raise ValueError("review_perimeter_bounds max must be greater than min")
 
     normalized_dictionary = normalize_dictionary_name(dictionary_name)
+    normalized_valid_tag_ids = _normalized_valid_tag_ids(valid_tag_ids)
     resolved_input = _resolve_user_path(input_path)
     sampled_frames, input_type, total_input_frames, sample_indices = load_sample_frames_with_indices(
         resolved_input,
@@ -1362,6 +1704,11 @@ def optimize_tracking(
             sweep_overrides=sweep_overrides,
         )
         parameter_source = "profile sweep grid"
+    parameter_combinations_uncapped = len(param_grid)
+    if max_parameter_combinations is not None:
+        param_grid = limit_parameter_grid(param_grid, int(max_parameter_combinations))
+        if len(param_grid) < parameter_combinations_uncapped:
+            parameter_source += f" (capped from {parameter_combinations_uncapped})"
     resolved_workers = recommended_worker_count(target_key, workers)
 
     evaluated: list[OptimizationCandidate] = []
@@ -1406,7 +1753,14 @@ def optimize_tracking(
 
     if resolved_workers == 1:
         for params in param_grid:
-            candidate = _evaluate_candidate(params, sampled_frames, normalized_dictionary, expected_tags)
+            candidate = _evaluate_candidate(
+                params,
+                sampled_frames,
+                normalized_dictionary,
+                expected_tags,
+                valid_tag_ids=normalized_valid_tag_ids,
+                perimeter_filter_bounds=review_perimeter_bounds,
+            )
             register_candidate(candidate)
             if early_stopped or stopped_by_user:
                 break
@@ -1422,6 +1776,8 @@ def optimize_tracking(
                         sampled_frames,
                         normalized_dictionary,
                         expected_tags,
+                        normalized_valid_tag_ids,
+                        review_perimeter_bounds,
                     )
                     for params in batch
                 ]
@@ -1480,6 +1836,7 @@ def optimize_tracking(
             for idx, candidate in enumerate(top_detection_candidates, start=1)
         ],
         perimeter_flag_bounds=review_perimeter_bounds,
+        valid_tag_ids=normalized_valid_tag_ids,
     )
 
     top_candidates = evaluated[: max(top_k, 1)]
@@ -1524,6 +1881,8 @@ def optimize_tracking(
     summary["total_input_frames"] = total_input_frames
     summary["all_candidates_count"] = len(evaluated)
     summary["parameter_combinations_total"] = total
+    summary["parameter_combinations_uncapped"] = parameter_combinations_uncapped
+    summary["max_parameter_combinations"] = max_parameter_combinations
     summary["all_candidates_csv"] = str(csv_path)
     summary["review_perimeter_bounds"] = (
         {
@@ -1533,6 +1892,11 @@ def optimize_tracking(
         }
         if review_perimeter_bounds is not None
         else None
+    )
+    summary["valid_tag_ids_filter"] = sorted(normalized_valid_tag_ids) if normalized_valid_tag_ids else None
+    summary["mean_detected_definition"] = (
+        "valid decoded tags after perimeter and allowed-ID filtering; "
+        "see mean_decoded and mean_filtered for raw decoded audit counts"
     )
 
     with Path(result.summary_json_path).open("w") as f:
@@ -1560,6 +1924,7 @@ def optimize_tracking_iterative_refinement(
     preview_frames: int = 240,
     top_k: int = 10,
     review_perimeter_bounds: Optional[tuple[float, float]] = None,
+    valid_tag_ids: Optional[Iterable[int]] = None,
     progress_callback: Optional[ProgressCallback] = None,
     stop_requested: Optional[StopRequestedCallback] = None,
 ) -> IterativeTrackingRefinementResult:
@@ -1630,6 +1995,7 @@ def optimize_tracking_iterative_refinement(
             preview_frames=preview_frames,
             top_k=max(top_k, seed_candidate_count),
             review_perimeter_bounds=review_perimeter_bounds,
+            valid_tag_ids=valid_tag_ids,
             progress_callback=stage_callback(f"Refinement round {round_index}/{rounds}"),
             stop_requested=stop_requested,
         )
@@ -1667,6 +2033,7 @@ def optimize_tracking_iterative_refinement(
             preview_frames=preview_frames,
             top_k=max(top_k, seed_candidate_count),
             review_perimeter_bounds=review_perimeter_bounds,
+            valid_tag_ids=valid_tag_ids,
             progress_callback=stage_callback("Validation pass"),
             stop_requested=stop_requested,
         )
@@ -1749,6 +2116,18 @@ def format_optimization_report(result: TrackingOptimizationResult, top_k: int = 
         f"Summary JSON: {result.summary_json_path}",
         f"Candidates CSV: {result.candidates_csv_path}",
     ]
+    summary_path = Path(result.summary_json_path)
+    valid_filter_note = ""
+    try:
+        summary_payload = json.loads(summary_path.read_text())
+        if summary_payload.get("valid_tag_ids_filter"):
+            valid_filter_note = f" Allowed-ID filter: {len(summary_payload['valid_tag_ids_filter'])} IDs."
+    except Exception:
+        valid_filter_note = ""
+    lines.append(
+        "Mean detections are valid decoded tags after perimeter and allowed-ID filters."
+        + valid_filter_note
+    )
     if result.preview_video_path:
         lines.append(f"Preview video: {result.preview_video_path}")
     if result.review_manifest_json_path:
@@ -1756,25 +2135,24 @@ def format_optimization_report(result: TrackingOptimizationResult, top_k: int = 
 
     lines.append("")
     lines.append("Top score candidates:")
-    for candidate in result.top_candidates[: max(1, top_k)]:
-        lines.append(
-            (
-                f"{candidate.rank}. score={candidate.score:.4f}, detected={candidate.mean_detected:.3f}, "
-                f"rejected={candidate.mean_rejected:.3f}, stability={candidate.stability:.3f}, "
-                f"fps={candidate.eval_fps:.2f}, params={json.dumps(candidate.params, sort_keys=True)}"
-            )
-        )
+    lines.append(format_candidate_results_table(result.top_candidates, ranking="score", max_rows=top_k))
     lines.append("")
     lines.append("Top mean-detection candidates:")
-    for detection_rank, candidate in enumerate(result.top_detection_candidates[:5], start=1):
-        lines.append(
-            (
-                f"{detection_rank}. score_rank={candidate.rank}, detected={candidate.mean_detected:.3f}, "
-                f"score={candidate.score:.4f}, rejected={candidate.mean_rejected:.3f}, "
-                f"stability={candidate.stability:.3f}, fps={candidate.eval_fps:.2f}, "
-                f"params={json.dumps(candidate.params, sort_keys=True)}"
-            )
-        )
+    detection_rows = []
+    for detection_rank, candidate in enumerate(result.top_detection_candidates[: max(1, top_k)], start=1):
+        row = asdict(candidate)
+        row["detection_rank"] = detection_rank
+        detection_rows.append(row)
+    lines.append(format_candidate_results_table(detection_rows, ranking="detection", max_rows=top_k))
+    lines.extend(
+        [
+            "",
+            "Table notes: detect is valid decoded tags/frame; decoded is raw ArUco decoded tags/frame; "
+            "filt is decoded tags/frame removed by perimeter or allowed-ID filters; reject/std are average counts per sampled frame; "
+            "test_s is wall time for that parameter set. minPerim/maxPerim are marker perimeter-rate bounds; "
+            "poly=polygonalApproxAccuracyRate; const=adaptiveThreshConstant.",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -1917,6 +2295,7 @@ def legacy_entrypoint(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--write-preview", action="store_true", help="Write a short preview video for best params.")
     parser.add_argument("--preview-frames", type=int, default=240, help="Max frames in preview video.")
     parser.add_argument("--top-k", type=int, default=5, help="Number of top candidates to print.")
+    parser.add_argument("--max-combinations", type=int, help="Optional cap on parameter combinations to evaluate.")
     args = parser.parse_args(argv)
 
     print(
@@ -1972,6 +2351,7 @@ def legacy_entrypoint(argv: Optional[Sequence[str]] = None) -> int:
             dictionary_name=args.dictionary,
             tag_size_mm=args.tag_size_mm,
             sweep_overrides=sweep_overrides or None,
+            max_parameter_combinations=args.max_combinations,
             execution_target=args.execution_target,
             workers=args.workers,
             expected_tags=args.expected_tags,
