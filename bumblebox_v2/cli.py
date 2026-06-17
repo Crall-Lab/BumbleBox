@@ -1497,6 +1497,7 @@ def _cmd_track_videos(args: argparse.Namespace) -> int:
             optimization_workers=args.optimization_workers,
             optimization_selection=args.optimization_selection,
             resume_tracking=not bool(args.force_retrack),
+            legacy_skip_existing_tracking=bool(args.legacy_skip_existing_tracking),
             progress_callback=_posthoc_progress,
         )
     except Exception as exc:
@@ -2012,6 +2013,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-retrack",
         action="store_true",
         help="Ignore completed per-video tracking markers and regenerate tracking outputs.",
+    )
+    track_videos_parser.add_argument(
+        "--legacy-skip-existing-tracking",
+        action="store_true",
+        help=(
+            "Temporary bridge for pre-marker runs: skip a video when existing raw/noID tracking CSVs "
+            "are present, then write a completion marker for future safe resume."
+        ),
     )
     track_videos_parser.add_argument(
         "--optimize-per-date",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import re
@@ -102,6 +103,7 @@ class PosthocTrackingReport:
     run_cleaning: bool
     run_metrics: bool
     resume_tracking: bool
+    legacy_skip_existing_tracking: bool
     report_path: Optional[str]
     optimizations: list[PosthocDateOptimizationResult]
     results: list[PosthocVideoResult]
@@ -468,6 +470,65 @@ def _load_valid_tracking_completion(
     return payload, ""
 
 
+def _csv_rows_and_frame_count(path: Path) -> tuple[int, int]:
+    if not path.exists() or not path.is_file():
+        return 0, 0
+
+    rows = 0
+    max_frame: Optional[int] = None
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows += 1
+            raw_frame = row.get("frame")
+            if raw_frame is None:
+                continue
+            try:
+                frame_value = int(float(raw_frame))
+            except (TypeError, ValueError):
+                continue
+            max_frame = frame_value if max_frame is None else max(max_frame, frame_value)
+    return rows, (int(max_frame) + 1 if max_frame is not None else 0)
+
+
+def _legacy_tracking_skip_payload(
+    *,
+    raw_csv_path: Path,
+    noid_csv_path: Path,
+    cleaned_csv_path: Path,
+    tracked_video_path: Path,
+    run_cleaning: bool,
+    render: bool,
+) -> tuple[Optional[dict[str, Any]], str]:
+    if not raw_csv_path.exists() or not raw_csv_path.is_file():
+        return None, "legacy raw CSV is missing"
+    if not noid_csv_path.exists() or not noid_csv_path.is_file():
+        return None, "legacy noID CSV is missing"
+
+    raw_rows, raw_frame_count = _csv_rows_and_frame_count(raw_csv_path)
+    noid_rows, noid_frame_count = _csv_rows_and_frame_count(noid_csv_path)
+    if run_cleaning and raw_rows > 0 and not cleaned_csv_path.exists():
+        return None, "legacy cleaned CSV is missing for a non-empty raw CSV"
+    if render and raw_rows > 0 and not tracked_video_path.exists():
+        return None, "legacy tracked video is missing"
+
+    return (
+        {
+            "raw_csv_path": str(raw_csv_path),
+            "noid_csv_path": str(noid_csv_path),
+            "cleaned_csv_path": str(cleaned_csv_path) if cleaned_csv_path.exists() else None,
+            "tracked_video_path": str(tracked_video_path) if tracked_video_path.exists() else None,
+            "raw_rows_before_filters": raw_rows,
+            "raw_rows_after_filters": raw_rows,
+            "removed_excluded_id_rows": 0,
+            "removed_disallowed_id_rows": 0,
+            "frame_count": max(raw_frame_count, noid_frame_count),
+            "noid_rows": noid_rows,
+        },
+        "",
+    )
+
+
 def _date_output_base(date_dir: Path, output_root_path: Optional[Path]) -> Path:
     if output_root_path is not None:
         return output_root_path / date_dir.name
@@ -826,6 +887,7 @@ def run_posthoc_tracking(
     optimization_workers: Optional[int] = None,
     optimization_selection: str = "mean_detection",
     resume_tracking: bool = True,
+    legacy_skip_existing_tracking: bool = False,
     progress_callback: Optional[PosthocProgressCallback] = None,
 ) -> PosthocTrackingReport:
     from .run_engine import (
@@ -854,6 +916,10 @@ def run_posthoc_tracking(
     _emit_progress(progress_callback, f"[posthoc] Videos found: {len(videos)}")
     _emit_progress(progress_callback, f"[posthoc] Output root: {output_root_path or 'date-local tracking folders'}")
     _emit_progress(progress_callback, f"[posthoc] Resume completed videos: {'yes' if resume_tracking else 'no'}")
+    _emit_progress(
+        progress_callback,
+        f"[posthoc] Legacy skip existing tracking CSVs: {'yes' if legacy_skip_existing_tracking else 'no'}",
+    )
     _emit_progress(
         progress_callback,
         f"[posthoc] Allowed tag IDs: {len(allowed_tag_ids) if allowed_tag_ids else 'none'}",
@@ -937,6 +1003,8 @@ def run_posthoc_tracking(
         raw_csv_path = output_dir / f"{session_name}_raw.csv"
         noid_csv_path = output_dir / f"{session_name}_noID.csv"
         completion_marker_path = output_dir / f"{session_name}_tracking_complete.json"
+        expected_cleaned_csv_path = output_dir / f"{session_name}_cleaned.csv"
+        expected_tracked_video_path = output_dir / f"{session_name}_tracked.mp4"
         cleaned_csv_path: Optional[Path] = None
         tracked_video_path: Optional[Path] = None
         frame_count = 0
@@ -944,7 +1012,7 @@ def run_posthoc_tracking(
             fallback_fps = float(config.get("camera", {}).get("fps_target", 5.0))
         except Exception:
             fallback_fps = 5.0
-        fps = fallback_fps if dry_run else _video_fps(video_path, config)
+        fps = fallback_fps
         raw_before = 0
         raw_after = 0
         removed_excluded = 0
@@ -1018,6 +1086,71 @@ def run_posthoc_tracking(
             if completion_marker_path.exists():
                 _emit_progress(progress_callback, f"[track] {session_name}: not resuming existing marker: {resume_reason}")
 
+        if (
+            legacy_skip_existing_tracking
+            and resume_tracking
+            and resume_signature_hash
+            and not dry_run
+            and not completion_marker_path.exists()
+        ):
+            legacy_payload, legacy_reason = _legacy_tracking_skip_payload(
+                raw_csv_path=raw_csv_path,
+                noid_csv_path=noid_csv_path,
+                cleaned_csv_path=expected_cleaned_csv_path,
+                tracked_video_path=expected_tracked_video_path,
+                run_cleaning=run_cleaning,
+                render=render,
+            )
+            if legacy_payload is not None:
+                skipped = True
+                success = True
+                item_warnings.append(
+                    "Skipped legacy existing tracking outputs without a completion marker. "
+                    "A new completion marker was written for future resumes."
+                )
+                _emit_progress(
+                    progress_callback,
+                    f"[track] {session_name}: legacy skip existing tracking CSVs; writing completion marker",
+                )
+                video_result = PosthocVideoResult(
+                    video_path=str(video_path),
+                    session_name=session_name,
+                    output_dir=str(output_dir),
+                    params_path=str(used_params_path) if used_params_path else None,
+                    raw_csv_path=str(raw_csv_path),
+                    noid_csv_path=str(noid_csv_path),
+                    cleaned_csv_path=str(expected_cleaned_csv_path) if expected_cleaned_csv_path.exists() else None,
+                    tracked_video_path=str(expected_tracked_video_path) if expected_tracked_video_path.exists() else None,
+                    frame_count=int(legacy_payload.get("frame_count") or 0),
+                    fps=float(fps),
+                    raw_rows_before_filters=int(legacy_payload.get("raw_rows_before_filters") or 0),
+                    raw_rows_after_filters=int(legacy_payload.get("raw_rows_after_filters") or 0),
+                    removed_excluded_id_rows=0,
+                    removed_disallowed_id_rows=0,
+                    allowed_tag_count=len(allowed_tag_ids) if allowed_tag_ids else None,
+                    elapsed_seconds=0.0,
+                    success=success,
+                    skipped=skipped,
+                    completion_marker_path=None,
+                    warnings=item_warnings,
+                    errors=item_errors,
+                )
+                marker_payload = {
+                    **asdict(video_result),
+                    "schema_version": TRACKING_COMPLETION_SCHEMA_VERSION,
+                    "completed_at": _now_iso(),
+                    "resume_signature": resume_signature,
+                    "resume_signature_hash": resume_signature_hash,
+                    "completion_marker_path": str(completion_marker_path),
+                    "legacy_skip_existing_tracking": True,
+                }
+                _write_json(completion_marker_path, marker_payload)
+                video_result.completion_marker_path = str(completion_marker_path)
+                results.append(video_result)
+                continue
+            if raw_csv_path.exists() or noid_csv_path.exists():
+                _emit_progress(progress_callback, f"[track] {session_name}: legacy skip unavailable: {legacy_reason}")
+
         try:
             if dry_run:
                 success = True
@@ -1029,6 +1162,7 @@ def run_posthoc_tracking(
                 output_dir.mkdir(parents=True, exist_ok=True)
                 item_config = _config_with_params(config, params)
                 now_value, colony_number = _video_datetime_and_colony(video_path, config)
+                fps = _video_fps(video_path, config)
                 _emit_progress(progress_callback, f"[track] {session_name}: detecting tags...")
                 df, df2, frame_count = trackTagsFromVid(
                     str(video_path),
@@ -1057,7 +1191,7 @@ def run_posthoc_tracking(
                 if run_cleaning and not getattr(df, "empty", True):
                     _emit_progress(progress_callback, f"[track] {session_name}: cleaning tracks...")
                     df_clean = _run_cleaning(item_config, df, fps)
-                    cleaned_csv_path = output_dir / f"{session_name}_cleaned.csv"
+                    cleaned_csv_path = expected_cleaned_csv_path
                     df_clean.to_csv(cleaned_csv_path, index=False)
                     if metrics:
                         _emit_progress(progress_callback, f"[track] {session_name}: calculating metrics...")
@@ -1066,7 +1200,7 @@ def run_posthoc_tracking(
                 if render and raw_csv_path.exists() and not getattr(df, "empty", True):
                     from bumblebox_desktop.visualization import render_tracking_video
 
-                    tracked_video_path = output_dir / f"{session_name}_tracked.mp4"
+                    tracked_video_path = expected_tracked_video_path
                     _emit_progress(progress_callback, f"[track] {session_name}: rendering tracked video...")
                     render_tracking_video(
                         video_path=video_path,
@@ -1145,6 +1279,7 @@ def run_posthoc_tracking(
         run_cleaning=run_cleaning,
         run_metrics=metrics,
         resume_tracking=resume_tracking,
+        legacy_skip_existing_tracking=legacy_skip_existing_tracking,
         report_path=str(report_path) if report_path else None,
         optimizations=optimization_results,
         results=results,
@@ -1179,6 +1314,7 @@ def format_posthoc_tracking_report(report: PosthocTrackingReport) -> str:
         f"Run cleaning: {report.run_cleaning}",
         f"Run metrics: {report.run_metrics}",
         f"Resume completed videos: {report.resume_tracking}",
+        f"Legacy skip existing tracking CSVs: {report.legacy_skip_existing_tracking}",
         f"Report JSON: {report.report_path or 'none'}",
     ]
 
