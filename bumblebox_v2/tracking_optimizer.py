@@ -1063,12 +1063,14 @@ def _top_detection_candidates(
 
 def _top_detection_candidate_snapshots(
     candidates: Sequence[OptimizationCandidate],
+    *,
+    limit: int = 5,
 ) -> list[ProgressCandidateSnapshot]:
     if not candidates:
         return []
     score_ranks = _score_rank_lookup(candidates)
     snapshots = []
-    for detection_rank, candidate in enumerate(_top_detection_candidates(candidates, limit=5), start=1):
+    for detection_rank, candidate in enumerate(_top_detection_candidates(candidates, limit=limit), start=1):
         snapshot = _candidate_progress_snapshot(candidate, rank=score_ranks.get(id(candidate), 0))
         snapshot["detection_rank"] = detection_rank
         snapshots.append(snapshot)
@@ -1738,7 +1740,7 @@ def optimize_tracking(
                 {
                     **_candidate_progress_snapshot(candidate, rank=done),
                     "highest_detection_candidate": _highest_detection_candidate_snapshot(evaluated),
-                    "top_detection_candidates": _top_detection_candidate_snapshots(evaluated),
+                    "top_detection_candidates": _top_detection_candidate_snapshots(evaluated, limit=20),
                 },
             )
         if candidate.score > (best_seen_score + early_stop_min_improvement):

@@ -759,7 +759,7 @@ def _optimize_tracking_per_date(
                 raise RuntimeError("No readable video frames could be sampled for optimization.")
             _emit_progress(progress_callback, f"[optimize] {date_label}: sampled {written_samples} frame(s)")
 
-            from .tracking_optimizer import optimize_tracking
+            from .tracking_optimizer import format_candidate_results_table, optimize_tracking
 
             last_emit = {"time": 0.0}
 
@@ -781,13 +781,21 @@ def _optimize_tracking_per_date(
                 best_score = float(best.get("score") or 0.0)
                 high = latest.get("highest_detection_candidate") or {}
                 high_detect = float(high.get("mean_detected") or 0.0)
+                top_detection_candidates = latest.get("top_detection_candidates") or []
+                top_detection_table = format_candidate_results_table(
+                    top_detection_candidates,
+                    ranking="detection",
+                    max_rows=20,
+                )
                 _emit_progress(
                     progress_callback,
                     (
                         f"[optimize] {date_label}: evaluated {done}/{total}; "
                         f"latest detect={latest_detect:.2f}, decoded={latest_decoded:.2f}, filtered={latest_filtered:.2f}; "
                         f"best detect={best_detect:.2f}, score={best_score:.3f}; "
-                        f"highest detect={high_detect:.2f}"
+                        f"highest detect={high_detect:.2f}\n"
+                        f"[optimize] {date_label}: top mean-detection candidates so far\n"
+                        f"{top_detection_table}"
                     ),
                 )
 
