@@ -1,0 +1,7 @@
+filename,ID,frame,centroidX,centroidY,label
+bumblebox-19_2026-03-17_20_50_04,38,50,732.75,2804.5,neighbor
+bumblebox-19_2026-03-17_20_50_04,38,51,3118.0,1671.5,jump
+bumblebox-19_2026-03-17_20_50_04,38,52,733.75,2804.25,neighbor
+bumblebox-19_2026-03-17_21_40_04,40,90,2749.25,1889.25,neighbor
+bumblebox-19_2026-03-17_21_40_04,40,91,1792.75,1865.25,jump
+bumblebox-19_2026-03-17_21_40_04,40,92,2797.0,1889.5,neighbor

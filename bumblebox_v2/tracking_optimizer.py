@@ -103,6 +103,29 @@ CANDIDATE_TABLE_PARAM_COLUMNS = (
     ("polygonalApproxAccuracyRate", "poly", 7, "float"),
     ("adaptiveThreshConstant", "const", 5, "int"),
 )
+IMAGE_DETECTION_CSV_FIELDS = [
+    "image_index",
+    "image_path",
+    "relative_image_path",
+    "tag_id",
+    "center_x",
+    "center_y",
+    "corner_0_x",
+    "corner_0_y",
+    "corner_1_x",
+    "corner_1_y",
+    "corner_2_x",
+    "corner_2_y",
+    "corner_3_x",
+    "corner_3_y",
+    "perimeter_px",
+    "perimeter_rate",
+    "frame_width",
+    "frame_height",
+    "selected_label",
+    "selected_params_path",
+    "params_json",
+]
 
 
 ProgressCandidateSnapshot = dict[str, Any]
@@ -644,8 +667,11 @@ def load_candidate_params_from_scores(path: str | Path, *, limit: int = 5) -> li
 
 def _classify_input_path(path: Path) -> str:
     if path.is_file():
-        if path.suffix.lower() not in VIDEO_EXTENSIONS:
-            raise ValueError(f"Unsupported video extension for {path}.")
+        suffix = path.suffix.lower()
+        if suffix in IMAGE_EXTENSIONS and not _is_system_sidecar_file(path):
+            return "image"
+        if suffix not in VIDEO_EXTENSIONS:
+            raise ValueError(f"Unsupported input extension for {path}.")
         return "video"
     if path.is_dir():
         return "image_dir"
@@ -666,12 +692,22 @@ def _is_generated_optimizer_artifact_path(path: Path, *, root: Path) -> bool:
     )
 
 
+def _is_system_sidecar_file(path: Path) -> bool:
+    name = path.name
+    if name.startswith("._"):
+        return True
+    if name in {".DS_Store", "Thumbs.db"}:
+        return True
+    return any(part.startswith("._") for part in path.parts)
+
+
 def find_supported_image_paths(image_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in image_dir.rglob("*")
         if path.is_file()
         and path.suffix.lower() in IMAGE_EXTENSIONS
+        and not _is_system_sidecar_file(path)
         and not _is_generated_optimizer_artifact_path(path, root=image_dir)
     )
 
@@ -754,11 +790,20 @@ def _load_sample_frames_from_image_dir(image_dir: Path, sample_count: int) -> tu
     return frames, len(all_images), used_indices
 
 
+def _load_sample_frames_from_image_file(image_path: Path) -> tuple[list, int, list[int]]:
+    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise RuntimeError(f"Could not read image for optimization: {image_path}")
+    return [image], 1, [0]
+
+
 def load_sample_frames_with_indices(input_path: str | Path, sample_count: int) -> tuple[list, str, int, list[int]]:
     path = _resolve_user_path(input_path)
     input_type = _classify_input_path(path)
     if input_type == "video":
         frames, total_count, sample_indices = _load_sample_frames_from_video(path, sample_count)
+    elif input_type == "image":
+        frames, total_count, sample_indices = _load_sample_frames_from_image_file(path)
     else:
         frames, total_count, sample_indices = _load_sample_frames_from_image_dir(path, sample_count)
     return frames, input_type, total_count, sample_indices
@@ -1229,6 +1274,12 @@ def _iter_input_frames(input_path: Path):
         cap.release()
         return
 
+    if input_type == "image":
+        frame = cv2.imread(str(input_path))
+        if frame is not None:
+            yield frame, 6.0
+        return
+
     image_paths = find_supported_image_paths(input_path)
     for path in image_paths:
         frame = cv2.imread(str(path))
@@ -1246,6 +1297,117 @@ def _corner_perimeter_rate(corner: Any, *, frame_width: int, frame_height: int) 
         x2, y2 = points[(idx + 1) % 4]
         perimeter += math.hypot(float(x2) - float(x1), float(y2) - float(y1))
     return perimeter / float(max(1, max(frame_width, frame_height)))
+
+
+def _corner_perimeter_px(corner: Any) -> float:
+    points = corner.reshape(-1, 2)
+    if len(points) < 4:
+        return 0.0
+    perimeter = 0.0
+    for idx in range(4):
+        x1, y1 = points[idx]
+        x2, y2 = points[(idx + 1) % 4]
+        perimeter += math.hypot(float(x2) - float(x1), float(y2) - float(y1))
+    return perimeter
+
+
+def detect_markers_in_image(
+    image_path: str | Path,
+    *,
+    params: dict[str, float | int],
+    dictionary_name: str,
+    selected_label: str = "top_mean_detection",
+    selected_params_path: str | Path | None = None,
+    relative_image_path: str = "",
+    image_index: int | None = None,
+    valid_tag_ids: Optional[Iterable[int]] = None,
+    perimeter_filter_bounds: Optional[tuple[float, float]] = None,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    _require_aruco()
+    path = _resolve_user_path(image_path)
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise RuntimeError(f"Could not read image for final detection: {path}")
+
+    frame_height, frame_width = image.shape[:2]
+    normalized_dictionary = normalize_dictionary_name(dictionary_name)
+    normalized_valid_tag_ids = _normalized_valid_tag_ids(valid_tag_ids)
+    detector_params = cv2.aruco.DetectorParameters()
+    for param_name, param_value in params.items():
+        if hasattr(detector_params, param_name):
+            setattr(detector_params, param_name, param_value)
+
+    dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, normalized_dictionary))
+    detector = cv2.aruco.ArucoDetector(dictionary, detector_params)
+    corners, ids, rejected = detector.detectMarkers(image)
+    bounds = _perimeter_filter_bounds(params, perimeter_filter_bounds)
+    params_json = json.dumps(params, sort_keys=True)
+    selected_params_text = str(selected_params_path) if selected_params_path else ""
+    rel_text = str(relative_image_path or path.name)
+
+    rows: list[dict[str, object]] = []
+    decoded_count = 0
+    filtered_count = 0
+    if ids is not None and len(ids) > 0:
+        for corner, marker_id_raw in zip(corners, ids.flatten().tolist()):
+            try:
+                marker_id = int(marker_id_raw)
+            except (TypeError, ValueError):
+                filtered_count += 1
+                continue
+            decoded_count += 1
+
+            points = corner.reshape(-1, 2)
+            if len(points) < 4:
+                filtered_count += 1
+                continue
+
+            perimeter_px = _corner_perimeter_px(corner)
+            perimeter_rate = perimeter_px / float(max(1, max(frame_width, frame_height)))
+            if normalized_valid_tag_ids is not None and marker_id not in normalized_valid_tag_ids:
+                filtered_count += 1
+                continue
+            if bounds is not None:
+                min_rate, max_rate = bounds
+                if min_rate > 0 and perimeter_rate < min_rate:
+                    filtered_count += 1
+                    continue
+                if max_rate > 0 and perimeter_rate > max_rate:
+                    filtered_count += 1
+                    continue
+
+            center_x = float(points[:, 0].mean())
+            center_y = float(points[:, 1].mean())
+            row: dict[str, object] = {
+                "image_index": image_index if image_index is not None else "",
+                "image_path": str(path),
+                "relative_image_path": rel_text,
+                "tag_id": marker_id,
+                "center_x": f"{center_x:.3f}",
+                "center_y": f"{center_y:.3f}",
+                "perimeter_px": f"{perimeter_px:.3f}",
+                "perimeter_rate": f"{perimeter_rate:.6f}",
+                "frame_width": int(frame_width),
+                "frame_height": int(frame_height),
+                "selected_label": selected_label,
+                "selected_params_path": selected_params_text,
+                "params_json": params_json,
+            }
+            for point_index in range(4):
+                row[f"corner_{point_index}_x"] = f"{float(points[point_index, 0]):.3f}"
+                row[f"corner_{point_index}_y"] = f"{float(points[point_index, 1]):.3f}"
+            rows.append(row)
+
+    audit = {
+        "decoded_count": decoded_count,
+        "valid_detection_count": len(rows),
+        "filtered_count": filtered_count,
+        "rejected_count": len(rejected) if rejected is not None else 0,
+        "frame_width": int(frame_width),
+        "frame_height": int(frame_height),
+        "dictionary": normalized_dictionary,
+    }
+    return rows, audit
 
 
 def _draw_perimeter_flag(
@@ -2274,6 +2436,16 @@ def legacy_entrypoint(argv: Optional[Sequence[str]] = None) -> int:
         help="Optional comma-separated adaptiveThreshWinSizeStep override values.",
     )
     parser.add_argument(
+        "--sweep-polygonal-approx-accuracy-rate",
+        default="",
+        help="Optional comma-separated polygonalApproxAccuracyRate override values.",
+    )
+    parser.add_argument(
+        "--sweep-adaptive-thresh-constant",
+        default="",
+        help="Optional comma-separated adaptiveThreshConstant override values.",
+    )
+    parser.add_argument(
         "--execution-target",
         choices=sorted(VALID_EXECUTION_TARGETS),
         default=DEFAULT_EXECUTION_TARGET,
@@ -2345,6 +2517,22 @@ def legacy_entrypoint(argv: Optional[Sequence[str]] = None) -> int:
         )
         if win_step:
             sweep_overrides["adaptiveThreshWinSizeStep"] = win_step
+
+        poly = _parse_csv_values(
+            args.sweep_polygonal_approx_accuracy_rate,
+            "--sweep-polygonal-approx-accuracy-rate",
+            "float",
+        )
+        if poly:
+            sweep_overrides["polygonalApproxAccuracyRate"] = poly
+
+        thresh_constant = _parse_csv_values(
+            args.sweep_adaptive_thresh_constant,
+            "--sweep-adaptive-thresh-constant",
+            "int",
+        )
+        if thresh_constant:
+            sweep_overrides["adaptiveThreshConstant"] = thresh_constant
 
         result = optimize_tracking(
             input_path=args.input,

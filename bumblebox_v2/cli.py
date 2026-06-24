@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import shlex
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -199,6 +203,99 @@ def _parse_comma_numeric_values(raw: str, *, label: str, value_type: str) -> lis
         if value not in unique:
             unique.append(value)
     return unique
+
+
+def _optimizer_sweep_overrides_from_args(args: argparse.Namespace) -> dict[str, list[float | int]]:
+    sweep_overrides: dict[str, list[float | int]] = {}
+    min_perimeter = _parse_comma_numeric_values(
+        getattr(args, "sweep_min_marker_perimeter_rate", ""),
+        label="--sweep-min-marker-perimeter-rate",
+        value_type="float",
+    )
+    if min_perimeter:
+        sweep_overrides["minMarkerPerimeterRate"] = min_perimeter
+
+    max_perimeter = _parse_comma_numeric_values(
+        getattr(args, "sweep_max_marker_perimeter_rate", ""),
+        label="--sweep-max-marker-perimeter-rate",
+        value_type="float",
+    )
+    if max_perimeter:
+        sweep_overrides["maxMarkerPerimeterRate"] = max_perimeter
+
+    win_min = _parse_comma_numeric_values(
+        getattr(args, "sweep_adaptive_thresh_win_size_min", ""),
+        label="--sweep-adaptive-thresh-win-size-min",
+        value_type="int",
+    )
+    if win_min:
+        sweep_overrides["adaptiveThreshWinSizeMin"] = win_min
+
+    win_max = _parse_comma_numeric_values(
+        getattr(args, "sweep_adaptive_thresh_win_size_max", ""),
+        label="--sweep-adaptive-thresh-win-size-max",
+        value_type="int",
+    )
+    if win_max:
+        sweep_overrides["adaptiveThreshWinSizeMax"] = win_max
+
+    win_step = _parse_comma_numeric_values(
+        getattr(args, "sweep_adaptive_thresh_win_size_step", ""),
+        label="--sweep-adaptive-thresh-win-size-step",
+        value_type="int",
+    )
+    if win_step:
+        sweep_overrides["adaptiveThreshWinSizeStep"] = win_step
+
+    poly = _parse_comma_numeric_values(
+        getattr(args, "sweep_polygonal_approx_accuracy_rate", ""),
+        label="--sweep-polygonal-approx-accuracy-rate",
+        value_type="float",
+    )
+    if poly:
+        sweep_overrides["polygonalApproxAccuracyRate"] = poly
+
+    thresh_constant = _parse_comma_numeric_values(
+        getattr(args, "sweep_adaptive_thresh_constant", ""),
+        label="--sweep-adaptive-thresh-constant",
+        value_type="int",
+    )
+    if thresh_constant:
+        sweep_overrides["adaptiveThreshConstant"] = thresh_constant
+
+    return sweep_overrides
+
+
+def _optimizer_allowed_tag_ids_from_args(args: argparse.Namespace, config: dict) -> set[int]:
+    from .posthoc_tracking import load_tag_ids
+
+    allowed_tag_ids: set[int] = set()
+    tracking_filter_config = (
+        config.get("tracking", {})
+        if isinstance(config.get("tracking", {}), dict)
+        else {}
+    )
+    raw_config_allowed = tracking_filter_config.get("allowed_tag_ids", [])
+    if isinstance(raw_config_allowed, list):
+        for raw_id in raw_config_allowed:
+            try:
+                allowed_tag_ids.add(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+    raw_config_tag_list = str(tracking_filter_config.get("allowed_tag_ids_path") or "").strip()
+    if raw_config_tag_list:
+        allowed_tag_ids.update(load_tag_ids(raw_config_tag_list))
+
+    cli_allowed_ids = _parse_comma_numeric_values(
+        getattr(args, "allowed_tag_ids", ""),
+        label="--allowed-tag-ids",
+        value_type="int",
+    )
+    allowed_tag_ids.update(int(value) for value in cli_allowed_ids)
+    tag_list = getattr(args, "tag_list", None)
+    if tag_list:
+        allowed_tag_ids.update(load_tag_ids(tag_list))
+    return allowed_tag_ids
 
 
 def _apply_camera_bool_override(
@@ -1388,6 +1485,22 @@ def _cmd_optimize_tracking(args: argparse.Namespace) -> int:
         if win_step:
             sweep_overrides["adaptiveThreshWinSizeStep"] = win_step
 
+        poly = _parse_comma_numeric_values(
+            args.sweep_polygonal_approx_accuracy_rate,
+            label="--sweep-polygonal-approx-accuracy-rate",
+            value_type="float",
+        )
+        if poly:
+            sweep_overrides["polygonalApproxAccuracyRate"] = poly
+
+        thresh_constant = _parse_comma_numeric_values(
+            args.sweep_adaptive_thresh_constant,
+            label="--sweep-adaptive-thresh-constant",
+            value_type="int",
+        )
+        if thresh_constant:
+            sweep_overrides["adaptiveThreshConstant"] = thresh_constant
+
         allowed_tag_ids = set()
         tracking_filter_config = (
             config_for_filters.get("tracking", {})
@@ -1471,6 +1584,361 @@ def _cmd_optimize_tracking(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
+    from .tracking_optimizer import (
+        IMAGE_EXTENSIONS,
+        IMAGE_DETECTION_CSV_FIELDS,
+        detect_markers_in_image,
+        find_supported_image_paths,
+        optimize_tracking,
+    )
+
+    def safe_output_name(image_path: Path, input_root: Path) -> str:
+        try:
+            relative = image_path.relative_to(input_root)
+        except ValueError:
+            relative = Path(image_path.name)
+        stem = "__".join(relative.with_suffix("").parts)
+        safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in stem)
+        return safe.strip("_") or image_path.stem
+
+    def image_signature(image_path: Path) -> dict[str, object]:
+        stat = image_path.stat()
+        return {
+            "path": str(image_path),
+            "size_bytes": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    def marker_matches(marker_path: Path, image_path: Path) -> tuple[bool, Optional[dict]]:
+        if not marker_path.exists():
+            return False, None
+        try:
+            payload = json.loads(marker_path.read_text())
+        except Exception:
+            return False, None
+        return payload.get("source_signature") == image_signature(image_path), payload
+
+    def candidate_row(prefix: str, candidate: object) -> dict[str, object]:
+        params = getattr(candidate, "params", {}) or {}
+        return {
+            f"{prefix}_score": getattr(candidate, "score", ""),
+            f"{prefix}_mean_detected": getattr(candidate, "mean_detected", ""),
+            f"{prefix}_mean_decoded": getattr(candidate, "mean_decoded", ""),
+            f"{prefix}_mean_filtered": getattr(candidate, "mean_filtered", ""),
+            f"{prefix}_std_detected": getattr(candidate, "std_detected", ""),
+            f"{prefix}_mean_rejected": getattr(candidate, "mean_rejected", ""),
+            f"{prefix}_stability": getattr(candidate, "stability", ""),
+            f"{prefix}_eval_fps": getattr(candidate, "eval_fps", ""),
+            f"{prefix}_runtime_seconds": getattr(candidate, "runtime_seconds", ""),
+            f"{prefix}_params_json": json.dumps(params, sort_keys=True),
+        }
+
+    fieldnames = [
+        "image_index",
+        "image_path",
+        "relative_image_path",
+        "status",
+        "error",
+        "runtime_seconds",
+        "output_dir",
+        "selected_params_path",
+        "summary_json_path",
+        "candidate_scores_path",
+        "detection_csv_path",
+        "detection_count",
+        "decoded_count",
+        "filtered_detection_count",
+        "rejected_candidate_count",
+        "dictionary",
+        "profile",
+        "execution_target",
+        "workers",
+        "parameter_combinations_total",
+        "combinations_evaluated",
+        "sample_frames_used",
+        "best_score",
+        "best_mean_detected",
+        "top_detect_score",
+        "top_detect_mean_detected",
+        "top_detect_mean_decoded",
+        "top_detect_mean_filtered",
+        "top_detect_std_detected",
+        "top_detect_mean_rejected",
+        "top_detect_stability",
+        "top_detect_eval_fps",
+        "top_detect_runtime_seconds",
+        "top_detect_params_json",
+        "best_score_params_json",
+    ]
+
+    def write_summary_csv(path: Path, rows: list[dict[str, object]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def write_detection_csv(path: Path, detection_rows: list[dict[str, object]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=IMAGE_DETECTION_CSV_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(detection_rows)
+
+    def read_detection_csv(path: Path) -> list[dict[str, object]]:
+        if not path.exists() or not path.is_file():
+            return []
+        with path.open(newline="") as f:
+            return [dict(row) for row in csv.DictReader(f)]
+
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+        sweep_overrides = _optimizer_sweep_overrides_from_args(args)
+        allowed_tag_ids = _optimizer_allowed_tag_ids_from_args(args, config)
+    except Exception as exc:
+        print(f"Image-folder optimization setup failed: {exc}")
+        return 1
+
+    input_root = Path(args.input).expanduser().resolve()
+    output_root = Path(args.output_root).expanduser().resolve()
+    if not input_root.exists() or not input_root.is_dir():
+        print(f"Input image folder does not exist or is not a directory: {input_root}")
+        return 1
+
+    if args.no_recursive:
+        images = sorted(
+            path
+            for path in input_root.iterdir()
+            if path.is_file()
+            and path.suffix.lower() in IMAGE_EXTENSIONS
+            and not path.name.startswith("._")
+            and path.name not in {".DS_Store", "Thumbs.db"}
+        )
+    else:
+        images = find_supported_image_paths(input_root)
+
+    if args.limit is not None:
+        if int(args.limit) <= 0:
+            print("--limit must be >= 1 when provided.")
+            return 1
+        images = images[: int(args.limit)]
+
+    if not images:
+        print(f"No supported PNG/image files found in: {input_root}")
+        return 1
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    summary_csv_path = output_root / "per_image_optimization_summary.csv"
+    combined_detection_csv_path = output_root / "per_image_tag_detections.csv"
+    report_json_path = output_root / "per_image_optimization_report.json"
+    started_at = datetime.now().isoformat(timespec="seconds")
+    run_started = time.perf_counter()
+    rows: list[dict[str, object]] = []
+    all_detection_rows: list[dict[str, object]] = []
+    completed = 0
+    skipped = 0
+    failed = 0
+
+    print(f"[optimize-images] Input: {input_root}")
+    print(f"[optimize-images] Images found: {len(images)}")
+    print(f"[optimize-images] Output root: {output_root}")
+    print(f"[optimize-images] Resume completed images: {'no' if args.force else 'yes'}")
+    print(f"[optimize-images] Allowed tag IDs: {len(allowed_tag_ids) if allowed_tag_ids else 'none'}")
+
+    for image_index, image_path in enumerate(images, start=1):
+        relative = image_path.relative_to(input_root)
+        image_output_dir = output_root / safe_output_name(image_path, input_root)
+        marker_path = image_output_dir / "image_optimization_complete.json"
+        selected_params_path = image_output_dir / "selected_tracking_params.json"
+        detection_csv_path = image_output_dir / f"{image_path.stem}_detections.csv"
+
+        matches, marker_payload = marker_matches(marker_path, image_path)
+        if matches and not args.force and detection_csv_path.exists():
+            marker_row = dict((marker_payload or {}).get("summary_row") or {})
+            marker_row["status"] = "skipped_completed"
+            marker_row["image_index"] = image_index
+            rows.append(marker_row)
+            all_detection_rows.extend(read_detection_csv(detection_csv_path))
+            skipped += 1
+            print(f"[optimize-images] {image_index}/{len(images)} {relative}: skipped existing result")
+            write_summary_csv(summary_csv_path, rows)
+            write_detection_csv(combined_detection_csv_path, all_detection_rows)
+            continue
+
+        print(f"[optimize-images] {image_index}/{len(images)} {relative}: optimizing")
+        image_started = time.perf_counter()
+        last_progress = {"time": 0.0}
+
+        def progress_callback(done: int, total: int, top_candidates: list[dict], latest: dict) -> None:
+            now = time.perf_counter()
+            if done not in {1, total} and now - last_progress["time"] < 5.0:
+                return
+            last_progress["time"] = now
+            high = latest.get("highest_detection_candidate") or {}
+            high_detect = float(high.get("mean_detected") or 0.0)
+            latest_detect = float(latest.get("mean_detected") or 0.0)
+            latest_decoded = float(latest.get("mean_decoded") or 0.0)
+            print(
+                f"[optimize-images] {image_index}/{len(images)} {relative}: "
+                f"evaluated {done}/{total}; latest detect={latest_detect:.2f}, "
+                f"decoded={latest_decoded:.2f}; highest detect={high_detect:.2f}"
+            )
+
+        try:
+            result = optimize_tracking(
+                input_path=image_path,
+                profile=args.profile,
+                sample_frames=1,
+                dictionary_name=args.dictionary,
+                tag_size_mm=args.tag_size_mm,
+                sweep_overrides=sweep_overrides or None,
+                max_parameter_combinations=args.max_combinations,
+                execution_target=args.execution_target,
+                workers=args.workers,
+                expected_tags=args.expected_tags,
+                early_stop_patience=args.early_stop_patience,
+                early_stop_min_improvement=args.early_stop_min_improvement,
+                output_dir=image_output_dir,
+                write_preview=False,
+                top_k=args.top_k,
+                valid_tag_ids=allowed_tag_ids or None,
+                progress_callback=progress_callback,
+            )
+            top_detect = (
+                result.top_detection_candidates[0]
+                if result.top_detection_candidates
+                else result.highest_detection_candidate
+            )
+            selected_params = dict(getattr(top_detect, "params", {}) or {})
+            selected_payload = {
+                "selected_at": datetime.now().isoformat(timespec="seconds"),
+                "selected_label": "top_mean_detection",
+                "source_image": str(image_path),
+                "source_optimization_summary": result.summary_json_path,
+                "source_candidate_scores": result.candidates_csv_path,
+                "params": selected_params,
+            }
+            selected_params_path.write_text(json.dumps(selected_payload, indent=2))
+            detection_rows, detection_audit = detect_markers_in_image(
+                image_path,
+                params=selected_params,
+                dictionary_name=result.dictionary,
+                selected_label="top_mean_detection",
+                selected_params_path=selected_params_path,
+                relative_image_path=str(relative),
+                image_index=image_index,
+                valid_tag_ids=allowed_tag_ids or None,
+            )
+            write_detection_csv(detection_csv_path, detection_rows)
+            all_detection_rows.extend(detection_rows)
+
+            runtime_seconds = time.perf_counter() - image_started
+            row: dict[str, object] = {
+                "image_index": image_index,
+                "image_path": str(image_path),
+                "relative_image_path": str(relative),
+                "status": "completed",
+                "error": "",
+                "runtime_seconds": f"{runtime_seconds:.3f}",
+                "output_dir": str(result.output_dir),
+                "selected_params_path": str(selected_params_path),
+                "summary_json_path": result.summary_json_path,
+                "candidate_scores_path": result.candidates_csv_path,
+                "detection_csv_path": str(detection_csv_path),
+                "detection_count": detection_audit["valid_detection_count"],
+                "decoded_count": detection_audit["decoded_count"],
+                "filtered_detection_count": detection_audit["filtered_count"],
+                "rejected_candidate_count": detection_audit["rejected_count"],
+                "dictionary": result.dictionary,
+                "profile": result.profile,
+                "execution_target": result.execution_target,
+                "workers": result.workers,
+                "parameter_combinations_total": result.parameter_combinations_total,
+                "combinations_evaluated": result.combinations_evaluated,
+                "sample_frames_used": result.sample_frames_used,
+                "best_score": result.best_score,
+                "best_mean_detected": result.best_mean_detected,
+                "best_score_params_json": json.dumps(result.best_params, sort_keys=True),
+            }
+            row.update(candidate_row("top_detect", top_detect))
+            image_output_dir.mkdir(parents=True, exist_ok=True)
+            marker_payload = {
+                "schema_version": 1,
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "source_signature": image_signature(image_path),
+                "summary_row": row,
+            }
+            marker_path.write_text(json.dumps(marker_payload, indent=2))
+            rows.append(row)
+            completed += 1
+            print(
+                f"[optimize-images] {image_index}/{len(images)} {relative}: "
+                f"done in {runtime_seconds:.1f}s; top_detect={row['top_detect_mean_detected']}; "
+                f"detections={row['detection_count']}"
+            )
+        except KeyboardInterrupt:
+            print("\n[optimize-images] Interrupted by user; writing partial summary.")
+            write_summary_csv(summary_csv_path, rows)
+            write_detection_csv(combined_detection_csv_path, all_detection_rows)
+            return 130
+        except Exception as exc:
+            runtime_seconds = time.perf_counter() - image_started
+            failed += 1
+            row = {
+                "image_index": image_index,
+                "image_path": str(image_path),
+                "relative_image_path": str(relative),
+                "status": "failed",
+                "error": str(exc),
+                "runtime_seconds": f"{runtime_seconds:.3f}",
+                "output_dir": str(image_output_dir),
+                "detection_csv_path": str(detection_csv_path),
+            }
+            rows.append(row)
+            print(f"[optimize-images] {image_index}/{len(images)} {relative}: failed: {exc}")
+
+        write_summary_csv(summary_csv_path, rows)
+        write_detection_csv(combined_detection_csv_path, all_detection_rows)
+
+    finished_at = datetime.now().isoformat(timespec="seconds")
+    elapsed = time.perf_counter() - run_started
+    write_detection_csv(combined_detection_csv_path, all_detection_rows)
+    report = {
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "elapsed_seconds": elapsed,
+        "input": str(input_root),
+        "output_root": str(output_root),
+        "images_found": len(images),
+        "completed": completed,
+        "skipped": skipped,
+        "failed": failed,
+        "summary_csv": str(summary_csv_path),
+        "combined_detection_csv": str(combined_detection_csv_path),
+        "dictionary": args.dictionary,
+        "profile": args.profile,
+        "execution_target": args.execution_target,
+        "max_combinations": args.max_combinations,
+        "allowed_tag_ids": sorted(allowed_tag_ids) if allowed_tag_ids else None,
+    }
+    report_json_path.write_text(json.dumps(report, indent=2))
+
+    print("")
+    print("Per-Image Tracking Optimization")
+    print("--------------------------------")
+    print(f"Images found: {len(images)}")
+    print(f"Completed: {completed}")
+    print(f"Skipped: {skipped}")
+    print(f"Failed: {failed}")
+    print(f"Elapsed (s): {elapsed:.1f}")
+    print(f"Summary CSV: {summary_csv_path}")
+    print(f"Combined detection CSV: {combined_detection_csv_path}")
+    print(f"Report JSON: {report_json_path}")
+    return 1 if failed else 0
+
+
 def _cmd_track_videos(args: argparse.Namespace) -> int:
     from .posthoc_tracking import format_posthoc_tracking_report, run_posthoc_tracking
 
@@ -1498,6 +1966,9 @@ def _cmd_track_videos(args: argparse.Namespace) -> int:
                 "--optimize-per-date is used. Recommended: --optimization-sample-frames 40"
             )
             return 2
+        if bool(args.optimization_only) and not bool(args.optimize_per_date):
+            print("Argument error: --optimization-only requires --optimize-per-date.")
+            return 2
 
         _posthoc_progress = _LiveProgressPrinter(enabled=not bool(args.no_live_progress))
 
@@ -1524,6 +1995,10 @@ def _cmd_track_videos(args: argparse.Namespace) -> int:
             optimization_execution_target=args.optimization_execution_target,
             optimization_workers=args.optimization_workers,
             optimization_selection=args.optimization_selection,
+            optimization_strategy=args.optimization_strategy,
+            optimization_initial_sample_frames=args.optimization_initial_sample_frames,
+            optimization_middle_sample_frames=args.optimization_middle_sample_frames,
+            optimization_only=bool(args.optimization_only),
             resume_tracking=not bool(args.force_retrack),
             legacy_skip_existing_tracking=bool(args.legacy_skip_existing_tracking),
             progress_callback=_posthoc_progress,
@@ -2056,6 +2531,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable in-place terminal updates and print every optimization progress table separately.",
     )
     track_videos_parser.add_argument(
+        "--optimization-only",
+        action="store_true",
+        help="Run per-date optimization and write selected params, then stop before tracking videos.",
+    )
+    track_videos_parser.add_argument(
         "--optimize-per-date",
         action="store_true",
         help=(
@@ -2112,6 +2592,29 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["mean_detection", "best_score"],
         default="mean_detection",
         help="Which optimizer winner to write as selected_tracking_params.json (default: mean_detection).",
+    )
+    track_videos_parser.add_argument(
+        "--optimization-strategy",
+        choices=["successive_halving", "exhaustive"],
+        default="successive_halving",
+        help=(
+            "Per-date optimization strategy. successive_halving tests the broad grid on a small "
+            "initial frame set, then validates survivors; exhaustive tests every candidate on all sample frames."
+        ),
+    )
+    track_videos_parser.add_argument(
+        "--optimization-initial-sample-frames",
+        type=int,
+        default=5,
+        help="Initial frame count for --optimization-strategy successive_halving (default: 5).",
+    )
+    track_videos_parser.add_argument(
+        "--optimization-middle-sample-frames",
+        type=int,
+        help=(
+            "Optional middle-stage frame count for --optimization-strategy successive_halving. "
+            "If omitted, BumbleBox uses about half of --optimization-sample-frames."
+        ),
     )
     track_videos_parser.add_argument("--dry-run", action="store_true", help="Show planned videos without tracking them.")
     track_videos_parser.set_defaults(func=_cmd_track_videos)
@@ -2604,6 +3107,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     optimize_parser.add_argument(
+        "--sweep-polygonal-approx-accuracy-rate",
+        default="",
+        help=(
+            "Optional comma-separated override values for polygonalApproxAccuracyRate "
+            "(for example 0.06,0.08)."
+        ),
+    )
+    optimize_parser.add_argument(
+        "--sweep-adaptive-thresh-constant",
+        default="",
+        help=(
+            "Optional comma-separated override values for adaptiveThreshConstant "
+            "(for example 1,3,5,7,9,11)."
+        ),
+    )
+    optimize_parser.add_argument(
         "--execution-target",
         choices=["pi_safe", "desktop"],
         default="pi_safe",
@@ -2664,6 +3183,133 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_config_arg(optimize_parser)
     optimize_parser.set_defaults(func=_cmd_optimize_tracking)
+
+    optimize_images_parser = subparsers.add_parser(
+        "optimize-image-folder",
+        help="Run a separate ArUco optimization for each PNG/image in a folder.",
+    )
+    optimize_images_parser.add_argument(
+        "--input",
+        required=True,
+        help="Folder containing PNG/image files to optimize one image at a time.",
+    )
+    optimize_images_parser.add_argument(
+        "--output-root",
+        required=True,
+        help="Output folder for per-image optimizer runs and the summary CSV.",
+    )
+    optimize_images_parser.add_argument(
+        "--profile",
+        choices=["quick", "balanced", "deep", "daily"],
+        default="daily",
+        help="Grid profile size (default: daily).",
+    )
+    optimize_images_parser.add_argument(
+        "--dictionary",
+        default="4X4_50",
+        help="ArUco dictionary name (for example 4X4_50 or DICT_4X4_50).",
+    )
+    optimize_images_parser.add_argument(
+        "--tag-size-mm",
+        type=float,
+        default=2.5,
+        help="Physical ArUco tag size in millimeters (default 2.5).",
+    )
+    optimize_images_parser.add_argument(
+        "--sweep-min-marker-perimeter-rate",
+        default="",
+        help="Optional comma-separated override values for minMarkerPerimeterRate.",
+    )
+    optimize_images_parser.add_argument(
+        "--sweep-max-marker-perimeter-rate",
+        default="",
+        help="Optional comma-separated override values for maxMarkerPerimeterRate.",
+    )
+    optimize_images_parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-min",
+        default="",
+        help="Optional comma-separated override values for adaptiveThreshWinSizeMin.",
+    )
+    optimize_images_parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-max",
+        default="",
+        help="Optional comma-separated override values for adaptiveThreshWinSizeMax.",
+    )
+    optimize_images_parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-step",
+        default="",
+        help="Optional comma-separated override values for adaptiveThreshWinSizeStep.",
+    )
+    optimize_images_parser.add_argument(
+        "--sweep-polygonal-approx-accuracy-rate",
+        default="",
+        help="Optional comma-separated override values for polygonalApproxAccuracyRate.",
+    )
+    optimize_images_parser.add_argument(
+        "--sweep-adaptive-thresh-constant",
+        default="",
+        help="Optional comma-separated override values for adaptiveThreshConstant.",
+    )
+    optimize_images_parser.add_argument(
+        "--execution-target",
+        choices=["pi_safe", "desktop"],
+        default="pi_safe",
+        help="pi_safe uses conservative worker defaults. desktop uses more cores.",
+    )
+    optimize_images_parser.add_argument(
+        "--max-combinations",
+        type=int,
+        default=750,
+        help="Optional cap on parameter combinations per image (default: 750).",
+    )
+    optimize_images_parser.add_argument("--workers", type=int, help="Optional explicit worker count override.")
+    optimize_images_parser.add_argument(
+        "--expected-tags",
+        type=float,
+        help="Optional expected visible tag count for each image to guide scoring.",
+    )
+    optimize_images_parser.add_argument(
+        "--tag-list",
+        help=(
+            "Optional colony allowlist file. Supports JSON list/object, CSV-ish text, or newline-separated IDs. "
+            "Optimizer mean detections count only decoded tags inside this list."
+        ),
+    )
+    optimize_images_parser.add_argument(
+        "--allowed-tag-ids",
+        default="",
+        help="Optional comma-separated colony allowlist IDs for optimizer scoring.",
+    )
+    optimize_images_parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Stop each image after this many non-improving evaluations (0 disables; default 0).",
+    )
+    optimize_images_parser.add_argument(
+        "--early-stop-min-improvement",
+        type=float,
+        default=0.0,
+        help="Minimum score increase considered an improvement for early stop.",
+    )
+    optimize_images_parser.add_argument("--top-k", type=int, default=5, help="How many top candidates to retain.")
+    optimize_images_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Only optimize the first N sorted images. Useful for timing pilots.",
+    )
+    optimize_images_parser.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Only scan the input directory itself, not nested folders.",
+    )
+    optimize_images_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Rerun images even if an image_optimization_complete.json marker already exists.",
+    )
+    _add_common_config_arg(optimize_images_parser)
+    optimize_images_parser.set_defaults(func=_cmd_optimize_image_folder)
 
     schedule_check_parser = subparsers.add_parser(
         "schedule-check",

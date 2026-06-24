@@ -104,6 +104,7 @@ class PosthocTrackingReport:
     run_metrics: bool
     resume_tracking: bool
     legacy_skip_existing_tracking: bool
+    optimization_only: bool
     report_path: Optional[str]
     optimizations: list[PosthocDateOptimizationResult]
     results: list[PosthocVideoResult]
@@ -653,6 +654,63 @@ def _write_selected_tracking_params(
     _write_json(path, payload)
 
 
+def _sample_image_dimensions(sample_dir: Path) -> tuple[int, int]:
+    import cv2
+
+    for image_path in sorted(sample_dir.glob("*.png")):
+        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            continue
+        height, width = image.shape[:2]
+        return int(width), int(height)
+    raise RuntimeError(f"No readable optimization sample PNGs were found in: {sample_dir}")
+
+
+def _candidate_params_from_result(
+    result: Any,
+    *,
+    detection_limit: int,
+    score_limit: int,
+    extra_params: Optional[Iterable[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    from .tracking_optimizer import normalize_candidate_param_grid
+
+    raw: list[dict[str, Any]] = []
+    for candidate in list(getattr(result, "top_detection_candidates", []) or [])[: max(0, detection_limit)]:
+        params = getattr(candidate, "params", None)
+        if isinstance(params, dict):
+            raw.append(dict(params))
+    for candidate in list(getattr(result, "top_candidates", []) or [])[: max(0, score_limit)]:
+        params = getattr(candidate, "params", None)
+        if isinstance(params, dict):
+            raw.append(dict(params))
+    if extra_params:
+        raw.extend(dict(params) for params in extra_params if isinstance(params, dict))
+    return normalize_candidate_param_grid(raw)
+
+
+def _write_successive_halving_summary(
+    path: Path,
+    *,
+    strategy: str,
+    profile: str,
+    selected_label: str,
+    selected_params: dict[str, Any],
+    previous_date_seed_used: bool,
+    stages: list[dict[str, Any]],
+) -> None:
+    payload = {
+        "created_at": _now_iso(),
+        "strategy": strategy,
+        "profile": profile,
+        "selected_label": selected_label,
+        "selected_params": dict(selected_params),
+        "previous_date_seed_used": previous_date_seed_used,
+        "stages": stages,
+    }
+    _write_json(path, payload)
+
+
 def _group_videos_by_date(videos: list[Path], input_root: Path) -> dict[Path, list[Path]]:
     grouped: dict[Path, list[Path]] = {}
     root = input_root if input_root.is_dir() else input_root.parent
@@ -679,6 +737,9 @@ def _optimize_tracking_per_date(
     workers: Optional[int],
     selection: str,
     valid_tag_ids: Optional[Iterable[int]],
+    strategy: str,
+    initial_sample_frames: int,
+    middle_sample_frames: Optional[int],
     force: bool,
     dry_run: bool,
     progress_callback: Optional[PosthocProgressCallback] = None,
@@ -686,7 +747,14 @@ def _optimize_tracking_per_date(
     per_date_params: dict[Path, tuple[dict[str, Any], Path]] = {}
     optimization_results: list[PosthocDateOptimizationResult] = []
     grouped = _group_videos_by_date(videos, input_root)
+    strategy_key = str(strategy or "successive_halving").strip().lower().replace("-", "_")
+    if strategy_key not in {"successive_halving", "exhaustive"}:
+        raise ValueError("optimization strategy must be 'successive_halving' or 'exhaustive'")
+    initial_frames = max(1, int(initial_sample_frames or 5))
+    middle_frames = max(1, int(middle_sample_frames)) if middle_sample_frames is not None else None
+    previous_date_params: Optional[dict[str, Any]] = None
     _emit_progress(progress_callback, f"[optimize] Dates to optimize: {len(grouped)}")
+    _emit_progress(progress_callback, f"[optimize] Strategy: {strategy_key}")
 
     for date_dir, date_videos in grouped.items():
         item_warnings: list[str] = []
@@ -702,6 +770,7 @@ def _optimize_tracking_per_date(
             try:
                 params = load_aruco_params_file(selected_params_path)
                 per_date_params[date_dir] = (params, selected_params_path)
+                previous_date_params = params
                 _emit_progress(progress_callback, f"[optimize] {date_label}: reusing {selected_params_path}")
                 optimization_results.append(
                     PosthocDateOptimizationResult(
@@ -759,63 +828,182 @@ def _optimize_tracking_per_date(
                 raise RuntimeError("No readable video frames could be sampled for optimization.")
             _emit_progress(progress_callback, f"[optimize] {date_label}: sampled {written_samples} frame(s)")
 
-            from .tracking_optimizer import format_candidate_results_table, optimize_tracking
+            from .tracking_optimizer import (
+                build_parameter_grid,
+                format_candidate_results_table,
+                limit_parameter_grid,
+                normalize_candidate_param_grid,
+                optimize_tracking,
+            )
 
-            last_emit = {"time": 0.0}
+            def make_optimization_progress(stage_label: str) -> Any:
+                last_emit = {"time": 0.0}
 
-            def optimization_progress(
-                done: int,
-                total: int,
-                top_candidates: list[dict[str, Any]],
-                latest: dict[str, Any],
-            ) -> None:
-                now = time.monotonic()
-                if done not in {1, total} and now - last_emit["time"] < 5.0:
-                    return
-                last_emit["time"] = now
-                best = top_candidates[0] if top_candidates else {}
-                latest_detect = float(latest.get("mean_detected") or 0.0)
-                latest_decoded = float(latest.get("mean_decoded") or 0.0)
-                latest_filtered = float(latest.get("mean_filtered") or 0.0)
-                best_detect = float(best.get("mean_detected") or 0.0)
-                best_score = float(best.get("score") or 0.0)
-                high = latest.get("highest_detection_candidate") or {}
-                high_detect = float(high.get("mean_detected") or 0.0)
-                top_detection_candidates = latest.get("top_detection_candidates") or []
-                top_detection_table = format_candidate_results_table(
-                    top_detection_candidates,
-                    ranking="detection",
-                    max_rows=20,
+                def optimization_progress(
+                    done: int,
+                    total: int,
+                    top_candidates: list[dict[str, Any]],
+                    latest: dict[str, Any],
+                ) -> None:
+                    now = time.monotonic()
+                    if done not in {1, total} and now - last_emit["time"] < 5.0:
+                        return
+                    last_emit["time"] = now
+                    best = top_candidates[0] if top_candidates else {}
+                    latest_detect = float(latest.get("mean_detected") or 0.0)
+                    latest_decoded = float(latest.get("mean_decoded") or 0.0)
+                    latest_filtered = float(latest.get("mean_filtered") or 0.0)
+                    best_detect = float(best.get("mean_detected") or 0.0)
+                    best_score = float(best.get("score") or 0.0)
+                    high = latest.get("highest_detection_candidate") or {}
+                    high_detect = float(high.get("mean_detected") or 0.0)
+                    top_detection_candidates = latest.get("top_detection_candidates") or []
+                    top_detection_table = format_candidate_results_table(
+                        top_detection_candidates,
+                        ranking="detection",
+                        max_rows=20,
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        (
+                            f"[optimize] {date_label} [{stage_label}]: evaluated {done}/{total}; "
+                            f"latest detect={latest_detect:.2f}, decoded={latest_decoded:.2f}, filtered={latest_filtered:.2f}; "
+                            f"best detect={best_detect:.2f}, score={best_score:.3f}; "
+                            f"highest detect={high_detect:.2f}\n"
+                            f"[optimize] {date_label} [{stage_label}]: top mean-detection candidates so far\n"
+                            f"{top_detection_table}"
+                        ),
+                    )
+
+                return optimization_progress
+
+            if strategy_key == "exhaustive":
+                result = optimize_tracking(
+                    input_path=sample_dir,
+                    profile=profile,
+                    sample_frames=sample_frames,
+                    dictionary_name=dictionary,
+                    tag_size_mm=tag_size_mm,
+                    sweep_overrides=_daily_sweep_overrides(seed_params),
+                    max_parameter_combinations=max_combinations,
+                    execution_target=execution_target,
+                    workers=workers,
+                    expected_tags=expected_tags,
+                    output_dir=optimization_dir,
+                    write_preview=False,
+                    top_k=20,
+                    valid_tag_ids=valid_tag_ids,
+                    progress_callback=make_optimization_progress("exhaustive"),
                 )
+                stage_results = [("exhaustive", result)]
+                summary_path_override: Optional[Path] = None
+            else:
+                frame_width, frame_height = _sample_image_dimensions(sample_dir)
+                candidate_grid = build_parameter_grid(
+                    profile,
+                    tag_size_mm=tag_size_mm,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    sweep_overrides=_daily_sweep_overrides(seed_params),
+                )
+                candidate_grid = limit_parameter_grid(candidate_grid, max_combinations)
+                previous_seed_used = False
+                if previous_date_params:
+                    candidate_grid = normalize_candidate_param_grid([*candidate_grid, previous_date_params])
+                    previous_seed_used = True
+                initial_eval_frames = min(max(1, initial_frames), max(1, sample_frames))
+                if middle_frames is None:
+                    mid_eval_frames = min(
+                        max(1, sample_frames),
+                        max(initial_eval_frames + 1, int(round(max(1, sample_frames) * 0.5))),
+                    )
+                else:
+                    mid_eval_frames = min(
+                        max(1, sample_frames),
+                        max(initial_eval_frames, middle_frames),
+                    )
+                stage1_keep = min(len(candidate_grid), max(20, min(80, max(1, len(candidate_grid) // 4))))
+                stage2_keep = min(stage1_keep, 20)
                 _emit_progress(
                     progress_callback,
                     (
-                        f"[optimize] {date_label}: evaluated {done}/{total}; "
-                        f"latest detect={latest_detect:.2f}, decoded={latest_decoded:.2f}, filtered={latest_filtered:.2f}; "
-                        f"best detect={best_detect:.2f}, score={best_score:.3f}; "
-                        f"highest detect={high_detect:.2f}\n"
-                        f"[optimize] {date_label}: top mean-detection candidates so far\n"
-                        f"{top_detection_table}"
+                        f"[optimize] {date_label}: successive halving plan: "
+                        f"{len(candidate_grid)} candidates on {initial_eval_frames} frame(s), "
+                        f"keep {stage1_keep}; then {mid_eval_frames} frame(s), keep {stage2_keep}; "
+                        f"final validation on {sample_frames} frame(s)."
                     ),
                 )
+                if previous_seed_used:
+                    _emit_progress(progress_callback, f"[optimize] {date_label}: included previous date selected params as a seed.")
 
-            result = optimize_tracking(
-                input_path=sample_dir,
-                profile=profile,
-                sample_frames=sample_frames,
-                dictionary_name=dictionary,
-                tag_size_mm=tag_size_mm,
-                sweep_overrides=_daily_sweep_overrides(seed_params),
-                max_parameter_combinations=max_combinations,
-                execution_target=execution_target,
-                workers=workers,
-                expected_tags=expected_tags,
-                output_dir=optimization_dir,
-                write_preview=False,
-                top_k=5,
-                valid_tag_ids=valid_tag_ids,
-                progress_callback=optimization_progress,
-            )
+                stage1 = optimize_tracking(
+                    input_path=sample_dir,
+                    profile=profile,
+                    sample_frames=initial_eval_frames,
+                    dictionary_name=dictionary,
+                    tag_size_mm=tag_size_mm,
+                    candidate_param_grid=candidate_grid,
+                    execution_target=execution_target,
+                    workers=workers,
+                    expected_tags=expected_tags,
+                    output_dir=optimization_dir / "successive_halving_stage_01",
+                    write_preview=False,
+                    top_k=max(20, stage1_keep),
+                    valid_tag_ids=valid_tag_ids,
+                    progress_callback=make_optimization_progress(f"stage 1/{initial_eval_frames} frames"),
+                )
+                stage1_survivors = _candidate_params_from_result(
+                    stage1,
+                    detection_limit=stage1_keep,
+                    score_limit=min(10, stage1_keep),
+                    extra_params=[previous_date_params] if previous_date_params else None,
+                )[:stage1_keep]
+
+                stage2 = optimize_tracking(
+                    input_path=sample_dir,
+                    profile=profile,
+                    sample_frames=mid_eval_frames,
+                    dictionary_name=dictionary,
+                    tag_size_mm=tag_size_mm,
+                    candidate_param_grid=stage1_survivors,
+                    execution_target=execution_target,
+                    workers=workers,
+                    expected_tags=expected_tags,
+                    output_dir=optimization_dir / "successive_halving_stage_02",
+                    write_preview=False,
+                    top_k=max(20, stage2_keep),
+                    valid_tag_ids=valid_tag_ids,
+                    progress_callback=make_optimization_progress(f"stage 2/{mid_eval_frames} frames"),
+                )
+                stage2_survivors = _candidate_params_from_result(
+                    stage2,
+                    detection_limit=stage2_keep,
+                    score_limit=min(5, stage2_keep),
+                    extra_params=[previous_date_params] if previous_date_params else None,
+                )[:stage2_keep]
+
+                result = optimize_tracking(
+                    input_path=sample_dir,
+                    profile=profile,
+                    sample_frames=sample_frames,
+                    dictionary_name=dictionary,
+                    tag_size_mm=tag_size_mm,
+                    candidate_param_grid=stage2_survivors,
+                    execution_target=execution_target,
+                    workers=workers,
+                    expected_tags=expected_tags,
+                    output_dir=optimization_dir / "successive_halving_final",
+                    write_preview=False,
+                    top_k=max(20, stage2_keep),
+                    valid_tag_ids=valid_tag_ids,
+                    progress_callback=make_optimization_progress(f"final/{sample_frames} frames"),
+                )
+                stage_results = [
+                    ("stage_1", stage1),
+                    ("stage_2", stage2),
+                    ("final", result),
+                ]
+                summary_path_override = optimization_dir / "successive_halving_summary.json"
             selected_params, selected_label = _selected_candidate_params(result, selection)
             if not selected_params:
                 raise RuntimeError("Optimization completed but did not produce selected parameters.")
@@ -830,6 +1018,28 @@ def _optimize_tracking_per_date(
                 progress_callback,
                 f"[optimize] {date_label}: selected {selected_label}; wrote {selected_params_path}",
             )
+            previous_date_params = selected_params
+            if summary_path_override is not None:
+                _write_successive_halving_summary(
+                    summary_path_override,
+                    strategy=strategy_key,
+                    profile=profile,
+                    selected_label=selected_label,
+                    selected_params=selected_params,
+                    previous_date_seed_used=previous_seed_used,
+                    stages=[
+                        {
+                            "stage": stage_name,
+                            "sample_frames": int(getattr(stage_result, "sample_frames_used", 0) or 0),
+                            "combinations_evaluated": int(getattr(stage_result, "combinations_evaluated", 0) or 0),
+                            "parameter_combinations_total": int(getattr(stage_result, "parameter_combinations_total", 0) or 0),
+                            "summary_json_path": str(getattr(stage_result, "summary_json_path", "") or ""),
+                            "candidate_scores_path": str(getattr(stage_result, "candidates_csv_path", "") or ""),
+                            "best_mean_detected": float(getattr(stage_result, "best_mean_detected", 0.0) or 0.0),
+                        }
+                        for stage_name, stage_result in stage_results
+                    ],
+                )
             optimization_results.append(
                 PosthocDateOptimizationResult(
                     date_dir=str(date_dir),
@@ -837,12 +1047,18 @@ def _optimize_tracking_per_date(
                     sample_dir=str(sample_dir),
                     selected_params_path=str(selected_params_path),
                     selected_label=selected_label,
-                    optimization_summary_path=str(getattr(result, "summary_json_path", "") or "") or None,
+                    optimization_summary_path=str(summary_path_override or getattr(result, "summary_json_path", "") or "") or None,
                     candidate_scores_path=str(getattr(result, "candidates_csv_path", "") or "") or None,
-                    parameter_combinations_total=int(getattr(result, "parameter_combinations_total", 0) or 0),
-                    combinations_evaluated=int(getattr(result, "combinations_evaluated", 0) or 0),
+                    parameter_combinations_total=sum(
+                        int(getattr(stage_result, "parameter_combinations_total", 0) or 0)
+                        for _stage_name, stage_result in stage_results
+                    ),
+                    combinations_evaluated=sum(
+                        int(getattr(stage_result, "combinations_evaluated", 0) or 0)
+                        for _stage_name, stage_result in stage_results
+                    ),
                     sample_frames_used=int(getattr(result, "sample_frames_used", 0) or 0),
-                    status="optimized",
+                    status=f"optimized_{strategy_key}",
                     warnings=item_warnings,
                     errors=item_errors,
                 )
@@ -894,6 +1110,10 @@ def run_posthoc_tracking(
     optimization_execution_target: str = "pi_safe",
     optimization_workers: Optional[int] = None,
     optimization_selection: str = "mean_detection",
+    optimization_strategy: str = "successive_halving",
+    optimization_initial_sample_frames: int = 5,
+    optimization_middle_sample_frames: Optional[int] = None,
+    optimization_only: bool = False,
     resume_tracking: bool = True,
     legacy_skip_existing_tracking: bool = False,
     progress_callback: Optional[PosthocProgressCallback] = None,
@@ -913,6 +1133,7 @@ def run_posthoc_tracking(
     output_root_path = Path(output_root).expanduser().resolve() if output_root else None
     allowed_tag_ids = _allowed_tag_ids(config, allowed_ids=allowed_ids, tag_list_path=tag_list_path)
     excluded_tag_ids = _excluded_tracking_tag_ids(config)
+    dictionary = str(config.get("tracking", {}).get("tag_dictionary", "4X4_50"))
     render = bool(config.get("runtime", {}).get("render_tracking_video", False)) if render_tracked_video is None else bool(render_tracked_video)
     metrics = bool(config.get("pipeline", {}).get("calculate_behavior_metrics", False)) if run_metrics is None else bool(run_metrics)
     global_params: Optional[dict[str, Any]] = None
@@ -920,10 +1141,14 @@ def run_posthoc_tracking(
     warnings: list[str] = []
     errors: list[str] = []
 
+    if optimization_only and not optimize_per_date:
+        raise ValueError("optimization_only requires optimize_per_date=True")
+
     _emit_progress(progress_callback, f"[posthoc] Input: {root}")
     _emit_progress(progress_callback, f"[posthoc] Videos found: {len(videos)}")
     _emit_progress(progress_callback, f"[posthoc] Output root: {output_root_path or 'date-local tracking folders'}")
     _emit_progress(progress_callback, f"[posthoc] Resume completed videos: {'yes' if resume_tracking else 'no'}")
+    _emit_progress(progress_callback, f"[posthoc] Optimization only: {'yes' if optimization_only else 'no'}")
     _emit_progress(
         progress_callback,
         f"[posthoc] Legacy skip existing tracking CSVs: {'yes' if legacy_skip_existing_tracking else 'no'}",
@@ -959,7 +1184,7 @@ def run_posthoc_tracking(
             seed_params=seed_params,
             profile=optimization_profile,
             sample_frames=optimization_sample_frames,
-            dictionary=str(config.get("tracking", {}).get("tag_dictionary", "4X4_50")),
+            dictionary=dictionary,
             tag_size_mm=optimization_tag_size_mm,
             expected_tags=optimization_expected_tags,
             max_combinations=optimization_max_combinations,
@@ -967,13 +1192,54 @@ def run_posthoc_tracking(
             workers=optimization_workers,
             selection=optimization_selection,
             valid_tag_ids=allowed_tag_ids or None,
+            strategy=optimization_strategy,
+            initial_sample_frames=optimization_initial_sample_frames,
+            middle_sample_frames=optimization_middle_sample_frames,
             force=force_optimize_per_date,
             dry_run=dry_run,
             progress_callback=progress_callback,
         )
 
     results: list[PosthocVideoResult] = []
-    dictionary = str(config.get("tracking", {}).get("tag_dictionary", "4X4_50"))
+
+    if optimization_only:
+        report_path: Optional[Path] = None
+        if output_root_path is not None:
+            report_path = output_root_path / "posthoc_tracking_report.json"
+        elif root.is_dir():
+            report_path = root / "posthoc_tracking_report.json"
+
+        report = PosthocTrackingReport(
+            started_at=started_at,
+            finished_at=_now_iso(),
+            input_path=str(root),
+            output_root=str(output_root_path) if output_root_path else None,
+            videos_found=len(videos),
+            videos_processed=0,
+            videos_skipped=0,
+            videos_failed=0,
+            dictionary=dictionary,
+            render_tracked_video=render,
+            run_cleaning=run_cleaning,
+            run_metrics=metrics,
+            resume_tracking=resume_tracking,
+            legacy_skip_existing_tracking=legacy_skip_existing_tracking,
+            optimization_only=optimization_only,
+            report_path=str(report_path) if report_path else None,
+            optimizations=optimization_results,
+            results=[],
+            warnings=warnings,
+            errors=errors,
+        )
+        if report_path and not dry_run:
+            _write_json(report_path, asdict(report))
+            _emit_progress(progress_callback, f"[posthoc] Report JSON: {report_path}")
+        _emit_progress(
+            progress_callback,
+            f"[posthoc] Optimization-only finished: dates={len(optimization_results)}, elapsed={time.perf_counter() - run_start:.1f}s",
+        )
+        return report
+
     box_preset = _normalize_box_preset(config.get("tracking", {}).get("box_preset"))
 
     for video_index, video_path in enumerate(videos, start=1):
@@ -1288,6 +1554,7 @@ def run_posthoc_tracking(
         run_metrics=metrics,
         resume_tracking=resume_tracking,
         legacy_skip_existing_tracking=legacy_skip_existing_tracking,
+        optimization_only=optimization_only,
         report_path=str(report_path) if report_path else None,
         optimizations=optimization_results,
         results=results,
@@ -1323,25 +1590,26 @@ def format_posthoc_tracking_report(report: PosthocTrackingReport) -> str:
         f"Run metrics: {report.run_metrics}",
         f"Resume completed videos: {report.resume_tracking}",
         f"Legacy skip existing tracking CSVs: {report.legacy_skip_existing_tracking}",
+        f"Optimization only: {report.optimization_only}",
         f"Report JSON: {report.report_path or 'none'}",
     ]
 
-    if report.results:
-        if report.optimizations:
-            lines.extend(["", "Per-Date Optimization"])
-            for item in report.optimizations:
-                lines.append(
-                    f"- {Path(item.date_dir).name} | {item.status} | "
-                    f"evaluated={item.combinations_evaluated}/{item.parameter_combinations_total} | "
-                    f"samples={item.sample_frames_used}"
-                )
-                lines.append(f"  selected params: {item.selected_params_path or 'none'}")
-                lines.append(f"  summary: {item.optimization_summary_path or 'none'}")
-                if item.warnings:
-                    lines.append("  warnings: " + "; ".join(item.warnings[:3]))
-                if item.errors:
-                    lines.append("  errors: " + "; ".join(item.errors[:3]))
+    if report.optimizations:
+        lines.extend(["", "Per-Date Optimization"])
+        for item in report.optimizations:
+            lines.append(
+                f"- {Path(item.date_dir).name} | {item.status} | "
+                f"evaluated={item.combinations_evaluated}/{item.parameter_combinations_total} | "
+                f"samples={item.sample_frames_used}"
+            )
+            lines.append(f"  selected params: {item.selected_params_path or 'none'}")
+            lines.append(f"  summary: {item.optimization_summary_path or 'none'}")
+            if item.warnings:
+                lines.append("  warnings: " + "; ".join(item.warnings[:3]))
+            if item.errors:
+                lines.append("  errors: " + "; ".join(item.errors[:3]))
 
+    if report.results:
         lines.extend(["", "Videos"])
         for item in report.results:
             status = "skipped" if item.skipped else "ok" if item.success else "failed"
