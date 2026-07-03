@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import shlex
+import shutil
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .calibration import (
     apply_scale_to_config,
@@ -1584,23 +1586,826 @@ def _cmd_optimize_tracking(args: argparse.Namespace) -> int:
     return 0
 
 
+def _safe_path_component(text: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(text))
+    return safe.strip("_") or "item"
+
+
+def _parse_video_range_text(row: dict[str, str]) -> list[tuple[int, int]]:
+    text = str(row.get("frame_ranges") or "").strip()
+    if not text:
+        start_text = str(row.get("first_start_frame") or "").strip()
+        end_text = str(row.get("last_end_frame") or "").strip()
+        if start_text and end_text:
+            text = f"{start_text}-{end_text}"
+    if not text:
+        raise ValueError("missing frame_ranges")
+
+    ranges: list[tuple[int, int]] = []
+    for token in re.split(r"[;,]+", text):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            start = int(float(start_text.strip()))
+            end = int(float(end_text.strip()))
+        else:
+            start = end = int(float(token))
+        if start < 0 or end < 0:
+            raise ValueError(f"negative frame index in {text!r}")
+        if end < start:
+            start, end = end, start
+        ranges.append((start, end))
+    if not ranges:
+        raise ValueError("no usable frame ranges")
+    return ranges
+
+
+def _frame_indices_from_ranges(ranges: list[tuple[int, int]]) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for start, end in ranges:
+        for frame_index in range(int(start), int(end) + 1):
+            if frame_index in seen:
+                continue
+            seen.add(frame_index)
+            out.append(frame_index)
+    return sorted(out)
+
+
+def _is_aug_2019_video_id(video_id: str) -> bool:
+    return bool(re.match(r"^\d{2}-Aug-2019_", str(video_id)))
+
+
+def _is_2024_no_tag_video_id(video_id: str) -> bool:
+    return "2024" in str(video_id)
+
+
+def _resolve_manifest_video(source_root: Path, video_id: str) -> Path | None:
+    from .tracking_optimizer import VIDEO_EXTENSIONS
+
+    search_roots = [
+        source_root / "input_data" / "val",
+        source_root / "input_data",
+        source_root,
+    ]
+    extensions = VIDEO_EXTENSIONS | {".mjpe"}
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for extension in sorted(extensions):
+            path = root / f"{video_id}{extension}"
+            if path.exists() and path.is_file() and path.resolve() not in seen:
+                seen.add(path.resolve())
+                candidates.append(path)
+        for path in root.rglob(f"{video_id}.*"):
+            if (
+                path.is_file()
+                and path.stem == video_id
+                and path.suffix.lower() in extensions
+                and path.resolve() not in seen
+            ):
+                seen.add(path.resolve())
+                candidates.append(path)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: (0 if "input_data/val" in str(item) else 1, str(item)))[0]
+
+
+def _frame_index_from_image_path(path: Path) -> int | None:
+    match = re.search(r"(\d+)$", path.stem)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _copy_or_extract_video_range_frames(
+    *,
+    video_id: str,
+    video_path: Path,
+    source_root: Path,
+    frame_indices: list[int],
+    output_dir: Path,
+    force: bool,
+) -> tuple[list[Path], list[str]]:
+    import cv2
+
+    from .tracking_optimizer import IMAGE_EXTENSIONS
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    warnings: list[str] = []
+    written: list[Path] = []
+    source_frames_dir = source_root / "frames" / video_id
+    source_images_by_index: dict[int, Path] = {}
+    if source_frames_dir.exists():
+        for image_path in sorted(source_frames_dir.iterdir()):
+            if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            frame_index = _frame_index_from_image_path(image_path)
+            if frame_index is not None:
+                source_images_by_index[frame_index] = image_path
+
+    fallback_indices: list[int] = []
+    for frame_index in frame_indices:
+        out_path = output_dir / f"frame_{frame_index:06d}.png"
+        if out_path.exists() and not force:
+            written.append(out_path)
+            continue
+        source_image = source_images_by_index.get(frame_index)
+        if source_image is None:
+            fallback_indices.append(frame_index)
+            continue
+        frame = cv2.imread(str(source_image), cv2.IMREAD_COLOR)
+        if frame is None:
+            warnings.append(f"Could not read extracted frame {source_image}; falling back to video seek.")
+            fallback_indices.append(frame_index)
+            continue
+        if not cv2.imwrite(str(out_path), frame):
+            warnings.append(f"Could not write frame image {out_path}")
+            continue
+        written.append(out_path)
+
+    if fallback_indices:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video for frame extraction: {video_path}")
+        try:
+            for frame_index in fallback_indices:
+                out_path = output_dir / f"frame_{frame_index:06d}.png"
+                if out_path.exists() and not force:
+                    written.append(out_path)
+                    continue
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    warnings.append(f"Could not read frame {frame_index} from {video_path.name}")
+                    continue
+                if not cv2.imwrite(str(out_path), frame):
+                    warnings.append(f"Could not write frame image {out_path}")
+                    continue
+                written.append(out_path)
+        finally:
+            cap.release()
+
+    deduped = sorted(set(written), key=lambda path: _frame_index_from_image_path(path) or -1)
+    if not deduped:
+        raise RuntimeError(f"No requested frames could be extracted for {video_id}")
+    return deduped, warnings
+
+
+def _tag_list_pair_from_path(path: Path) -> tuple[int, int] | None:
+    parent_match = re.search(r"mcs-(\d+)-and-(\d+)", path.parent.name.lower())
+    if parent_match:
+        return int(parent_match.group(1)), int(parent_match.group(2))
+    name_match = re.search(r"mc(\d+)_mc(\d+)", path.name.lower())
+    if name_match:
+        return int(name_match.group(1)), int(name_match.group(2))
+    return None
+
+
+def _resolve_tag_list_for_video(video_id: str, tag_list_root: Path | None) -> Path | None:
+    if tag_list_root is None or not tag_list_root.exists():
+        return None
+    match = re.match(r"^bumblebox-(\d+)_", video_id)
+    if not match:
+        return None
+    box_number = int(match.group(1))
+    candidates: list[Path] = []
+    for path in sorted(tag_list_root.rglob("*tag*list*.txt")):
+        pair = _tag_list_pair_from_path(path)
+        if pair and box_number in pair:
+            candidates.append(path)
+    return candidates[0] if candidates else None
+
+
+def _dictionary_candidates_for_video(video_id: str, dictionary: str, dictionary_candidates: str) -> list[str]:
+    requested = str(dictionary or "auto").strip()
+    if requested and requested.lower() != "auto":
+        return [requested]
+    if "2021" in video_id:
+        return ["4X4_50"]
+    if "2024" in video_id:
+        values = [item.strip() for item in str(dictionary_candidates or "").split(",") if item.strip()]
+        return values or ["4X4_50", "4X4_100"]
+    if video_id.startswith("bumblebox-"):
+        return ["4X4_100"]
+    return ["4X4_50"]
+
+
+def _load_video_range_bounds(path_text: str | None) -> dict[str, dict[str, Any]]:
+    if not path_text:
+        return {}
+    path = Path(path_text).expanduser()
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text())
+    entries = payload.get("entries", {}) if isinstance(payload, dict) else {}
+    if not isinstance(entries, dict):
+        return {}
+    return {str(key): dict(value) for key, value in entries.items() if isinstance(value, dict)}
+
+
+def _bounds_for_video(video_id: str, bounds_by_video: dict[str, dict[str, Any]]) -> tuple[tuple[float, float] | None, dict[str, list[float]]]:
+    entry = bounds_by_video.get(video_id)
+    if not isinstance(entry, dict):
+        return None, {}
+    review_bounds_raw = entry.get("review_perimeter_bounds")
+    review_bounds: tuple[float, float] | None = None
+    if isinstance(review_bounds_raw, list) and len(review_bounds_raw) == 2:
+        try:
+            low = float(review_bounds_raw[0])
+            high = float(review_bounds_raw[1])
+            if low > 0 and high > low:
+                review_bounds = (low, high)
+        except (TypeError, ValueError):
+            review_bounds = None
+
+    overrides: dict[str, list[float]] = {}
+    for source_key, param_key in (
+        ("suggested_min_marker_perimeter_rate", "minMarkerPerimeterRate"),
+        ("suggested_max_marker_perimeter_rate", "maxMarkerPerimeterRate"),
+    ):
+        values = entry.get(source_key)
+        if isinstance(values, list):
+            parsed: list[float] = []
+            for value in values:
+                try:
+                    parsed.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            if parsed:
+                overrides[param_key] = parsed
+    return review_bounds, overrides
+
+
+def _selected_params_from_optimization(result: Any) -> tuple[dict[str, Any], str, float]:
+    candidates = list(getattr(result, "top_detection_candidates", []) or [])
+    if candidates:
+        candidate = candidates[0]
+        return (
+            dict(getattr(candidate, "params", {}) or {}),
+            "top_mean_detection",
+            float(getattr(candidate, "mean_detected", 0.0) or 0.0),
+        )
+    return (
+        dict(getattr(result, "best_params", {}) or {}),
+        "best_score",
+        float(getattr(result, "best_mean_detected", 0.0) or 0.0),
+    )
+
+
+def _write_detection_rows_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    from .tracking_optimizer import IMAGE_DETECTION_CSV_FIELDS
+
+    fieldnames = [
+        "video_id",
+        "source_video_path",
+        "frame",
+        *IMAGE_DETECTION_CSV_FIELDS,
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _write_annotated_frame_video(annotated_paths: list[Path], output_path: Path, *, fps: float = 2.0) -> Path | None:
+    import cv2
+
+    readable: list[tuple[Path, Any]] = []
+    for path in annotated_paths:
+        frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if frame is not None:
+            readable.append((path, frame))
+    if not readable:
+        return None
+
+    height, width = readable[0][1].shape[:2]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        return None
+    try:
+        for _path, frame in readable:
+            if frame.shape[1] != width or frame.shape[0] != height:
+                frame = cv2.resize(frame, (width, height))
+            writer.write(frame)
+    finally:
+        writer.release()
+    return output_path if output_path.exists() else None
+
+
+def _cmd_optimize_video_ranges(args: argparse.Namespace) -> int:
+    from .config import load_config
+    from .posthoc_tracking import load_tag_ids
+    from .tracking_optimizer import detect_markers_in_image, normalize_dictionary_name, optimize_tracking
+
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    source_root = Path(args.source_root).expanduser().resolve()
+    if getattr(args, "open_gui", False):
+        bounds_path = (
+            Path(args.tag_bounds_json).expanduser()
+            if args.tag_bounds_json
+            else manifest_path.with_name(f"{manifest_path.stem}_tag_bounds.json")
+        )
+        print("[optimize-video-ranges] Opening GUI for smallest/largest tag bounds.")
+        print(f"[optimize-video-ranges] Manifest: {manifest_path}")
+        print(f"[optimize-video-ranges] Source root: {source_root}")
+        print(f"[optimize-video-ranges] Bounds JSON: {bounds_path}")
+        try:
+            from .gui_app import launch
+        except Exception as exc:
+            print(f"Failed to load GUI: {exc}")
+            return 1
+        launch(
+            open_video_range_bounds=True,
+            video_range_manifest=str(manifest_path),
+            video_range_source_root=str(source_root),
+            video_range_bounds_file=str(bounds_path),
+        )
+        print(
+            "[optimize-video-ranges] GUI closed. "
+            "Rerun the command without --open-gui to optimize with the saved bounds."
+        )
+        return 0
+
+    load_config(args.config)
+    output_root = Path(args.output_root).expanduser().resolve()
+    tag_list_root = Path(args.tag_list_root).expanduser().resolve() if args.tag_list_root else None
+    bounds_by_video = _load_video_range_bounds(getattr(args, "tag_bounds_json", None))
+    global_allowed_ids = {
+        int(value)
+        for value in _parse_comma_numeric_values(
+            getattr(args, "allowed_tag_ids", ""),
+            label="--allowed-tag-ids",
+            value_type="int",
+        )
+    }
+    global_excluded_ids = {
+        int(value)
+        for value in _parse_comma_numeric_values(
+            getattr(args, "exclude_tag_ids", ""),
+            label="--exclude-tag-ids",
+            value_type="int",
+        )
+    }
+    excluded_id_exempt_prefixes = tuple(
+        prefix.strip()
+        for prefix in str(getattr(args, "exclude_tag_ids_except_video_prefixes", "") or "").split(",")
+        if prefix.strip()
+    )
+    sweep_overrides_base = _optimizer_sweep_overrides_from_args(args)
+
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest CSV does not exist: {manifest_path}")
+    if not source_root.exists():
+        raise FileNotFoundError(f"Source root does not exist: {source_root}")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    manifest_rows: list[dict[str, str]] = []
+    with manifest_path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            manifest_rows.append(dict(row))
+    if args.limit:
+        manifest_rows = manifest_rows[: max(0, int(args.limit))]
+
+    report_rows: list[dict[str, Any]] = []
+    combined_detection_rows: list[dict[str, object]] = []
+    skipped = 0
+    processed = 0
+    failed = 0
+
+    print(f"[optimize-video-ranges] Manifest: {manifest_path}")
+    print(f"[optimize-video-ranges] Source root: {source_root}")
+    print(f"[optimize-video-ranges] Output root: {output_root}")
+    print(f"[optimize-video-ranges] Rows loaded: {len(manifest_rows)}")
+    if tag_list_root:
+        print(f"[optimize-video-ranges] Tag-list root: {tag_list_root}")
+    if args.tag_bounds_json:
+        print(f"[optimize-video-ranges] Tag bounds JSON: {Path(args.tag_bounds_json).expanduser()}")
+    if bounds_by_video:
+        print(f"[optimize-video-ranges] Per-video tag bounds loaded: {len(bounds_by_video)}")
+    elif args.tag_bounds_json:
+        print("[optimize-video-ranges] WARNING: no per-video tag bounds were loaded from that JSON.")
+
+    for row_index, row in enumerate(manifest_rows, start=1):
+        video_id = str(row.get("video_id") or "").strip()
+        if not video_id:
+            skipped += 1
+            report_rows.append({"row_index": row_index, "status": "skipped", "reason": "missing video_id"})
+            continue
+        if _is_aug_2019_video_id(video_id) and not args.include_aug_2019:
+            skipped += 1
+            print(f"\n[optimize-video-ranges] {row_index}/{len(manifest_rows)} {video_id}: skipped Aug-2019 row")
+            report_rows.append({"video_id": video_id, "row_index": row_index, "status": "skipped", "reason": "Aug-2019 no ArUco tags"})
+            continue
+        if _is_2024_no_tag_video_id(video_id) and not args.include_2024:
+            skipped += 1
+            print(f"\n[optimize-video-ranges] {row_index}/{len(manifest_rows)} {video_id}: skipped 2024 no-tag row")
+            report_rows.append({"video_id": video_id, "row_index": row_index, "status": "skipped", "reason": "2024 no ArUco tags"})
+            continue
+
+        safe_video_id = _safe_path_component(video_id)
+        item_dir = output_root / f"{safe_video_id}_tracking"
+        frames_dir = item_dir / "optimized_frames"
+        annotated_dir = item_dir / "annotated_frames"
+        optimization_root = item_dir / "optimization"
+        detection_csv_path = item_dir / f"{safe_video_id}_detections.csv"
+        selected_params_path = item_dir / "selected_tracking_params.json"
+        summary_path = item_dir / "video_range_tracking_summary.json"
+        item_warnings: list[str] = []
+        item_errors: list[str] = []
+        item_start = time.perf_counter()
+
+        print(f"\n[optimize-video-ranges] {row_index}/{len(manifest_rows)} {video_id}: preparing")
+        try:
+            ranges = _parse_video_range_text(row)
+            frame_indices = _frame_indices_from_ranges(ranges)
+            video_path = _resolve_manifest_video(source_root, video_id)
+            if video_path is None:
+                raise FileNotFoundError(f"Could not find video for {video_id} under {source_root}")
+
+            copied_video_path = output_root / video_path.name
+            if args.dry_run:
+                print(f"[optimize-video-ranges] {video_id}: dry run; would copy {video_path} -> {copied_video_path}")
+            elif args.force or not copied_video_path.exists():
+                shutil.copy2(video_path, copied_video_path)
+            else:
+                source_stat = video_path.stat()
+                dest_stat = copied_video_path.stat()
+                if source_stat.st_size != dest_stat.st_size:
+                    shutil.copy2(video_path, copied_video_path)
+
+            tag_list_path = _resolve_tag_list_for_video(video_id, tag_list_root)
+            allowed_tag_ids = set(global_allowed_ids)
+            if tag_list_path is not None:
+                allowed_tag_ids.update(load_tag_ids(tag_list_path))
+            elif video_id.startswith("bumblebox-") and "2026" in video_id:
+                item_warnings.append("No tag list found for 2026 BumbleBox video.")
+            excluded_tags_exempt = any(
+                video_id.startswith(prefix) for prefix in excluded_id_exempt_prefixes
+            )
+            excluded_tag_ids = set() if excluded_tags_exempt else set(global_excluded_ids)
+            if excluded_tag_ids:
+                allowed_tag_ids.difference_update(excluded_tag_ids)
+            tag_filter_ids = None if args.no_tag_list_filter else (allowed_tag_ids or None)
+            if args.no_tag_list_filter and allowed_tag_ids:
+                item_warnings.append("Tag-list filtering disabled by --no-tag-list-filter.")
+
+            review_bounds, bounds_sweep_overrides = _bounds_for_video(video_id, bounds_by_video)
+            sweep_overrides = dict(sweep_overrides_base)
+            if "minMarkerPerimeterRate" not in sweep_overrides and "minMarkerPerimeterRate" in bounds_sweep_overrides:
+                sweep_overrides["minMarkerPerimeterRate"] = bounds_sweep_overrides["minMarkerPerimeterRate"]
+            if "maxMarkerPerimeterRate" not in sweep_overrides and "maxMarkerPerimeterRate" in bounds_sweep_overrides:
+                sweep_overrides["maxMarkerPerimeterRate"] = bounds_sweep_overrides["maxMarkerPerimeterRate"]
+
+            if args.dry_run:
+                extracted_paths: list[Path] = [frames_dir / f"frame_{idx:06d}.png" for idx in frame_indices]
+            else:
+                extracted_paths, extraction_warnings = _copy_or_extract_video_range_frames(
+                    video_id=video_id,
+                    video_path=video_path,
+                    source_root=source_root,
+                    frame_indices=frame_indices,
+                    output_dir=frames_dir,
+                    force=args.force,
+                )
+                item_warnings.extend(extraction_warnings)
+
+            dictionaries = [
+                normalize_dictionary_name(dictionary)
+                for dictionary in _dictionary_candidates_for_video(video_id, args.dictionary, args.dictionary_candidates)
+            ]
+            print(
+                f"[optimize-video-ranges] {video_id}: frames={len(extracted_paths)} "
+                f"range={row.get('frame_ranges') or ranges}; dictionaries={','.join(dictionaries)}; "
+                f"tag_list={tag_list_path or 'none'}"
+            )
+            if args.no_tag_list_filter:
+                print(f"[optimize-video-ranges] {video_id}: tag-list filter disabled")
+            if excluded_tag_ids:
+                print(f"[optimize-video-ranges] {video_id}: excluding tag IDs {sorted(excluded_tag_ids)}")
+            elif excluded_tags_exempt and global_excluded_ids:
+                print(
+                    f"[optimize-video-ranges] {video_id}: tag ID exclusions skipped "
+                    f"because video ID matches {','.join(excluded_id_exempt_prefixes)}"
+                )
+            if review_bounds:
+                print(f"[optimize-video-ranges] {video_id}: measured perimeter bounds {review_bounds[0]:.6f}-{review_bounds[1]:.6f}")
+            elif args.tag_bounds_json:
+                print(
+                    f"[optimize-video-ranges] {video_id}: no saved smallest/largest tag bounds found; "
+                    "using command sweep/profile perimeter settings"
+                )
+
+            best_item: dict[str, Any] | None = None
+            if not args.dry_run:
+                for dictionary in dictionaries:
+                    dict_dir = optimization_root / dictionary
+                    print(f"[optimize-video-ranges] {video_id}: optimizing dictionary {dictionary}")
+                    last_emit = {"time": 0.0}
+
+                    def filter_breakdown(stats: dict[str, object]) -> str:
+                        filtered = float(stats.get("mean_filtered") or 0.0)
+                        small = float(stats.get("mean_filtered_too_small") or 0.0)
+                        large = float(stats.get("mean_filtered_too_large") or 0.0)
+                        excluded = float(stats.get("mean_filtered_excluded_tag") or 0.0)
+                        outside = float(stats.get("mean_filtered_outside_tag_list") or 0.0)
+                        other = float(stats.get("mean_filtered_other") or 0.0)
+                        return (
+                            f"filtered={filtered:.2f} "
+                            f"(small={small:.2f}, large={large:.2f}, excluded={excluded:.2f}, "
+                            f"outside-list={outside:.2f}, other={other:.2f})"
+                        )
+
+                    def progress_callback(done: int, total: int, top_candidates: list[dict[str, object]], latest: dict[str, object]) -> None:
+                        now = time.monotonic()
+                        if done not in {1, total} and now - last_emit["time"] < 5.0:
+                            return
+                        last_emit["time"] = now
+                        high = latest.get("highest_detection_candidate") or {}
+                        print(
+                            f"[optimize-video-ranges] {video_id} {dictionary}: evaluated {done}/{total}; "
+                            f"latest detect={float(latest.get('mean_detected') or 0.0):.2f}, "
+                            f"decoded={float(latest.get('mean_decoded') or 0.0):.2f}, "
+                            f"{filter_breakdown(latest)}; "
+                            f"highest detect={float(high.get('mean_detected') or 0.0):.2f}, "
+                            f"{filter_breakdown(high)}"
+                        )
+
+                    result = optimize_tracking(
+                        input_path=frames_dir,
+                        profile=args.profile,
+                        sample_frames=min(len(extracted_paths), max(1, int(args.sample_frames or len(extracted_paths)))),
+                        dictionary_name=dictionary,
+                        tag_size_mm=float(args.tag_size_mm),
+                        sweep_overrides=sweep_overrides or None,
+                        max_parameter_combinations=args.max_combinations,
+                        execution_target=args.execution_target,
+                        workers=args.workers,
+                        expected_tags=args.expected_tags,
+                        output_dir=dict_dir,
+                        write_preview=False,
+                        top_k=20,
+                        review_perimeter_bounds=review_bounds,
+                        valid_tag_ids=tag_filter_ids,
+                        excluded_tag_ids=excluded_tag_ids or None,
+                        progress_callback=None if args.no_live_progress else progress_callback,
+                    )
+                    params, selected_label, mean_detected = _selected_params_from_optimization(result)
+                    candidate = {
+                        "dictionary": dictionary,
+                        "params": params,
+                        "selected_label": selected_label,
+                        "mean_detected": mean_detected,
+                        "summary_json_path": getattr(result, "summary_json_path", None),
+                        "candidates_csv_path": getattr(result, "candidates_csv_path", None),
+                    }
+                    if best_item is None or float(candidate["mean_detected"]) > float(best_item["mean_detected"]):
+                        best_item = candidate
+
+                if best_item is None:
+                    raise RuntimeError("Optimization did not produce a selected parameter set.")
+                selected_payload = {
+                    "selected_at": datetime.now().isoformat(timespec="seconds"),
+                    "video_id": video_id,
+                    "frame_ranges": row.get("frame_ranges") or "",
+                    "dictionary": best_item["dictionary"],
+                    "selected_label": best_item["selected_label"],
+                    "params": best_item["params"],
+                    "mean_detected": best_item["mean_detected"],
+                    "tag_list_path": str(tag_list_path) if tag_list_path else None,
+                    "tag_list_filter_enabled": tag_filter_ids is not None,
+                    "allowed_tag_count": len(allowed_tag_ids) if allowed_tag_ids else None,
+                    "excluded_tag_ids_filter": sorted(excluded_tag_ids) if excluded_tag_ids else None,
+                    "review_perimeter_bounds": list(review_bounds) if review_bounds else None,
+                    "source_optimization_summary": best_item["summary_json_path"],
+                    "source_candidate_scores": best_item["candidates_csv_path"],
+                }
+                selected_params_path.write_text(json.dumps(selected_payload, indent=2, sort_keys=True))
+
+                detection_rows: list[dict[str, object]] = []
+                annotated_paths: list[Path] = []
+                final_audit_totals = {
+                    "decoded_count": 0,
+                    "valid_detection_count": 0,
+                    "filtered_count": 0,
+                    "filtered_too_small_count": 0,
+                    "filtered_too_large_count": 0,
+                    "filtered_excluded_tag_count": 0,
+                    "filtered_outside_tag_list_count": 0,
+                    "filtered_other_count": 0,
+                }
+                final_filtered_ids: dict[str, set[int]] = {
+                    "too_small": set(),
+                    "too_large": set(),
+                    "excluded_tag": set(),
+                    "outside_tag_list": set(),
+                    "other": set(),
+                }
+                for frame_path in extracted_paths:
+                    frame_index = _frame_index_from_image_path(frame_path)
+                    annotated_path = annotated_dir / f"{frame_path.stem}_annotated.png"
+                    rows_for_frame, audit = detect_markers_in_image(
+                        frame_path,
+                        params=best_item["params"],
+                        dictionary_name=best_item["dictionary"],
+                        selected_label=best_item["selected_label"],
+                        selected_params_path=selected_params_path,
+                        relative_image_path=f"{video_id}/{frame_path.name}",
+                        image_index=frame_index,
+                        valid_tag_ids=tag_filter_ids,
+                        excluded_tag_ids=excluded_tag_ids or None,
+                        perimeter_filter_bounds=review_bounds,
+                        annotated_output_path=annotated_path,
+                    )
+                    for key in final_audit_totals:
+                        try:
+                            final_audit_totals[key] += int(audit.get(key) or 0)
+                        except (TypeError, ValueError):
+                            pass
+                    reason_ids = audit.get("filtered_reason_ids")
+                    if isinstance(reason_ids, dict):
+                        for reason, ids in reason_ids.items():
+                            if reason not in final_filtered_ids or not isinstance(ids, list):
+                                continue
+                            for tag_id in ids:
+                                try:
+                                    final_filtered_ids[reason].add(int(tag_id))
+                                except (TypeError, ValueError):
+                                    continue
+                    annotated_paths.append(annotated_path)
+                    for detection_row in rows_for_frame:
+                        detection_row = dict(detection_row)
+                        detection_row["video_id"] = video_id
+                        detection_row["source_video_path"] = str(video_path)
+                        detection_row["frame"] = frame_index if frame_index is not None else ""
+                        detection_rows.append(detection_row)
+                _write_detection_rows_csv(detection_csv_path, detection_rows)
+                combined_detection_rows.extend(detection_rows)
+
+                final_detection_audit = {
+                    **final_audit_totals,
+                    "filtered_reason_ids": {
+                        reason: sorted(ids) for reason, ids in final_filtered_ids.items()
+                    },
+                }
+                if not detection_rows and final_audit_totals["decoded_count"] > 0:
+                    reason_text = (
+                        f"decoded {final_audit_totals['decoded_count']} tags but kept 0 after filters "
+                        f"(too_small={final_audit_totals['filtered_too_small_count']}, "
+                        f"too_large={final_audit_totals['filtered_too_large_count']}, "
+                        f"excluded={final_audit_totals['filtered_excluded_tag_count']}, "
+                        f"outside-list={final_audit_totals['filtered_outside_tag_list_count']}, "
+                        f"other={final_audit_totals['filtered_other_count']})"
+                    )
+                    excluded_ids = final_detection_audit["filtered_reason_ids"].get("excluded_tag", [])
+                    outside_ids = final_detection_audit["filtered_reason_ids"].get("outside_tag_list", [])
+                    if excluded_ids:
+                        reason_text += f"; excluded IDs={excluded_ids[:25]}"
+                    if outside_ids:
+                        reason_text += f"; outside-list IDs={outside_ids[:25]}"
+                    item_warnings.append(reason_text)
+                    print(f"[optimize-video-ranges] {video_id}: WARNING {reason_text}")
+
+                annotated_video_path = None
+                if args.write_annotated_video:
+                    annotated_video_path = _write_annotated_frame_video(
+                        annotated_paths,
+                        item_dir / f"{safe_video_id}_optimized_frames_annotated.mp4",
+                        fps=float(args.annotated_video_fps),
+                    )
+
+                summary = {
+                    "video_id": video_id,
+                    "status": "ok",
+                    "source_video_path": str(video_path),
+                    "copied_video_path": str(copied_video_path),
+                    "frame_ranges": row.get("frame_ranges") or "",
+                    "frame_indices": frame_indices,
+                    "frames_dir": str(frames_dir),
+                    "annotated_frames_dir": str(annotated_dir),
+                    "annotated_video_path": str(annotated_video_path) if annotated_video_path else None,
+                    "selected_params_path": str(selected_params_path),
+                    "detection_csv_path": str(detection_csv_path),
+                    "dictionary": best_item["dictionary"],
+                    "tag_list_path": str(tag_list_path) if tag_list_path else None,
+                    "tag_list_filter_enabled": tag_filter_ids is not None,
+                    "allowed_tag_count": len(allowed_tag_ids) if allowed_tag_ids else None,
+                    "excluded_tag_ids_filter": sorted(excluded_tag_ids) if excluded_tag_ids else None,
+                    "detections": len(detection_rows),
+                    "detection_audit": final_detection_audit,
+                    "warnings": item_warnings,
+                    "errors": item_errors,
+                    "elapsed_seconds": time.perf_counter() - item_start,
+                }
+                summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+                report_rows.append(summary)
+                processed += 1
+                print(
+                    f"[optimize-video-ranges] {video_id}: done; dictionary={best_item['dictionary']}; "
+                    f"detections={len(detection_rows)}; annotated PNGs={len(annotated_paths)}"
+                )
+            else:
+                report_rows.append(
+                    {
+                        "video_id": video_id,
+                        "status": "planned",
+                        "source_video_path": str(video_path),
+                        "copied_video_path": str(copied_video_path),
+                        "frame_ranges": row.get("frame_ranges") or "",
+                        "frame_indices": frame_indices,
+                        "dictionary_candidates": dictionaries,
+                        "tag_list_path": str(tag_list_path) if tag_list_path else None,
+                        "allowed_tag_count": len(allowed_tag_ids) if allowed_tag_ids else None,
+                        "excluded_tag_ids_filter": sorted(excluded_tag_ids) if excluded_tag_ids else None,
+                        "warnings": item_warnings,
+                    }
+                )
+                processed += 1
+        except Exception as exc:
+            failed += 1
+            item_errors.append(str(exc))
+            print(f"[optimize-video-ranges] {video_id}: failed: {exc}")
+            report_rows.append(
+                {
+                    "video_id": video_id,
+                    "row_index": row_index,
+                    "status": "failed",
+                    "warnings": item_warnings,
+                    "errors": item_errors,
+                }
+            )
+
+    combined_csv_path = output_root / "all_video_range_detections.csv"
+    if combined_detection_rows:
+        _write_detection_rows_csv(combined_csv_path, combined_detection_rows)
+
+    report = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "manifest_path": str(manifest_path),
+        "source_root": str(source_root),
+        "output_root": str(output_root),
+        "tag_list_root": str(tag_list_root) if tag_list_root else None,
+        "tag_bounds_json": str(args.tag_bounds_json) if args.tag_bounds_json else None,
+        "rows_loaded": len(manifest_rows),
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+        "combined_detection_csv_path": str(combined_csv_path) if combined_detection_rows else None,
+        "results": report_rows,
+    }
+    report_path = output_root / "optimize_video_ranges_report.json"
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+    print(f"\n[optimize-video-ranges] Finished: processed={processed}, skipped={skipped}, failed={failed}")
+    print(f"[optimize-video-ranges] Report: {report_path}")
+    if combined_detection_rows:
+        print(f"[optimize-video-ranges] Combined detections CSV: {combined_csv_path}")
+    return 0 if failed == 0 else 1
+
+
 def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
     from .tracking_optimizer import (
         IMAGE_EXTENSIONS,
         IMAGE_DETECTION_CSV_FIELDS,
         detect_markers_in_image,
         find_supported_image_paths,
+        is_generated_optimizer_artifact_path,
         optimize_tracking,
     )
 
-    def safe_output_name(image_path: Path, input_root: Path) -> str:
+    def safe_path_component(text: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)
+        return safe.strip("_")
+
+    def per_image_output_dir(image_path: Path, input_root: Path, output_root: Path) -> Path:
         try:
             relative = image_path.relative_to(input_root)
         except ValueError:
             relative = Path(image_path.name)
-        stem = "__".join(relative.with_suffix("").parts)
-        safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in stem)
-        return safe.strip("_") or image_path.stem
+
+        stem = safe_path_component(relative.stem) or safe_path_component(image_path.stem) or "image"
+        return output_root / relative.parent / f"{stem}_tracking_optimization"
+
+    def annotated_image_path(image_path: Path) -> Path:
+        return image_path.with_name(f"{image_path.stem}_annotated{image_path.suffix}")
+
+    def per_image_detection_csv_path(image_path: Path) -> Path:
+        return image_path.with_name(f"{image_path.stem}_detections.csv")
 
     def image_signature(image_path: Path) -> dict[str, object]:
         stat = image_path.stat()
@@ -1619,6 +2424,37 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
             return False, None
         return payload.get("source_signature") == image_signature(image_path), payload
 
+    def load_saved_selected_params(row: dict[str, object], default_path: Path) -> tuple[dict[str, object], Path]:
+        raw_path = str(row.get("selected_params_path") or "").strip()
+        candidate_paths = []
+        if raw_path:
+            candidate_paths.append(Path(raw_path).expanduser())
+        candidate_paths.append(default_path)
+
+        for candidate_path in candidate_paths:
+            try:
+                if not candidate_path.exists():
+                    continue
+                payload = json.loads(candidate_path.read_text())
+                params = payload.get("params") if isinstance(payload, dict) else None
+                if isinstance(params, dict) and params:
+                    return params, candidate_path
+            except Exception:
+                continue
+
+        for key in ("top_detect_params_json", "best_score_params_json"):
+            raw_params = str(row.get(key) or "").strip()
+            if not raw_params:
+                continue
+            try:
+                params = json.loads(raw_params)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(params, dict) and params:
+                return params, default_path
+
+        raise RuntimeError(f"Could not load saved selected tracking parameters from {default_path}")
+
     def candidate_row(prefix: str, candidate: object) -> dict[str, object]:
         params = getattr(candidate, "params", {}) or {}
         return {
@@ -1626,6 +2462,14 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
             f"{prefix}_mean_detected": getattr(candidate, "mean_detected", ""),
             f"{prefix}_mean_decoded": getattr(candidate, "mean_decoded", ""),
             f"{prefix}_mean_filtered": getattr(candidate, "mean_filtered", ""),
+            f"{prefix}_mean_filtered_too_small": getattr(candidate, "mean_filtered_too_small", ""),
+            f"{prefix}_mean_filtered_too_large": getattr(candidate, "mean_filtered_too_large", ""),
+            f"{prefix}_mean_filtered_outside_tag_list": getattr(
+                candidate,
+                "mean_filtered_outside_tag_list",
+                "",
+            ),
+            f"{prefix}_mean_filtered_other": getattr(candidate, "mean_filtered_other", ""),
             f"{prefix}_std_detected": getattr(candidate, "std_detected", ""),
             f"{prefix}_mean_rejected": getattr(candidate, "mean_rejected", ""),
             f"{prefix}_stability": getattr(candidate, "stability", ""),
@@ -1633,6 +2477,315 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
             f"{prefix}_runtime_seconds": getattr(candidate, "runtime_seconds", ""),
             f"{prefix}_params_json": json.dumps(params, sort_keys=True),
         }
+
+    def shorten_table_text(text: object, width: int) -> str:
+        value = str(text)
+        if len(value) <= width:
+            return value
+        if width <= 3:
+            return value[:width]
+        return f"{value[: width - 3]}..."
+
+    def selected_metric(metrics: object, key: str, *fallback_keys: str) -> object:
+        if isinstance(metrics, dict):
+            for candidate_key in (key, f"top_detect_{key}", *fallback_keys):
+                value = metrics.get(candidate_key)
+                if value not in ("", None):
+                    return value
+            return ""
+        value = getattr(metrics, key, "")
+        return value if value not in ("", None) else ""
+
+    def format_table_float(value: object, width: int, precision: int) -> str:
+        if value in ("", None):
+            return f"{'':>{width}}"
+        try:
+            return f"{float(value):>{width}.{precision}f}"
+        except (TypeError, ValueError):
+            return f"{str(value):>{width}}"
+
+    def format_table_int(value: object, width: int) -> str:
+        if value in ("", None):
+            return f"{'':>{width}}"
+        try:
+            return f"{int(float(value)):>{width}}"
+        except (TypeError, ValueError):
+            return f"{str(value):>{width}}"
+
+    def selected_params_table_text(relative: Path, params: dict[str, object], metrics: object) -> str:
+        header = (
+            f"{'image':<48} "
+            f"{'detect':>7} {'decoded':>7} {'filt':>6} "
+            f"{'small':>6} {'large':>6} {'outside':>7} "
+            f"{'score':>9} {'minPerim':>9} {'maxPerim':>9} "
+            f"{'winMin':>6} {'winMax':>6} {'winStep':>7} {'poly':>7} {'const':>5}"
+        )
+        row = (
+            f"{shorten_table_text(relative, 48):<48} "
+            f"{format_table_float(selected_metric(metrics, 'mean_detected', 'detection_count'), 7, 2)} "
+            f"{format_table_float(selected_metric(metrics, 'mean_decoded', 'decoded_count'), 7, 2)} "
+            f"{format_table_float(selected_metric(metrics, 'mean_filtered', 'filtered_detection_count'), 6, 2)} "
+            f"{format_table_float(selected_metric(metrics, 'mean_filtered_too_small', 'filtered_too_small_count'), 6, 2)} "
+            f"{format_table_float(selected_metric(metrics, 'mean_filtered_too_large', 'filtered_too_large_count'), 6, 2)} "
+            f"{format_table_float(selected_metric(metrics, 'mean_filtered_outside_tag_list', 'filtered_outside_tag_list_count'), 7, 2)} "
+            f"{format_table_float(selected_metric(metrics, 'score'), 9, 4)} "
+            f"{format_table_float(params.get('minMarkerPerimeterRate'), 9, 6)} "
+            f"{format_table_float(params.get('maxMarkerPerimeterRate'), 9, 6)} "
+            f"{format_table_int(params.get('adaptiveThreshWinSizeMin'), 6)} "
+            f"{format_table_int(params.get('adaptiveThreshWinSizeMax'), 6)} "
+            f"{format_table_int(params.get('adaptiveThreshWinSizeStep'), 7)} "
+            f"{format_table_float(params.get('polygonalApproxAccuracyRate'), 7, 4)} "
+            f"{format_table_int(params.get('adaptiveThreshConstant'), 5)}"
+        )
+        return "\n".join(
+            [
+                "[optimize-images] selected top-detection parameters:",
+                header,
+                "-" * len(header),
+                row,
+            ]
+        )
+
+    def candidate_params(metrics: object) -> dict[str, object]:
+        if not isinstance(metrics, dict):
+            params = getattr(metrics, "params", {})
+            return params if isinstance(params, dict) else {}
+
+        params = metrics.get("params")
+        if isinstance(params, dict):
+            return params
+
+        for key in ("params_json", "top_detect_params_json", "best_score_params_json"):
+            raw = str(metrics.get(key) or "").strip()
+            if not raw:
+                continue
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(decoded, dict):
+                return decoded
+        return {}
+
+    def parameter_sort_value(params: dict[str, object], key: str) -> tuple[int, object]:
+        value = params.get(key)
+        if value in ("", None):
+            return (1, "")
+        try:
+            return (0, float(value))
+        except (TypeError, ValueError):
+            return (0, str(value))
+
+    def candidate_rows_from_csv(path: str | Path) -> list[dict[str, object]]:
+        candidate_path = Path(path)
+        if not candidate_path.exists():
+            return []
+
+        rows: list[dict[str, object]] = []
+        with candidate_path.open(newline="") as f:
+            for row in csv.DictReader(f):
+                params = candidate_params(row)
+                row["params"] = params
+                rows.append(row)
+        return rows
+
+    def candidate_mean_detected(candidate: dict[str, object]) -> Optional[float]:
+        try:
+            return float(candidate.get("mean_detected") or 0.0)
+        except (TypeError, ValueError):
+            return None
+
+    def candidate_score_rank(candidate: dict[str, object]) -> int:
+        try:
+            return int(float(candidate.get("rank") or 999999))
+        except (TypeError, ValueError):
+            return 999999
+
+    def candidate_score_value(candidate: dict[str, object]) -> float:
+        try:
+            return float(candidate.get("score") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def sorted_by_parameter_values(candidates: list[dict[str, object]]) -> list[dict[str, object]]:
+        sort_keys = (
+            "minMarkerPerimeterRate",
+            "maxMarkerPerimeterRate",
+            "adaptiveThreshWinSizeMin",
+            "adaptiveThreshWinSizeMax",
+            "adaptiveThreshWinSizeStep",
+            "polygonalApproxAccuracyRate",
+            "adaptiveThreshConstant",
+        )
+        return sorted(
+            candidates,
+            key=lambda row: (
+                tuple(parameter_sort_value(candidate_params(row), key) for key in sort_keys),
+                candidate_score_value(row),
+            )
+        )
+
+    def best_detection_ties_from_csv(path: str | Path, best_detect: object) -> list[dict[str, object]]:
+        try:
+            target_detect = float(best_detect)
+        except (TypeError, ValueError):
+            return []
+
+        ties: list[dict[str, object]] = []
+        for row in candidate_rows_from_csv(path):
+            mean_detected = candidate_mean_detected(row)
+            if mean_detected is None:
+                continue
+            if abs(mean_detected - target_detect) <= 1e-9:
+                ties.append(row)
+        return sorted_by_parameter_values(ties)
+
+    def near_miss_detection_groups_from_csv(
+        path: str | Path,
+        best_detect: object,
+        *,
+        levels: int = 2,
+        limit_per_level: int = 15,
+    ) -> list[tuple[float, list[dict[str, object]], int]]:
+        try:
+            target_detect = float(best_detect)
+        except (TypeError, ValueError):
+            return []
+
+        groups: dict[float, list[dict[str, object]]] = {}
+        for row in candidate_rows_from_csv(path):
+            mean_detected = candidate_mean_detected(row)
+            if mean_detected is None or mean_detected >= target_detect - 1e-9:
+                continue
+            groups.setdefault(mean_detected, []).append(row)
+
+        out: list[tuple[float, list[dict[str, object]], int]] = []
+        for detect_value in sorted(groups.keys(), reverse=True)[: max(0, int(levels))]:
+            candidates = sorted(
+                groups[detect_value],
+                key=lambda row: (candidate_score_rank(row), -candidate_score_value(row)),
+            )
+            out.append((detect_value, candidates[: max(1, int(limit_per_level))], len(candidates)))
+        return out
+
+    def best_detection_ties_table_text(
+        relative: Path,
+        candidates: list[dict[str, object]],
+        best_detect: object,
+    ) -> str:
+        if not candidates:
+            return f"[optimize-images] no best-detection tie rows found for {relative}"
+
+        header = (
+            f"{'tie':>4} {'score#':>6} "
+            f"{'detect':>7} {'decoded':>7} {'filt':>6} "
+            f"{'small':>6} {'large':>6} {'outside':>7} "
+            f"{'score':>9} {'minPerim':>9} {'maxPerim':>9} "
+            f"{'winMin':>6} {'winMax':>6} {'winStep':>7} {'poly':>7} {'const':>5}"
+        )
+        lines = [
+            (
+                f"[optimize-images] parameter sets tied for best detection "
+                f"for {relative} (detect={format_table_float(best_detect, 0, 2).strip()}, "
+                f"n={len(candidates)}):"
+            ),
+            header,
+            "-" * len(header),
+        ]
+
+        for tie_index, candidate in enumerate(candidates, start=1):
+            params = candidate_params(candidate)
+            lines.append(
+                " ".join(
+                    [
+                        f"{tie_index:>4}",
+                        format_table_int(candidate.get("rank"), 6),
+                        format_table_float(selected_metric(candidate, "mean_detected"), 7, 2),
+                        format_table_float(selected_metric(candidate, "mean_decoded"), 7, 2),
+                        format_table_float(selected_metric(candidate, "mean_filtered"), 6, 2),
+                        format_table_float(selected_metric(candidate, "mean_filtered_too_small"), 6, 2),
+                        format_table_float(selected_metric(candidate, "mean_filtered_too_large"), 6, 2),
+                        format_table_float(
+                            selected_metric(candidate, "mean_filtered_outside_tag_list"),
+                            7,
+                            2,
+                        ),
+                        format_table_float(selected_metric(candidate, "score"), 9, 4),
+                        format_table_float(params.get("minMarkerPerimeterRate"), 9, 6),
+                        format_table_float(params.get("maxMarkerPerimeterRate"), 9, 6),
+                        format_table_int(params.get("adaptiveThreshWinSizeMin"), 6),
+                        format_table_int(params.get("adaptiveThreshWinSizeMax"), 6),
+                        format_table_int(params.get("adaptiveThreshWinSizeStep"), 7),
+                        format_table_float(params.get("polygonalApproxAccuracyRate"), 7, 4),
+                        format_table_int(params.get("adaptiveThreshConstant"), 5),
+                    ]
+                )
+            )
+        return "\n".join(lines)
+
+    def near_miss_detection_groups_table_text(
+        relative: Path,
+        groups: list[tuple[float, list[dict[str, object]], int]],
+        *,
+        limit_per_level: int = 15,
+    ) -> str:
+        if not groups:
+            return ""
+
+        header = (
+            f"{'row':>4} {'score#':>6} "
+            f"{'detect':>7} {'decoded':>7} {'filt':>6} "
+            f"{'small':>6} {'large':>6} {'outside':>7} "
+            f"{'score':>9} {'minPerim':>9} {'maxPerim':>9} "
+            f"{'winMin':>6} {'winMax':>6} {'winStep':>7} {'poly':>7} {'const':>5}"
+        )
+        lines = [
+            (
+                f"[optimize-images] near-miss parameter sets for {relative} "
+                f"(top {limit_per_level} by score rank for each next-lower detection level):"
+            )
+        ]
+        for detect_value, candidates, total_count in groups:
+            lines.extend(
+                [
+                    "",
+                    (
+                        f"detect={format_table_float(detect_value, 0, 2).strip()} "
+                        f"(showing {len(candidates)} of {total_count})"
+                    ),
+                    header,
+                    "-" * len(header),
+                ]
+            )
+            for row_index, candidate in enumerate(candidates, start=1):
+                params = candidate_params(candidate)
+                lines.append(
+                    " ".join(
+                        [
+                            f"{row_index:>4}",
+                            format_table_int(candidate.get("rank"), 6),
+                            format_table_float(selected_metric(candidate, "mean_detected"), 7, 2),
+                            format_table_float(selected_metric(candidate, "mean_decoded"), 7, 2),
+                            format_table_float(selected_metric(candidate, "mean_filtered"), 6, 2),
+                            format_table_float(selected_metric(candidate, "mean_filtered_too_small"), 6, 2),
+                            format_table_float(selected_metric(candidate, "mean_filtered_too_large"), 6, 2),
+                            format_table_float(
+                                selected_metric(candidate, "mean_filtered_outside_tag_list"),
+                                7,
+                                2,
+                            ),
+                            format_table_float(selected_metric(candidate, "score"), 9, 4),
+                            format_table_float(params.get("minMarkerPerimeterRate"), 9, 6),
+                            format_table_float(params.get("maxMarkerPerimeterRate"), 9, 6),
+                            format_table_int(params.get("adaptiveThreshWinSizeMin"), 6),
+                            format_table_int(params.get("adaptiveThreshWinSizeMax"), 6),
+                            format_table_int(params.get("adaptiveThreshWinSizeStep"), 7),
+                            format_table_float(params.get("polygonalApproxAccuracyRate"), 7, 4),
+                            format_table_int(params.get("adaptiveThreshConstant"), 5),
+                        ]
+                    )
+                )
+        return "\n".join(lines)
 
     fieldnames = [
         "image_index",
@@ -1646,9 +2799,14 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
         "summary_json_path",
         "candidate_scores_path",
         "detection_csv_path",
+        "annotated_image_path",
         "detection_count",
         "decoded_count",
         "filtered_detection_count",
+        "filtered_too_small_count",
+        "filtered_too_large_count",
+        "filtered_outside_tag_list_count",
+        "filtered_other_count",
         "rejected_candidate_count",
         "dictionary",
         "profile",
@@ -1663,6 +2821,10 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
         "top_detect_mean_detected",
         "top_detect_mean_decoded",
         "top_detect_mean_filtered",
+        "top_detect_mean_filtered_too_small",
+        "top_detect_mean_filtered_too_large",
+        "top_detect_mean_filtered_outside_tag_list",
+        "top_detect_mean_filtered_other",
         "top_detect_std_detected",
         "top_detect_mean_rejected",
         "top_detect_stability",
@@ -1692,6 +2854,55 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
         with path.open(newline="") as f:
             return [dict(row) for row in csv.DictReader(f)]
 
+    def filtered_reason_summary_text(audit: dict[str, object]) -> str:
+        reason_ids = audit.get("filtered_reason_ids") or {}
+        if not isinstance(reason_ids, dict):
+            reason_ids = {}
+
+        def part(label: str, count_key: str, ids_key: str) -> str:
+            count = int(audit.get(count_key) or 0)
+            ids = reason_ids.get(ids_key) or []
+            if ids:
+                return f"{label}={count} ids={list(ids)}"
+            return f"{label}={count}"
+
+        pieces = [
+            part("too_small", "filtered_too_small_count", "too_small"),
+            part("too_large", "filtered_too_large_count", "too_large"),
+            part("outside_tag_list", "filtered_outside_tag_list_count", "outside_tag_list"),
+        ]
+        other_count = int(audit.get("filtered_other_count") or 0)
+        if other_count:
+            pieces.append(part("other", "filtered_other_count", "other"))
+        return "; ".join(pieces)
+
+    def candidate_filtered_reason_summary_text(candidate: dict[str, object]) -> str:
+        def mean_part(label: str, key: str) -> str:
+            try:
+                value = float(candidate.get(key) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            return f"{label}={value:.2f}"
+
+        pieces = [
+            mean_part("small", "mean_filtered_too_small"),
+            mean_part("large", "mean_filtered_too_large"),
+            mean_part("outside", "mean_filtered_outside_tag_list"),
+        ]
+        try:
+            other = float(candidate.get("mean_filtered_other") or 0.0)
+        except (TypeError, ValueError):
+            other = 0.0
+        if other:
+            pieces.append(f"other={other:.2f}")
+        return ", ".join(pieces)
+
+    def row_int(row: dict[str, object], key: str) -> int:
+        try:
+            return int(float(row.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
     config_path = Path(args.config)
     try:
         config = _load_or_defaults(config_path)
@@ -1715,6 +2926,7 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
             and path.suffix.lower() in IMAGE_EXTENSIONS
             and not path.name.startswith("._")
             and path.name not in {".DS_Store", "Thumbs.db"}
+            and not is_generated_optimizer_artifact_path(path, root=input_root)
         )
     else:
         images = find_supported_image_paths(input_root)
@@ -1739,6 +2951,7 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
     all_detection_rows: list[dict[str, object]] = []
     completed = 0
     skipped = 0
+    backfilled_annotations = 0
     failed = 0
 
     print(f"[optimize-images] Input: {input_root}")
@@ -1748,17 +2961,135 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
     print(f"[optimize-images] Allowed tag IDs: {len(allowed_tag_ids) if allowed_tag_ids else 'none'}")
 
     for image_index, image_path in enumerate(images, start=1):
+        if image_index > 1:
+            print()
+
         relative = image_path.relative_to(input_root)
-        image_output_dir = output_root / safe_output_name(image_path, input_root)
+        image_output_dir = per_image_output_dir(image_path, input_root, output_root)
         marker_path = image_output_dir / "image_optimization_complete.json"
         selected_params_path = image_output_dir / "selected_tracking_params.json"
-        detection_csv_path = image_output_dir / f"{image_path.stem}_detections.csv"
+        detection_csv_path = per_image_detection_csv_path(image_path)
+        annotated_path = annotated_image_path(image_path)
 
         matches, marker_payload = marker_matches(marker_path, image_path)
         if matches and not args.force and detection_csv_path.exists():
             marker_row = dict((marker_payload or {}).get("summary_row") or {})
+            if not annotated_path.exists():
+                try:
+                    saved_params, saved_params_path = load_saved_selected_params(
+                        marker_row,
+                        selected_params_path,
+                    )
+                    saved_dictionary = str(marker_row.get("dictionary") or args.dictionary)
+                    detection_rows, detection_audit = detect_markers_in_image(
+                        image_path,
+                        params=saved_params,
+                        dictionary_name=saved_dictionary,
+                        selected_label="top_mean_detection",
+                        selected_params_path=saved_params_path,
+                        relative_image_path=str(relative),
+                        image_index=image_index,
+                        valid_tag_ids=allowed_tag_ids or None,
+                        annotated_output_path=annotated_path,
+                    )
+                    write_detection_csv(detection_csv_path, detection_rows)
+                    all_detection_rows.extend(detection_rows)
+                    marker_row.update(
+                        {
+                            "status": "annotated_backfilled",
+                            "error": "",
+                            "image_index": image_index,
+                            "image_path": str(image_path),
+                            "relative_image_path": str(relative),
+                            "output_dir": str(image_output_dir),
+                            "selected_params_path": str(saved_params_path),
+                            "detection_csv_path": str(detection_csv_path),
+                            "annotated_image_path": detection_audit["annotated_image_path"],
+                            "detection_count": detection_audit["valid_detection_count"],
+                            "decoded_count": detection_audit["decoded_count"],
+                            "filtered_detection_count": detection_audit["filtered_count"],
+                            "filtered_too_small_count": detection_audit["filtered_too_small_count"],
+                            "filtered_too_large_count": detection_audit["filtered_too_large_count"],
+                            "filtered_outside_tag_list_count": detection_audit[
+                                "filtered_outside_tag_list_count"
+                            ],
+                            "filtered_other_count": detection_audit["filtered_other_count"],
+                            "rejected_candidate_count": detection_audit["rejected_count"],
+                            "dictionary": detection_audit["dictionary"],
+                        }
+                    )
+                    if marker_payload is None:
+                        marker_payload = {}
+                    marker_payload["schema_version"] = marker_payload.get("schema_version", 1)
+                    marker_payload["source_signature"] = image_signature(image_path)
+                    marker_payload["summary_row"] = marker_row
+                    marker_path.write_text(json.dumps(marker_payload, indent=2))
+                    rows.append(marker_row)
+                    skipped += 1
+                    backfilled_annotations += 1
+                    print(
+                        f"[optimize-images] {image_index}/{len(images)} {relative}: "
+                        "backfilled annotated image from existing result"
+                    )
+                    print()
+                    print(selected_params_table_text(relative, saved_params, marker_row))
+                    print()
+                    candidate_scores_path = marker_row.get("candidate_scores_path") or ""
+                    best_detect_for_tables = (
+                        marker_row.get("top_detect_mean_detected")
+                        or marker_row.get("detection_count")
+                    )
+                    tie_rows = best_detection_ties_from_csv(
+                        candidate_scores_path,
+                        best_detect_for_tables,
+                    )
+                    if tie_rows:
+                        print(
+                            best_detection_ties_table_text(
+                                relative,
+                                tie_rows,
+                                best_detect_for_tables,
+                            )
+                        )
+                        print()
+                    near_miss_groups = near_miss_detection_groups_from_csv(
+                        candidate_scores_path,
+                        best_detect_for_tables,
+                    )
+                    near_miss_text = near_miss_detection_groups_table_text(relative, near_miss_groups)
+                    if near_miss_text:
+                        print(near_miss_text)
+                        print()
+                    write_summary_csv(summary_csv_path, rows)
+                    write_detection_csv(combined_detection_csv_path, all_detection_rows)
+                    continue
+                except Exception as exc:
+                    failed += 1
+                    marker_row.update(
+                        {
+                            "status": "annotation_backfill_failed",
+                            "error": str(exc),
+                            "image_index": image_index,
+                            "image_path": str(image_path),
+                            "relative_image_path": str(relative),
+                            "output_dir": str(image_output_dir),
+                            "detection_csv_path": str(detection_csv_path),
+                            "annotated_image_path": str(annotated_path),
+                        }
+                    )
+                    rows.append(marker_row)
+                    print(
+                        f"[optimize-images] {image_index}/{len(images)} {relative}: "
+                        f"failed to backfill annotated image: {exc}"
+                    )
+                    write_summary_csv(summary_csv_path, rows)
+                    write_detection_csv(combined_detection_csv_path, all_detection_rows)
+                    continue
+
             marker_row["status"] = "skipped_completed"
             marker_row["image_index"] = image_index
+            marker_row["detection_csv_path"] = str(detection_csv_path)
+            marker_row["annotated_image_path"] = marker_row.get("annotated_image_path") or str(annotated_path)
             rows.append(marker_row)
             all_detection_rows.extend(read_detection_csv(detection_csv_path))
             skipped += 1
@@ -1780,10 +3111,14 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
             high_detect = float(high.get("mean_detected") or 0.0)
             latest_detect = float(latest.get("mean_detected") or 0.0)
             latest_decoded = float(latest.get("mean_decoded") or 0.0)
+            latest_filtered = float(latest.get("mean_filtered") or 0.0)
             print(
                 f"[optimize-images] {image_index}/{len(images)} {relative}: "
                 f"evaluated {done}/{total}; latest detect={latest_detect:.2f}, "
-                f"decoded={latest_decoded:.2f}; highest detect={high_detect:.2f}"
+                f"decoded={latest_decoded:.2f}; "
+                f"filtered={latest_filtered:.2f} "
+                f"({candidate_filtered_reason_summary_text(latest)}); "
+                f"highest detect={high_detect:.2f}"
             )
 
         try:
@@ -1830,6 +3165,7 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
                 relative_image_path=str(relative),
                 image_index=image_index,
                 valid_tag_ids=allowed_tag_ids or None,
+                annotated_output_path=annotated_path,
             )
             write_detection_csv(detection_csv_path, detection_rows)
             all_detection_rows.extend(detection_rows)
@@ -1847,9 +3183,14 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
                 "summary_json_path": result.summary_json_path,
                 "candidate_scores_path": result.candidates_csv_path,
                 "detection_csv_path": str(detection_csv_path),
+                "annotated_image_path": detection_audit["annotated_image_path"],
                 "detection_count": detection_audit["valid_detection_count"],
                 "decoded_count": detection_audit["decoded_count"],
                 "filtered_detection_count": detection_audit["filtered_count"],
+                "filtered_too_small_count": detection_audit["filtered_too_small_count"],
+                "filtered_too_large_count": detection_audit["filtered_too_large_count"],
+                "filtered_outside_tag_list_count": detection_audit["filtered_outside_tag_list_count"],
+                "filtered_other_count": detection_audit["filtered_other_count"],
                 "rejected_candidate_count": detection_audit["rejected_count"],
                 "dictionary": result.dictionary,
                 "profile": result.profile,
@@ -1876,7 +3217,29 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
             print(
                 f"[optimize-images] {image_index}/{len(images)} {relative}: "
                 f"done in {runtime_seconds:.1f}s; top_detect={row['top_detect_mean_detected']}; "
-                f"detections={row['detection_count']}"
+                f"detections={row['detection_count']}; decoded={row['decoded_count']}; "
+                f"filtered={row['filtered_detection_count']}"
+            )
+            print()
+            print(selected_params_table_text(relative, selected_params, top_detect))
+            print()
+            tie_rows = best_detection_ties_from_csv(
+                result.candidates_csv_path,
+                row["top_detect_mean_detected"],
+            )
+            print(best_detection_ties_table_text(relative, tie_rows, row["top_detect_mean_detected"]))
+            print()
+            near_miss_groups = near_miss_detection_groups_from_csv(
+                result.candidates_csv_path,
+                row["top_detect_mean_detected"],
+            )
+            near_miss_text = near_miss_detection_groups_table_text(relative, near_miss_groups)
+            if near_miss_text:
+                print(near_miss_text)
+                print()
+            print(
+                f"[optimize-images] {image_index}/{len(images)} {relative}: "
+                f"filtered decoded tags: {filtered_reason_summary_text(detection_audit)}"
             )
         except KeyboardInterrupt:
             print("\n[optimize-images] Interrupted by user; writing partial summary.")
@@ -1914,6 +3277,7 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
         "images_found": len(images),
         "completed": completed,
         "skipped": skipped,
+        "backfilled_annotations": backfilled_annotations,
         "failed": failed,
         "summary_csv": str(summary_csv_path),
         "combined_detection_csv": str(combined_detection_csv_path),
@@ -1931,7 +3295,18 @@ def _cmd_optimize_image_folder(args: argparse.Namespace) -> int:
     print(f"Images found: {len(images)}")
     print(f"Completed: {completed}")
     print(f"Skipped: {skipped}")
+    print(f"Annotated images backfilled: {backfilled_annotations}")
     print(f"Failed: {failed}")
+    print("Filtered decoded tags:")
+    print(f"  too_small: {sum(row_int(row, 'filtered_too_small_count') for row in rows)}")
+    print(f"  too_large: {sum(row_int(row, 'filtered_too_large_count') for row in rows)}")
+    print(
+        "  outside_tag_list: "
+        f"{sum(row_int(row, 'filtered_outside_tag_list_count') for row in rows)}"
+    )
+    other_total = sum(row_int(row, "filtered_other_count") for row in rows)
+    if other_total:
+        print(f"  other: {other_total}")
     print(f"Elapsed (s): {elapsed:.1f}")
     print(f"Summary CSV: {summary_csv_path}")
     print(f"Combined detection CSV: {combined_detection_csv_path}")
@@ -3183,6 +4558,197 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_config_arg(optimize_parser)
     optimize_parser.set_defaults(func=_cmd_optimize_tracking)
+
+    optimize_video_ranges_parser = subparsers.add_parser(
+        "optimize-video-ranges",
+        help="Optimize and annotate ArUco detections on frame ranges listed in a video manifest CSV.",
+    )
+    _add_common_config_arg(optimize_video_ranges_parser)
+    optimize_video_ranges_parser.add_argument(
+        "--manifest",
+        required=True,
+        help="CSV containing video_id and frame_ranges columns.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--source-root",
+        required=True,
+        help="Project/source root containing input_data videos and, when available, frames/<video_id> images.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--output-root",
+        required=True,
+        help="Output folder for copied videos, extracted range frames, optimization results, and annotations.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--tag-list-root",
+        help="Root folder containing MC tag-list files such as tag_list_mc7_mc8.txt.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--tag-bounds-json",
+        help="Optional per-video smallest/largest tag bounds JSON saved from the GUI.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--open-gui",
+        action="store_true",
+        help=(
+            "Open the GUI prefilled to the video-range smallest/largest tag-bounds workflow, "
+            "then exit without optimizing. Rerun without this flag after saving bounds."
+        ),
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--profile",
+        choices=["quick", "balanced", "deep", "daily"],
+        default="daily",
+        help="Grid profile size (default: daily).",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--dictionary",
+        default="auto",
+        help=(
+            "ArUco dictionary, or 'auto'. Auto skips Aug-2019 and 2024 no-tag rows by default, "
+            "uses 4X4_50 for 2021, and uses 4X4_100 for 2026 BumbleBox videos."
+        ),
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--dictionary-candidates",
+        default="4X4_50,4X4_100",
+        help="Comma-separated dictionaries tested when --dictionary auto cannot decide uniquely, especially 2024 rows.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--tag-size-mm",
+        type=float,
+        default=2.5,
+        help="Physical ArUco tag size in millimeters (default 2.5).",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--sample-frames",
+        type=int,
+        help="Frames sampled from the extracted range for optimization. Defaults to all requested frames.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--expected-tags",
+        type=float,
+        help="Optional expected visible tag count for each optimized frame to guide scoring.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--max-combinations",
+        type=int,
+        default=750,
+        help="Optional cap on parameter combinations per dictionary/video (default: 750).",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--execution-target",
+        choices=["pi_safe", "desktop"],
+        default="desktop",
+        help="pi_safe uses conservative worker defaults. desktop uses more cores.",
+    )
+    optimize_video_ranges_parser.add_argument("--workers", type=int, help="Optional explicit worker count override.")
+    optimize_video_ranges_parser.add_argument(
+        "--sweep-min-marker-perimeter-rate",
+        default="",
+        help="Optional comma-separated override values for minMarkerPerimeterRate.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--sweep-max-marker-perimeter-rate",
+        default="",
+        help="Optional comma-separated override values for maxMarkerPerimeterRate.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-min",
+        default="",
+        help="Optional comma-separated override values for adaptiveThreshWinSizeMin.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-max",
+        default="",
+        help="Optional comma-separated override values for adaptiveThreshWinSizeMax.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--sweep-adaptive-thresh-win-size-step",
+        default="",
+        help="Optional comma-separated override values for adaptiveThreshWinSizeStep.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--sweep-polygonal-approx-accuracy-rate",
+        default="",
+        help="Optional comma-separated override values for polygonalApproxAccuracyRate.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--sweep-adaptive-thresh-constant",
+        default="",
+        help="Optional comma-separated override values for adaptiveThreshConstant.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--allowed-tag-ids",
+        default="",
+        help="Optional comma-separated colony allowlist IDs, combined with auto-resolved --tag-list-root files.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--exclude-tag-ids",
+        default="",
+        help=(
+            "Optional comma-separated marker IDs to ignore even when they decode. "
+            "Ignored IDs do not count during optimization or final detection."
+        ),
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--exclude-tag-ids-except-video-prefixes",
+        default="",
+        help=(
+            "Optional comma-separated video_id prefixes where --exclude-tag-ids should not apply, "
+            "for example col_40."
+        ),
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--no-tag-list-filter",
+        action="store_true",
+        help=(
+            "Decode and size-filter tags without requiring IDs to appear in --allowed-tag-ids "
+            "or the auto-resolved --tag-list-root file. Useful for diagnosing tag-list mismatches."
+        ),
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--include-aug-2019",
+        action="store_true",
+        help="Do not skip Aug-2019 rows. By default those rows are skipped because they do not have ArUco tags.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--include-2024",
+        action="store_true",
+        help="Do not skip 2024 rows. By default those rows are skipped because this manifest's 2024 video has no ArUco tags.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--write-annotated-video",
+        action="store_true",
+        help="Also stitch optimized-frame annotated PNGs into a short MP4 review video for each row.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--annotated-video-fps",
+        type=float,
+        default=2.0,
+        help="FPS for --write-annotated-video review clips (default: 2).",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite copied videos and extracted frames if they already exist.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Only process the first N manifest rows after reading the CSV.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve videos/tag lists/dictionaries and print the plan without copying or optimizing.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--no-live-progress",
+        action="store_true",
+        help="Suppress live per-candidate optimizer progress lines.",
+    )
+    optimize_video_ranges_parser.set_defaults(func=_cmd_optimize_video_ranges)
 
     optimize_images_parser = subparsers.add_parser(
         "optimize-image-folder",

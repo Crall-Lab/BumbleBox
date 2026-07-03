@@ -126,6 +126,13 @@ IMAGE_DETECTION_CSV_FIELDS = [
     "selected_params_path",
     "params_json",
 ]
+FILTER_REASON_KEYS = (
+    "too_small",
+    "too_large",
+    "excluded_tag",
+    "outside_tag_list",
+    "other",
+)
 
 
 ProgressCandidateSnapshot = dict[str, Any]
@@ -150,6 +157,11 @@ class OptimizationCandidate:
     runtime_seconds: float
     mean_decoded: float = 0.0
     mean_filtered: float = 0.0
+    mean_filtered_too_small: float = 0.0
+    mean_filtered_too_large: float = 0.0
+    mean_filtered_excluded_tag: float = 0.0
+    mean_filtered_outside_tag_list: float = 0.0
+    mean_filtered_other: float = 0.0
 
 
 @dataclass
@@ -684,12 +696,20 @@ def _is_generated_optimizer_artifact_path(path: Path, *, root: Path) -> bool:
     except ValueError:
         parts = path.parts
     root_name = root.name
+    if path.suffix.lower() in IMAGE_EXTENSIONS and path.stem.endswith("_annotated"):
+        return True
     return any(
         part in GENERATED_OPTIMIZER_DIR_NAMES
+        or part.startswith("tracking_optimization_")
+        or part.endswith("_tracking_optimization")
         or part.startswith("optimize_tracking_")
         or part.startswith("iterative_tracking_refinement_")
         for part in (root_name, *parts)
     )
+
+
+def is_generated_optimizer_artifact_path(path: Path, *, root: Path) -> bool:
+    return _is_generated_optimizer_artifact_path(path, root=root)
 
 
 def _is_system_sidecar_file(path: Path) -> bool:
@@ -845,6 +865,18 @@ def _normalized_valid_tag_ids(valid_tag_ids: Optional[Iterable[int]]) -> Optiona
     return out if out else None
 
 
+def _normalized_excluded_tag_ids(excluded_tag_ids: Optional[Iterable[int]]) -> set[int]:
+    if excluded_tag_ids is None:
+        return set()
+    out: set[int] = set()
+    for raw_id in excluded_tag_ids:
+        try:
+            out.add(int(raw_id))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _perimeter_filter_bounds(
     params: dict[str, float | int],
     explicit_bounds: Optional[tuple[float, float]],
@@ -862,6 +894,16 @@ def _perimeter_filter_bounds(
     return min_rate, max_rate
 
 
+def _empty_filter_reason_counts() -> dict[str, int]:
+    return {reason: 0 for reason in FILTER_REASON_KEYS}
+
+
+def _record_filter_reason(reason_counts: dict[str, int], reason: str) -> None:
+    if reason not in reason_counts:
+        reason = "other"
+    reason_counts[reason] += 1
+
+
 def _valid_decoded_marker_ids(
     *,
     corners: Any,
@@ -869,24 +911,33 @@ def _valid_decoded_marker_ids(
     frame_width: int,
     frame_height: int,
     valid_tag_ids: Optional[set[int]],
+    excluded_tag_ids: Optional[set[int]],
     perimeter_bounds: Optional[tuple[float, float]],
-) -> tuple[set[int], set[int], int]:
+) -> tuple[set[int], set[int], int, dict[str, int]]:
     decoded_ids: set[int] = set()
     valid_ids: set[int] = set()
     filtered_count = 0
+    reason_counts = _empty_filter_reason_counts()
     if ids is None or len(ids) <= 0:
-        return decoded_ids, valid_ids, filtered_count
+        return decoded_ids, valid_ids, filtered_count, reason_counts
 
     for corner, marker_id_raw in zip(corners, ids.flatten().tolist()):
         try:
             marker_id = int(marker_id_raw)
         except (TypeError, ValueError):
             filtered_count += 1
+            _record_filter_reason(reason_counts, "other")
             continue
         decoded_ids.add(marker_id)
 
+        if excluded_tag_ids and marker_id in excluded_tag_ids:
+            filtered_count += 1
+            _record_filter_reason(reason_counts, "excluded_tag")
+            continue
+
         if valid_tag_ids is not None and marker_id not in valid_tag_ids:
             filtered_count += 1
+            _record_filter_reason(reason_counts, "outside_tag_list")
             continue
 
         if perimeter_bounds is not None:
@@ -898,13 +949,15 @@ def _valid_decoded_marker_ids(
             )
             if min_rate > 0 and perimeter_rate < min_rate:
                 filtered_count += 1
+                _record_filter_reason(reason_counts, "too_small")
                 continue
             if max_rate > 0 and perimeter_rate > max_rate:
                 filtered_count += 1
+                _record_filter_reason(reason_counts, "too_large")
                 continue
 
         valid_ids.add(marker_id)
-    return decoded_ids, valid_ids, filtered_count
+    return decoded_ids, valid_ids, filtered_count, reason_counts
 
 
 def _evaluate_candidate(
@@ -913,6 +966,7 @@ def _evaluate_candidate(
     dictionary_name: str,
     expected_tags: Optional[float],
     valid_tag_ids: Optional[set[int]] = None,
+    excluded_tag_ids: Optional[set[int]] = None,
     perimeter_filter_bounds: Optional[tuple[float, float]] = None,
 ) -> OptimizationCandidate:
     detector_params = cv2.aruco.DetectorParameters()
@@ -928,6 +982,7 @@ def _evaluate_candidate(
     detected_counts = []
     decoded_counts = []
     filtered_counts = []
+    filtered_reason_count_lists = {reason: [] for reason in FILTER_REASON_KEYS}
     rejected_counts = []
     stability_scores = []
     unique_ids = set()
@@ -943,12 +998,13 @@ def _evaluate_candidate(
         frame_height, frame_width = gray.shape[:2]
 
         corners, ids, rejected = detector.detectMarkers(gray)
-        decoded_ids, ids_set, filtered_count = _valid_decoded_marker_ids(
+        decoded_ids, ids_set, filtered_count, reason_counts = _valid_decoded_marker_ids(
             corners=corners,
             ids=ids,
             frame_width=frame_width,
             frame_height=frame_height,
             valid_tag_ids=valid_tag_ids,
+            excluded_tag_ids=excluded_tag_ids,
             perimeter_bounds=bounds,
         )
         unique_ids.update(ids_set)
@@ -959,6 +1015,8 @@ def _evaluate_candidate(
         detected_counts.append(detected)
         decoded_counts.append(decoded_count)
         filtered_counts.append(filtered_count)
+        for reason in FILTER_REASON_KEYS:
+            filtered_reason_count_lists[reason].append(reason_counts.get(reason, 0))
         rejected_counts.append(rejected_count)
 
         union = previous_ids | ids_set
@@ -973,6 +1031,10 @@ def _evaluate_candidate(
     mean_detected = statistics.fmean(detected_counts) if detected_counts else 0.0
     mean_decoded = statistics.fmean(decoded_counts) if decoded_counts else 0.0
     mean_filtered = statistics.fmean(filtered_counts) if filtered_counts else 0.0
+    mean_filtered_reasons = {
+        reason: statistics.fmean(counts) if counts else 0.0
+        for reason, counts in filtered_reason_count_lists.items()
+    }
     mean_rejected = statistics.fmean(rejected_counts) if rejected_counts else 0.0
     std_detected = statistics.pstdev(detected_counts) if len(detected_counts) > 1 else 0.0
     stability = statistics.fmean(stability_scores) if stability_scores else 0.0
@@ -998,6 +1060,11 @@ def _evaluate_candidate(
         runtime_seconds=runtime,
         mean_decoded=mean_decoded,
         mean_filtered=mean_filtered,
+        mean_filtered_too_small=mean_filtered_reasons["too_small"],
+        mean_filtered_too_large=mean_filtered_reasons["too_large"],
+        mean_filtered_excluded_tag=mean_filtered_reasons["excluded_tag"],
+        mean_filtered_outside_tag_list=mean_filtered_reasons["outside_tag_list"],
+        mean_filtered_other=mean_filtered_reasons["other"],
     )
 
 
@@ -1014,6 +1081,11 @@ def _write_candidates_csv(candidates: Sequence[OptimizationCandidate], csv_path:
         "mean_detected",
         "mean_decoded",
         "mean_filtered",
+        "mean_filtered_too_small",
+        "mean_filtered_too_large",
+        "mean_filtered_excluded_tag",
+        "mean_filtered_outside_tag_list",
+        "mean_filtered_other",
         "std_detected",
         "mean_rejected",
         "stability",
@@ -1033,6 +1105,11 @@ def _write_candidates_csv(candidates: Sequence[OptimizationCandidate], csv_path:
                     "mean_detected": f"{item.mean_detected:.6f}",
                     "mean_decoded": f"{item.mean_decoded:.6f}",
                     "mean_filtered": f"{item.mean_filtered:.6f}",
+                    "mean_filtered_too_small": f"{item.mean_filtered_too_small:.6f}",
+                    "mean_filtered_too_large": f"{item.mean_filtered_too_large:.6f}",
+                    "mean_filtered_excluded_tag": f"{item.mean_filtered_excluded_tag:.6f}",
+                    "mean_filtered_outside_tag_list": f"{item.mean_filtered_outside_tag_list:.6f}",
+                    "mean_filtered_other": f"{item.mean_filtered_other:.6f}",
                     "std_detected": f"{item.std_detected:.6f}",
                     "mean_rejected": f"{item.mean_rejected:.6f}",
                     "stability": f"{item.stability:.6f}",
@@ -1063,6 +1140,11 @@ def _top_candidate_snapshots(
                 "mean_detected": candidate.mean_detected,
                 "mean_decoded": candidate.mean_decoded,
                 "mean_filtered": candidate.mean_filtered,
+                "mean_filtered_too_small": candidate.mean_filtered_too_small,
+                "mean_filtered_too_large": candidate.mean_filtered_too_large,
+                "mean_filtered_excluded_tag": candidate.mean_filtered_excluded_tag,
+                "mean_filtered_outside_tag_list": candidate.mean_filtered_outside_tag_list,
+                "mean_filtered_other": candidate.mean_filtered_other,
                 "std_detected": candidate.std_detected,
                 "mean_rejected": candidate.mean_rejected,
                 "stability": candidate.stability,
@@ -1140,6 +1222,11 @@ def _candidate_progress_snapshot(
         "mean_detected": candidate.mean_detected,
         "mean_decoded": candidate.mean_decoded,
         "mean_filtered": candidate.mean_filtered,
+        "mean_filtered_too_small": candidate.mean_filtered_too_small,
+        "mean_filtered_too_large": candidate.mean_filtered_too_large,
+        "mean_filtered_excluded_tag": candidate.mean_filtered_excluded_tag,
+        "mean_filtered_outside_tag_list": candidate.mean_filtered_outside_tag_list,
+        "mean_filtered_other": candidate.mean_filtered_other,
         "std_detected": candidate.std_detected,
         "mean_rejected": candidate.mean_rejected,
         "stability": candidate.stability,
@@ -1321,7 +1408,9 @@ def detect_markers_in_image(
     relative_image_path: str = "",
     image_index: int | None = None,
     valid_tag_ids: Optional[Iterable[int]] = None,
+    excluded_tag_ids: Optional[Iterable[int]] = None,
     perimeter_filter_bounds: Optional[tuple[float, float]] = None,
+    annotated_output_path: str | Path | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     _require_aruco()
     path = _resolve_user_path(image_path)
@@ -1332,6 +1421,7 @@ def detect_markers_in_image(
     frame_height, frame_width = image.shape[:2]
     normalized_dictionary = normalize_dictionary_name(dictionary_name)
     normalized_valid_tag_ids = _normalized_valid_tag_ids(valid_tag_ids)
+    normalized_excluded_tag_ids = _normalized_excluded_tag_ids(excluded_tag_ids)
     detector_params = cv2.aruco.DetectorParameters()
     for param_name, param_value in params.items():
         if hasattr(detector_params, param_name):
@@ -1346,34 +1436,50 @@ def detect_markers_in_image(
     rel_text = str(relative_image_path or path.name)
 
     rows: list[dict[str, object]] = []
+    accepted_corners: list[Any] = []
+    accepted_id_indices: list[int] = []
     decoded_count = 0
     filtered_count = 0
+    filter_reason_counts = {reason: 0 for reason in FILTER_REASON_KEYS}
+    filter_reason_ids: dict[str, list[int]] = {reason: [] for reason in FILTER_REASON_KEYS}
+
+    def record_filtered(reason: str, marker_id: int | None = None) -> None:
+        nonlocal filtered_count
+        reason_key = reason if reason in filter_reason_counts else "other"
+        filtered_count += 1
+        filter_reason_counts[reason_key] += 1
+        if marker_id is not None:
+            filter_reason_ids[reason_key].append(marker_id)
+
     if ids is not None and len(ids) > 0:
-        for corner, marker_id_raw in zip(corners, ids.flatten().tolist()):
+        for marker_index, (corner, marker_id_raw) in enumerate(zip(corners, ids.flatten().tolist())):
             try:
                 marker_id = int(marker_id_raw)
             except (TypeError, ValueError):
-                filtered_count += 1
+                record_filtered("other")
                 continue
             decoded_count += 1
 
             points = corner.reshape(-1, 2)
             if len(points) < 4:
-                filtered_count += 1
+                record_filtered("other", marker_id)
                 continue
 
             perimeter_px = _corner_perimeter_px(corner)
             perimeter_rate = perimeter_px / float(max(1, max(frame_width, frame_height)))
+            if marker_id in normalized_excluded_tag_ids:
+                record_filtered("excluded_tag", marker_id)
+                continue
             if normalized_valid_tag_ids is not None and marker_id not in normalized_valid_tag_ids:
-                filtered_count += 1
+                record_filtered("outside_tag_list", marker_id)
                 continue
             if bounds is not None:
                 min_rate, max_rate = bounds
                 if min_rate > 0 and perimeter_rate < min_rate:
-                    filtered_count += 1
+                    record_filtered("too_small", marker_id)
                     continue
                 if max_rate > 0 and perimeter_rate > max_rate:
-                    filtered_count += 1
+                    record_filtered("too_large", marker_id)
                     continue
 
             center_x = float(points[:, 0].mean())
@@ -1397,15 +1503,63 @@ def detect_markers_in_image(
                 row[f"corner_{point_index}_x"] = f"{float(points[point_index, 0]):.3f}"
                 row[f"corner_{point_index}_y"] = f"{float(points[point_index, 1]):.3f}"
             rows.append(row)
+            accepted_corners.append(corner)
+            accepted_id_indices.append(marker_index)
+
+    annotated_path_text = ""
+    if annotated_output_path is not None:
+        annotated_path = _resolve_user_path(annotated_output_path)
+        annotated_path.parent.mkdir(parents=True, exist_ok=True)
+        annotated = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if annotated is None:
+            annotated = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        if ids is not None and accepted_id_indices:
+            accepted_ids = ids[accepted_id_indices]
+            cv2.aruco.drawDetectedMarkers(annotated, accepted_corners, accepted_ids)
+            _draw_large_marker_ids(annotated, accepted_corners, accepted_ids)
+        label = f"tracked tags: {len(rows)}"
+        cv2.putText(
+            annotated,
+            label,
+            (16, 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 0),
+            5,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            annotated,
+            label,
+            (16, 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        if not cv2.imwrite(str(annotated_path), annotated):
+            raise RuntimeError(f"Could not write annotated detection image: {annotated_path}")
+        annotated_path_text = str(annotated_path)
 
     audit = {
         "decoded_count": decoded_count,
         "valid_detection_count": len(rows),
         "filtered_count": filtered_count,
+        "filtered_too_small_count": filter_reason_counts["too_small"],
+        "filtered_too_large_count": filter_reason_counts["too_large"],
+        "filtered_excluded_tag_count": filter_reason_counts["excluded_tag"],
+        "filtered_outside_tag_list_count": filter_reason_counts["outside_tag_list"],
+        "filtered_other_count": filter_reason_counts["other"],
+        "filtered_reason_ids": {
+            reason: sorted(set(reason_ids))
+            for reason, reason_ids in filter_reason_ids.items()
+        },
         "rejected_count": len(rejected) if rejected is not None else 0,
         "frame_width": int(frame_width),
         "frame_height": int(frame_height),
         "dictionary": normalized_dictionary,
+        "annotated_image_path": annotated_path_text,
     }
     return rows, audit
 
@@ -1551,6 +1705,7 @@ def _annotate_review_frame(
     source_index: int,
     perimeter_flag_bounds: Optional[tuple[float, float]] = None,
     valid_tag_ids: Optional[set[int]] = None,
+    excluded_tag_ids: Optional[set[int]] = None,
 ) -> tuple[Any, int, int, int, int, int, int]:
     corners, ids, rejected = detector.detectMarkers(frame_gray)
     frame_height, frame_width = frame_gray.shape[:2]
@@ -1562,12 +1717,13 @@ def _annotate_review_frame(
             candidate.params.get("maxMarkerPerimeterRate", DEFAULT_MAX_MARKER_PERIMETER_RATE)
             or DEFAULT_MAX_MARKER_PERIMETER_RATE
         )
-    decoded_ids, valid_ids, filtered_count = _valid_decoded_marker_ids(
+    decoded_ids, valid_ids, filtered_count, _reason_counts = _valid_decoded_marker_ids(
         corners=corners,
         ids=ids,
         frame_width=frame_width,
         frame_height=frame_height,
         valid_tag_ids=valid_tag_ids,
+        excluded_tag_ids=excluded_tag_ids,
         perimeter_bounds=(min_rate, max_rate),
     )
     detected_count = len(valid_ids)
@@ -1663,6 +1819,7 @@ def write_top_candidate_review_artifacts(
     extra_candidates: Optional[Sequence[tuple[str, OptimizationCandidate]]] = None,
     perimeter_flag_bounds: Optional[tuple[float, float]] = None,
     valid_tag_ids: Optional[set[int]] = None,
+    excluded_tag_ids: Optional[set[int]] = None,
 ) -> Optional[Path]:
     if not sampled_frames or not candidates:
         return None
@@ -1745,6 +1902,7 @@ def write_top_candidate_review_artifacts(
                 source_index=source_index,
                 perimeter_flag_bounds=perimeter_flag_bounds,
                 valid_tag_ids=valid_tag_ids,
+                excluded_tag_ids=excluded_tag_ids,
             )
             total_below_min_count += below_min_count
             total_above_max_count += above_max_count
@@ -1813,6 +1971,7 @@ def optimize_tracking(
     top_k: int = 10,
     review_perimeter_bounds: Optional[tuple[float, float]] = None,
     valid_tag_ids: Optional[Iterable[int]] = None,
+    excluded_tag_ids: Optional[Iterable[int]] = None,
     progress_callback: Optional[ProgressCallback] = None,
     stop_requested: Optional[StopRequestedCallback] = None,
 ) -> TrackingOptimizationResult:
@@ -1850,6 +2009,7 @@ def optimize_tracking(
 
     normalized_dictionary = normalize_dictionary_name(dictionary_name)
     normalized_valid_tag_ids = _normalized_valid_tag_ids(valid_tag_ids)
+    normalized_excluded_tag_ids = _normalized_excluded_tag_ids(excluded_tag_ids)
     resolved_input = _resolve_user_path(input_path)
     sampled_frames, input_type, total_input_frames, sample_indices = load_sample_frames_with_indices(
         resolved_input,
@@ -1923,6 +2083,7 @@ def optimize_tracking(
                 normalized_dictionary,
                 expected_tags,
                 valid_tag_ids=normalized_valid_tag_ids,
+                excluded_tag_ids=normalized_excluded_tag_ids,
                 perimeter_filter_bounds=review_perimeter_bounds,
             )
             register_candidate(candidate)
@@ -1940,8 +2101,9 @@ def optimize_tracking(
                         sampled_frames,
                         normalized_dictionary,
                         expected_tags,
-                        normalized_valid_tag_ids,
-                        review_perimeter_bounds,
+                        valid_tag_ids=normalized_valid_tag_ids,
+                        excluded_tag_ids=normalized_excluded_tag_ids,
+                        perimeter_filter_bounds=review_perimeter_bounds,
                     )
                     for params in batch
                 ]
@@ -2001,6 +2163,7 @@ def optimize_tracking(
         ],
         perimeter_flag_bounds=review_perimeter_bounds,
         valid_tag_ids=normalized_valid_tag_ids,
+        excluded_tag_ids=normalized_excluded_tag_ids,
     )
 
     top_candidates = evaluated[: max(top_k, 1)]
@@ -2058,8 +2221,9 @@ def optimize_tracking(
         else None
     )
     summary["valid_tag_ids_filter"] = sorted(normalized_valid_tag_ids) if normalized_valid_tag_ids else None
+    summary["excluded_tag_ids_filter"] = sorted(normalized_excluded_tag_ids) if normalized_excluded_tag_ids else None
     summary["mean_detected_definition"] = (
-        "valid decoded tags after perimeter and allowed-ID filtering; "
+        "valid decoded tags after excluded-ID, perimeter, and allowed-ID filtering; "
         "see mean_decoded and mean_filtered for raw decoded audit counts"
     )
 
@@ -2089,6 +2253,7 @@ def optimize_tracking_iterative_refinement(
     top_k: int = 10,
     review_perimeter_bounds: Optional[tuple[float, float]] = None,
     valid_tag_ids: Optional[Iterable[int]] = None,
+    excluded_tag_ids: Optional[Iterable[int]] = None,
     progress_callback: Optional[ProgressCallback] = None,
     stop_requested: Optional[StopRequestedCallback] = None,
 ) -> IterativeTrackingRefinementResult:
@@ -2160,6 +2325,7 @@ def optimize_tracking_iterative_refinement(
             top_k=max(top_k, seed_candidate_count),
             review_perimeter_bounds=review_perimeter_bounds,
             valid_tag_ids=valid_tag_ids,
+            excluded_tag_ids=excluded_tag_ids,
             progress_callback=stage_callback(f"Refinement round {round_index}/{rounds}"),
             stop_requested=stop_requested,
         )
@@ -2198,6 +2364,7 @@ def optimize_tracking_iterative_refinement(
             top_k=max(top_k, seed_candidate_count),
             review_perimeter_bounds=review_perimeter_bounds,
             valid_tag_ids=valid_tag_ids,
+            excluded_tag_ids=excluded_tag_ids,
             progress_callback=stage_callback("Validation pass"),
             stop_requested=stop_requested,
         )

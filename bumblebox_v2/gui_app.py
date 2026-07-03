@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import csv
 from copy import deepcopy
 import json
 import os
 import queue
+import re
 import shutil
 import shlex
 import subprocess
@@ -222,6 +224,9 @@ class BumbleBoxV2GUI(tk.Tk):
         self._optimize_started_monotonic: float | None = None
         self._optimize_last_progress_monotonic: float | None = None
         self._optimize_latest_progress: tuple[int, int, list[dict[str, object]], dict[str, object]] | None = None
+        self._video_range_rows: list[dict[str, object]] = []
+        self._video_range_selected_index: int | None = None
+        self._video_range_tag_bounds: dict[str, dict[str, object]] = {}
         self._fps_sweep_thread: threading.Thread | None = None
         self._fps_sweep_error: str | None = None
         self._fps_sweep_report = None
@@ -3963,6 +3968,11 @@ class BumbleBoxV2GUI(tk.Tk):
         self.opt_refinement_seed_count_var = tk.StringVar(value="5")
         self.opt_refinement_seed_source_var = tk.StringVar(value="mean_detection")
         self.opt_refinement_validation_multiplier_var = tk.StringVar(value="2")
+        self.video_range_manifest_var = tk.StringVar(value="")
+        self.video_range_source_root_var = tk.StringVar(value="")
+        self.video_range_bounds_file_var = tk.StringVar(value="")
+        self.video_range_selected_var = tk.StringVar(value="No video range manifest loaded.")
+        self.video_range_status_var = tk.StringVar(value="Load a video range CSV to measure per-video tag bounds.")
         self._opt_sweep_profile_vars: dict[str, dict[str, tk.StringVar]] = {}
         self._opt_profile_notebook: ttk.Notebook | None = None
         self._opt_profile_tabs: dict[str, ttk.Frame] = {}
@@ -4126,8 +4136,11 @@ class BumbleBoxV2GUI(tk.Tk):
             ),
         ).pack(side=tk.LEFT, padx=(4, 0))
 
+        video_range_frame = self._build_video_range_calibration_panel(top)
+        video_range_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
         advanced = ttk.LabelFrame(top, text="Advanced Optimization Options", padding=6)
-        advanced.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        advanced.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self._grid_help_label(
             advanced,
             row=0,
@@ -4255,7 +4268,7 @@ class BumbleBoxV2GUI(tk.Tk):
         self._register_advanced_widget(advanced)
 
         controls = ttk.Frame(top)
-        controls.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        controls.grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.optimize_run_btn = ttk.Button(
             controls,
             text="Run optimize-tracking",
@@ -4295,6 +4308,121 @@ class BumbleBoxV2GUI(tk.Tk):
             wrap=tk.NONE,
             horizontal_scroll=True,
         )
+
+    def _build_video_range_calibration_panel(self, parent: tk.Widget) -> ttk.LabelFrame:
+        frame = ttk.LabelFrame(parent, text="Video Range Tag Bounds", padding=6)
+
+        self._grid_help_label(
+            frame,
+            row=0,
+            column=0,
+            text="Video range CSV",
+            help_title="Video Range CSV",
+            help_details=(
+                "CSV with video_id and frame_ranges columns. This is used to step through the requested "
+                "videos and measure tag-size bounds on the exact frames that will be tracked."
+            ),
+        )
+        manifest_row = ttk.Frame(frame)
+        manifest_row.grid(row=0, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Entry(manifest_row, textvariable=self.video_range_manifest_var, width=70).pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+        )
+        ttk.Button(manifest_row, text="Browse", command=self._browse_video_range_manifest).pack(
+            side=tk.LEFT,
+            padx=(6, 0),
+        )
+
+        self._grid_help_label(
+            frame,
+            row=1,
+            column=0,
+            text="Project/source root",
+            help_title="Project Source Root",
+            help_details=(
+                "Folder that contains the videos and, when available, the extracted frames/<video_id> folders. "
+                "For the current project this is the test_august_june25 project folder."
+            ),
+        )
+        source_row = ttk.Frame(frame)
+        source_row.grid(row=1, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Entry(source_row, textvariable=self.video_range_source_root_var, width=70).pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+        )
+        ttk.Button(source_row, text="Browse", command=self._browse_video_range_source_root).pack(
+            side=tk.LEFT,
+            padx=(6, 0),
+        )
+
+        self._grid_help_label(
+            frame,
+            row=2,
+            column=0,
+            text="Bounds JSON",
+            help_title="Per-Video Bounds JSON",
+            help_details=(
+                "Where the per-video smallest/largest tag measurements are saved. The future video-range "
+                "tracking workflow can read this file to use different perimeter bounds for different videos."
+            ),
+        )
+        bounds_row = ttk.Frame(frame)
+        bounds_row.grid(row=2, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Entry(bounds_row, textvariable=self.video_range_bounds_file_var, width=70).pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+        )
+        ttk.Button(bounds_row, text="Browse", command=self._browse_video_range_bounds_file).pack(
+            side=tk.LEFT,
+            padx=(6, 0),
+        )
+
+        controls = ttk.Frame(frame)
+        controls.grid(row=3, column=1, sticky="w", padx=8, pady=(6, 2))
+        ttk.Button(controls, text="Load CSV", command=self._load_video_range_manifest).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Prev Video", command=lambda: self._shift_video_range_selection(-1)).pack(
+            side=tk.LEFT,
+            padx=(8, 0),
+        )
+        ttk.Button(controls, text="Next Video", command=lambda: self._shift_video_range_selection(1)).pack(
+            side=tk.LEFT,
+            padx=(6, 0),
+        )
+        ttk.Button(
+            controls,
+            text="Measure Selected Video",
+            command=self._open_video_range_tag_measurement,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self._make_help_button(
+            controls,
+            title="Measure Selected Video",
+            details=(
+                "Opens the corner-marking tool on only the selected video's requested frame range. "
+                "After you apply the measurement, BumbleBox saves the smallest/largest tag bounds for that video."
+            ),
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(frame, textvariable=self.video_range_selected_var, justify=tk.LEFT).grid(
+            row=4,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(4, 0),
+        )
+        ttk.Label(frame, textvariable=self.video_range_status_var, justify=tk.LEFT).grid(
+            row=5,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(2, 0),
+        )
+
+        frame.columnconfigure(1, weight=1)
+        return frame
 
     def _save_optimizer_dictionary_to_config(self) -> None:
         try:
@@ -4551,7 +4679,476 @@ class BumbleBoxV2GUI(tk.Tk):
 
         raise ValueError(f"Unsupported frame reference kind: {kind}")
 
-    def _open_tag_perimeter_measurement_dialog(self) -> None:
+    def _browse_video_range_manifest(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select video range CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.video_range_manifest_var.set(path)
+        if not self.video_range_bounds_file_var.get().strip():
+            self.video_range_bounds_file_var.set(self._default_video_range_bounds_file())
+
+    def _browse_video_range_source_root(self) -> None:
+        path = filedialog.askdirectory(title="Select project/source root")
+        if not path:
+            return
+        self.video_range_source_root_var.set(path)
+        if not self.video_range_bounds_file_var.get().strip():
+            self.video_range_bounds_file_var.set(self._default_video_range_bounds_file())
+
+    def _browse_video_range_bounds_file(self) -> None:
+        initial = self.video_range_bounds_file_var.get().strip() or self._default_video_range_bounds_file()
+        path = filedialog.asksaveasfilename(
+            title="Save per-video tag bounds JSON",
+            initialfile=Path(initial).name if initial else "video_range_tag_bounds.json",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if path:
+            self.video_range_bounds_file_var.set(path)
+
+    def _default_video_range_bounds_file(self) -> str:
+        manifest_text = self.video_range_manifest_var.get().strip()
+        if manifest_text:
+            manifest_path = Path(manifest_text).expanduser()
+            return str(manifest_path.with_name(f"{manifest_path.stem}_tag_bounds.json"))
+        source_text = self.video_range_source_root_var.get().strip()
+        if source_text:
+            return str(Path(source_text).expanduser() / "video_range_tag_bounds.json")
+        return "video_range_tag_bounds.json"
+
+    def _parse_video_frame_ranges(self, row: dict[str, str]) -> list[tuple[int, int]]:
+        text = str(row.get("frame_ranges") or "").strip()
+        if not text:
+            start_text = str(row.get("first_start_frame") or "").strip()
+            end_text = str(row.get("last_end_frame") or "").strip()
+            if start_text and end_text:
+                text = f"{start_text}-{end_text}"
+        if not text:
+            raise ValueError("missing frame_ranges")
+
+        ranges: list[tuple[int, int]] = []
+        for token in re.split(r"[;,]+", text):
+            token = token.strip()
+            if not token:
+                continue
+            if "-" in token:
+                start_text, end_text = token.split("-", 1)
+                start = int(float(start_text.strip()))
+                end = int(float(end_text.strip()))
+            else:
+                start = end = int(float(token))
+            if start < 0 or end < 0:
+                raise ValueError(f"negative frame index in {text!r}")
+            if end < start:
+                start, end = end, start
+            ranges.append((start, end))
+        if not ranges:
+            raise ValueError("no usable frame ranges")
+        return ranges
+
+    def _video_range_indices(self, ranges: list[tuple[int, int]], *, max_frames: int | None = None) -> list[int]:
+        indices: list[int] = []
+        seen: set[int] = set()
+        for start, end in ranges:
+            for frame_index in range(int(start), int(end) + 1):
+                if frame_index in seen:
+                    continue
+                seen.add(frame_index)
+                indices.append(frame_index)
+        indices.sort()
+        if max_frames is not None and len(indices) > max_frames:
+            from .tracking_optimizer import _sample_indices
+
+            sample_positions = _sample_indices(len(indices), max_frames)
+            indices = [indices[position] for position in sample_positions]
+        return indices
+
+    def _resolve_video_range_video_path(self, source_root: Path, video_id: str) -> Path | None:
+        from .tracking_optimizer import VIDEO_EXTENSIONS
+
+        search_roots = [
+            source_root / "input_data" / "val",
+            source_root / "input_data",
+            source_root,
+        ]
+        candidates: list[Path] = []
+        seen: set[Path] = set()
+        for root in search_roots:
+            if not root.exists():
+                continue
+            direct = [
+                root / f"{video_id}{extension}"
+                for extension in sorted(VIDEO_EXTENSIONS | {".mjpe"})
+            ]
+            for path in direct:
+                if path.exists() and path.is_file() and path.resolve() not in seen:
+                    seen.add(path.resolve())
+                    candidates.append(path)
+            for path in root.rglob(f"{video_id}.*"):
+                if (
+                    path.is_file()
+                    and path.stem == video_id
+                    and path.suffix.lower() in (VIDEO_EXTENSIONS | {".mjpe"})
+                    and path.resolve() not in seen
+                ):
+                    seen.add(path.resolve())
+                    candidates.append(path)
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda item: (0 if "input_data/val" in str(item) else 1, str(item)))[0]
+
+    def _load_video_range_bounds_file(self) -> None:
+        path_text = self.video_range_bounds_file_var.get().strip()
+        self._video_range_tag_bounds = {}
+        if not path_text:
+            return
+        path = Path(path_text).expanduser()
+        if not path.exists():
+            return
+        payload = json.loads(path.read_text())
+        raw_entries = payload.get("entries", {}) if isinstance(payload, dict) else {}
+        if isinstance(raw_entries, dict):
+            self._video_range_tag_bounds = {
+                str(video_id): dict(value)
+                for video_id, value in raw_entries.items()
+                if isinstance(value, dict)
+            }
+
+    def _write_video_range_bounds_file(self) -> Path:
+        path_text = self.video_range_bounds_file_var.get().strip() or self._default_video_range_bounds_file()
+        self.video_range_bounds_file_var.set(path_text)
+        path = Path(path_text).expanduser()
+        payload = {
+            "schema_version": 1,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "manifest_path": self.video_range_manifest_var.get().strip(),
+            "source_root": self.video_range_source_root_var.get().strip(),
+            "entries": self._video_range_tag_bounds,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        return path
+
+    def _load_video_range_manifest(self) -> None:
+        manifest_text = self.video_range_manifest_var.get().strip()
+        source_text = self.video_range_source_root_var.get().strip()
+        if not manifest_text:
+            self._show_error("Missing CSV", "Choose the video range CSV first.")
+            return
+        if not source_text:
+            self._show_error("Missing source root", "Choose the project/source root that contains the videos.")
+            return
+
+        manifest_path = Path(manifest_text).expanduser().resolve()
+        source_root = Path(source_text).expanduser().resolve()
+        if not manifest_path.exists():
+            self._show_error("CSV not found", str(manifest_path))
+            return
+        if not source_root.exists():
+            self._show_error("Source root not found", str(source_root))
+            return
+        if not self.video_range_bounds_file_var.get().strip():
+            self.video_range_bounds_file_var.set(self._default_video_range_bounds_file())
+
+        rows: list[dict[str, object]] = []
+        errors: list[str] = []
+        skipped_aug_2019 = 0
+        skipped_2024 = 0
+        with manifest_path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            for row_index, row in enumerate(reader, start=2):
+                video_id = str(row.get("video_id") or "").strip()
+                if not video_id:
+                    errors.append(f"row {row_index}: missing video_id")
+                    continue
+                if re.match(r"^\d{2}-Aug-2019_", video_id):
+                    skipped_aug_2019 += 1
+                    continue
+                if "2024" in video_id:
+                    skipped_2024 += 1
+                    continue
+                try:
+                    ranges = self._parse_video_frame_ranges(row)
+                except Exception as exc:
+                    errors.append(f"{video_id}: {exc}")
+                    continue
+                video_path = self._resolve_video_range_video_path(source_root, video_id)
+                frames_dir = source_root / "frames" / video_id
+                rows.append(
+                    {
+                        "video_id": video_id,
+                        "row": dict(row),
+                        "frame_ranges": str(row.get("frame_ranges") or ""),
+                        "ranges": ranges,
+                        "video_path": str(video_path) if video_path else "",
+                        "frames_dir": str(frames_dir) if frames_dir.exists() else "",
+                    }
+                )
+
+        self._video_range_rows = rows
+        self._video_range_selected_index = 0 if rows else None
+        try:
+            self._load_video_range_bounds_file()
+        except Exception as exc:
+            errors.append(f"could not load bounds JSON: {exc}")
+        self._update_video_range_selection_display()
+
+        missing_videos = sum(1 for row in rows if not str(row.get("video_path") or ""))
+        message = f"Loaded {len(rows)} video range row(s)."
+        if skipped_aug_2019:
+            message += f" Skipped Aug-2019 no-tag row(s): {skipped_aug_2019}."
+        if skipped_2024:
+            message += f" Skipped 2024 no-tag row(s): {skipped_2024}."
+        if missing_videos:
+            message += f" Missing videos: {missing_videos}."
+        if errors:
+            message += " Issues: " + "; ".join(errors[:4])
+            if len(errors) > 4:
+                message += f"; plus {len(errors) - 4} more"
+        self.video_range_status_var.set(message)
+
+    def _selected_video_range_row(self) -> dict[str, object] | None:
+        if self._video_range_selected_index is None:
+            return None
+        if not (0 <= self._video_range_selected_index < len(self._video_range_rows)):
+            return None
+        return self._video_range_rows[self._video_range_selected_index]
+
+    def _shift_video_range_selection(self, delta: int) -> None:
+        if not self._video_range_rows:
+            self.video_range_status_var.set("Load a video range CSV first.")
+            return
+        current = self._video_range_selected_index or 0
+        self._video_range_selected_index = max(0, min(len(self._video_range_rows) - 1, current + int(delta)))
+        self._update_video_range_selection_display()
+
+    def _update_video_range_selection_display(self) -> None:
+        row = self._selected_video_range_row()
+        if row is None:
+            self.video_range_selected_var.set("No video range manifest loaded.")
+            return
+        video_id = str(row.get("video_id") or "")
+        video_path = str(row.get("video_path") or "not found")
+        frames_dir = str(row.get("frames_dir") or "none")
+        ranges = row.get("ranges") or []
+        range_text = ", ".join(f"{start}-{end}" for start, end in ranges) if isinstance(ranges, list) else ""
+        measured = self._video_range_tag_bounds.get(video_id)
+        measured_text = "not measured"
+        if isinstance(measured, dict):
+            min_values = measured.get("suggested_min_marker_perimeter_rate") or []
+            max_values = measured.get("suggested_max_marker_perimeter_rate") or []
+            measured_text = (
+                "measured | "
+                f"min {self._format_optimize_sweep_values(list(min_values)) if isinstance(min_values, list) else min_values} | "
+                f"max {self._format_optimize_sweep_values(list(max_values)) if isinstance(max_values, list) else max_values}"
+            )
+        self.video_range_selected_var.set(
+            (
+                f"Selected {int(self._video_range_selected_index or 0) + 1}/{len(self._video_range_rows)}: {video_id}\n"
+                f"Frame range(s): {range_text or row.get('frame_ranges') or 'none'} | Bounds: {measured_text}\n"
+                f"Video: {video_path}\n"
+                f"Extracted frames: {frames_dir}"
+            )
+        )
+
+    def _frame_index_from_extracted_frame_path(self, path: Path) -> int | None:
+        match = re.search(r"(\d+)$", path.stem)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    def _build_video_range_measurement_frame_refs(
+        self,
+        row: dict[str, object],
+        *,
+        max_frames: int = 25,
+    ) -> list[dict[str, object]]:
+        from .tracking_optimizer import IMAGE_EXTENSIONS
+
+        ranges = row.get("ranges")
+        if not isinstance(ranges, list):
+            raise ValueError("Selected row has no parsed frame ranges.")
+        frame_indices = self._video_range_indices(ranges, max_frames=max_frames)
+        if not frame_indices:
+            raise ValueError("Selected row has no frame indices.")
+
+        frames_dir_text = str(row.get("frames_dir") or "").strip()
+        if frames_dir_text:
+            frames_dir = Path(frames_dir_text).expanduser()
+            if frames_dir.exists():
+                image_by_index: dict[int, Path] = {}
+                for image_path in sorted(frames_dir.iterdir()):
+                    if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                        continue
+                    frame_index = self._frame_index_from_extracted_frame_path(image_path)
+                    if frame_index is not None:
+                        image_by_index[frame_index] = image_path
+                refs = [
+                    {
+                        "kind": "image",
+                        "path": image_by_index[frame_index],
+                        "label": f"{row.get('video_id')} frame {frame_index} ({image_by_index[frame_index].name})",
+                    }
+                    for frame_index in frame_indices
+                    if frame_index in image_by_index
+                ]
+                if refs:
+                    return refs
+
+        video_path_text = str(row.get("video_path") or "").strip()
+        if not video_path_text:
+            raise FileNotFoundError("No source video was resolved for the selected row.")
+        video_path = Path(video_path_text).expanduser()
+        if not video_path.exists():
+            raise FileNotFoundError(f"Source video does not exist: {video_path}")
+        return [
+            {
+                "kind": "video",
+                "path": video_path,
+                "frame_index": frame_index,
+                "label": f"{row.get('video_id')} frame {frame_index}",
+            }
+            for frame_index in frame_indices
+        ]
+
+    def _open_video_range_tag_measurement(self) -> None:
+        row = self._selected_video_range_row()
+        if row is None:
+            self._show_error("No selected video", "Load a video range CSV first.")
+            return
+        try:
+            frame_refs = self._build_video_range_measurement_frame_refs(row)
+        except Exception as exc:
+            self._show_error("Measurement frames failed", str(exc))
+            return
+
+        def apply_video_measurement(
+            measurement_payload: dict[str, dict[str, object]],
+            min_values: list[float],
+            max_values: list[float],
+        ) -> None:
+            video_id = str(row.get("video_id") or "")
+            small_rate = float(measurement_payload["smallest"]["perimeter_rate"])
+            large_rate = float(measurement_payload["largest"]["perimeter_rate"])
+            if large_rate < small_rate:
+                small_rate, large_rate = large_rate, small_rate
+            self._video_range_tag_bounds[video_id] = {
+                "video_id": video_id,
+                "measured_at": datetime.now().isoformat(timespec="seconds"),
+                "frame_ranges": row.get("frame_ranges"),
+                "ranges": row.get("ranges"),
+                "video_path": row.get("video_path"),
+                "frames_dir": row.get("frames_dir"),
+                "smallest": measurement_payload["smallest"],
+                "largest": measurement_payload["largest"],
+                "review_perimeter_bounds": [small_rate, large_rate],
+                "suggested_min_marker_perimeter_rate": list(min_values),
+                "suggested_max_marker_perimeter_rate": list(max_values),
+            }
+            try:
+                bounds_path = self._write_video_range_bounds_file()
+            except Exception as exc:
+                self._show_error("Save bounds failed", str(exc))
+                return
+            self._update_video_range_selection_display()
+            self.video_range_status_var.set(f"Saved tag bounds for {video_id}: {bounds_path}")
+            self.optimize_output.delete("1.0", tk.END)
+            self.optimize_output.insert(
+                tk.END,
+                (
+                    f"Saved per-video tag bounds for {video_id}\n"
+                    f"Bounds JSON: {bounds_path}\n"
+                    f"Measured perimeter-rate bounds: {small_rate:.6f}-{large_rate:.6f}\n"
+                    f"Suggested minMarkerPerimeterRate: {self._format_optimize_sweep_values(min_values)}\n"
+                    f"Suggested maxMarkerPerimeterRate: {self._format_optimize_sweep_values(max_values)}\n"
+                ),
+            )
+
+        self._open_tag_perimeter_measurement_dialog(
+            frame_refs=frame_refs,
+            apply_callback=apply_video_measurement,
+            dialog_title=f"Measure Tag Bounds: {row.get('video_id')}",
+            apply_button_text="Save Bounds For Selected Video",
+            intro_note=(
+                "Measure the smallest and largest real tags in this video's requested frame range. "
+                "These bounds will be saved for this video only, so the range-tracking workflow can tune "
+                "perimeter thresholds independently across videos."
+            ),
+        )
+
+    def open_video_range_bounds_workflow(
+        self,
+        *,
+        manifest_path: str | None = None,
+        source_root: str | None = None,
+        bounds_file: str | None = None,
+    ) -> None:
+        self._open_workflow("setup")
+        try:
+            self.notebook.select(self.optimize_tracking_tab)
+        except Exception:
+            pass
+
+        if manifest_path:
+            self.video_range_manifest_var.set(str(manifest_path))
+        if source_root:
+            self.video_range_source_root_var.set(str(source_root))
+        if bounds_file:
+            self.video_range_bounds_file_var.set(str(bounds_file))
+        elif manifest_path and not self.video_range_bounds_file_var.get().strip():
+            self.video_range_bounds_file_var.set(self._default_video_range_bounds_file())
+
+        if manifest_path and source_root:
+            self._load_video_range_manifest()
+            self.optimize_output.delete("1.0", tk.END)
+            self.optimize_output.insert(
+                tk.END,
+                (
+                    "Video range tag-bounds workflow opened from the command line.\n\n"
+                    "Use Prev Video / Next Video and Measure Selected Video to mark the smallest and "
+                    "largest real tags. Save bounds for each video you want calibrated, then close the GUI "
+                    "and rerun the optimize-video-ranges command without --open-gui."
+                ),
+            )
+        else:
+            self.video_range_status_var.set(
+                "Set the video range CSV and project/source root, then click Load CSV."
+            )
+
+    def _measurement_payload_from_role_states(
+        self,
+        role_states: dict[str, dict[str, object]],
+    ) -> dict[str, dict[str, object]]:
+        payload: dict[str, dict[str, object]] = {}
+        for role in ("smallest", "largest"):
+            state = role_states[role]
+            payload[role] = {
+                "perimeter_px": float(state["perimeter_px"]),
+                "perimeter_rate": float(state["perimeter_rate"]),
+                "source": str(state.get("source") or ""),
+                "frame_size": str(state.get("frame_size") or ""),
+                "points": [
+                    [float(point[0]), float(point[1])]
+                    for point in list(state.get("points") or [])
+                ],
+            }
+        return payload
+
+    def _open_tag_perimeter_measurement_dialog(
+        self,
+        *,
+        frame_refs: list[dict[str, object]] | None = None,
+        apply_callback: object | None = None,
+        dialog_title: str = "Measure Smallest & Largest Tags",
+        apply_button_text: str = "Apply Both To Active Profile",
+        intro_note: str | None = None,
+    ) -> None:
         import base64
         import math
 
@@ -4559,16 +5156,17 @@ class BumbleBoxV2GUI(tk.Tk):
 
         from .tracking_optimizer import suggest_marker_perimeter_rate_sweeps_from_measurements
 
-        input_path = self.opt_input_path_var.get().strip()
-        if not input_path:
-            self._show_error("Missing input", "Set an input video or image folder path first.")
-            return
+        if frame_refs is None:
+            input_path = self.opt_input_path_var.get().strip()
+            if not input_path:
+                self._show_error("Missing input", "Set an input video or image folder path first.")
+                return
 
-        try:
-            frame_refs = self._build_optimizer_measurement_frame_refs(input_path)
-        except Exception as exc:
-            self._show_error("Measurement frames failed", str(exc))
-            return
+            try:
+                frame_refs = self._build_optimizer_measurement_frame_refs(input_path)
+            except Exception as exc:
+                self._show_error("Measurement frames failed", str(exc))
+                return
         if not frame_refs:
             self._show_error("Measurement frames failed", "No representative frames were found.")
             return
@@ -4577,7 +5175,7 @@ class BumbleBoxV2GUI(tk.Tk):
         max_display_height = 680
 
         dialog = tk.Toplevel(self)
-        dialog.title("Measure Smallest & Largest Tags")
+        dialog.title(dialog_title)
         dialog.geometry("1180x920")
         dialog.minsize(760, 560)
         dialog.transient(self)
@@ -4585,7 +5183,7 @@ class BumbleBoxV2GUI(tk.Tk):
         outer = ttk.Frame(dialog, padding=10)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        note = (
+        note = intro_note or (
             "Use the frame controls to find good examples. Measure the SMALLEST real tag you want BumbleBox "
             "to detect and the LARGEST real tag you expect to accept. Avoid measuring artifacts. Drag any "
             "placed point to adjust it. Scroll over the image to zoom at the cursor. Right-drag, middle-drag, "
@@ -4688,7 +5286,7 @@ class BumbleBoxV2GUI(tk.Tk):
         footer = ttk.Frame(outer)
         footer.pack(fill=tk.X, pady=(10, 0))
 
-        apply_button = ttk.Button(footer, text="Apply Both To Active Profile", state=tk.DISABLED)
+        apply_button = ttk.Button(footer, text=apply_button_text, state=tk.DISABLED)
 
         def current_state() -> dict[str, object]:
             return role_states[active_role_var.get()]
@@ -5019,6 +5617,14 @@ class BumbleBoxV2GUI(tk.Tk):
                 float(small_rate),
                 float(large_rate),
             )
+            if apply_callback is not None:
+                if not callable(apply_callback):
+                    self._show_error("Apply failed", "Measurement callback is not callable.")
+                    return
+                measurement_payload = self._measurement_payload_from_role_states(role_states)
+                apply_callback(measurement_payload, list(min_values), list(max_values))
+                return
+
             profile = self.opt_profile_var.get().strip().lower() or "quick"
             profile_vars = self._opt_sweep_profile_vars.get(profile)
             if (
@@ -9233,6 +9839,20 @@ class BumbleBoxV2GUI(tk.Tk):
             self._show_error("Bundle export failed", str(exc))
 
 
-def launch() -> None:
+def launch(
+    *,
+    open_video_range_bounds: bool = False,
+    video_range_manifest: str | None = None,
+    video_range_source_root: str | None = None,
+    video_range_bounds_file: str | None = None,
+) -> None:
     app = BumbleBoxV2GUI()
+    if open_video_range_bounds:
+        app.after_idle(
+            lambda: app.open_video_range_bounds_workflow(
+                manifest_path=video_range_manifest,
+                source_root=video_range_source_root,
+                bounds_file=video_range_bounds_file,
+            )
+        )
     app.mainloop()
