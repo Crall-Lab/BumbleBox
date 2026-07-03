@@ -1967,6 +1967,7 @@ def optimize_tracking(
     early_stop_min_improvement: float = DEFAULT_EARLY_STOP_MIN_IMPROVEMENT,
     output_dir: Optional[str | Path] = None,
     write_preview: bool = False,
+    write_candidate_review: bool = True,
     preview_frames: int = 240,
     top_k: int = 10,
     review_perimeter_bounds: Optional[tuple[float, float]] = None,
@@ -2149,22 +2150,24 @@ def optimize_tracking(
             output_path=run_dir / "best_params_preview.mp4",
             max_frames=preview_frames,
         )
-    review_manifest_json_path = write_top_candidate_review_artifacts(
-        sampled_frames=sampled_frames,
-        sample_indices=sample_indices,
-        dictionary_name=normalized_dictionary,
-        candidates=evaluated,
-        output_dir=run_dir,
-        max_candidates=5,
-        max_frames=24,
-        extra_candidates=[
-            (f"Top mean detections #{idx}", candidate)
-            for idx, candidate in enumerate(top_detection_candidates, start=1)
-        ],
-        perimeter_flag_bounds=review_perimeter_bounds,
-        valid_tag_ids=normalized_valid_tag_ids,
-        excluded_tag_ids=normalized_excluded_tag_ids,
-    )
+    review_manifest_json_path: Optional[Path] = None
+    if write_candidate_review:
+        review_manifest_json_path = write_top_candidate_review_artifacts(
+            sampled_frames=sampled_frames,
+            sample_indices=sample_indices,
+            dictionary_name=normalized_dictionary,
+            candidates=evaluated,
+            output_dir=run_dir,
+            max_candidates=5,
+            max_frames=24,
+            extra_candidates=[
+                (f"Top mean detections #{idx}", candidate)
+                for idx, candidate in enumerate(top_detection_candidates, start=1)
+            ],
+            perimeter_flag_bounds=review_perimeter_bounds,
+            valid_tag_ids=normalized_valid_tag_ids,
+            excluded_tag_ids=normalized_excluded_tag_ids,
+        )
 
     top_candidates = evaluated[: max(top_k, 1)]
     result = TrackingOptimizationResult(
@@ -2210,6 +2213,7 @@ def optimize_tracking(
     summary["parameter_combinations_total"] = total
     summary["parameter_combinations_uncapped"] = parameter_combinations_uncapped
     summary["max_parameter_combinations"] = max_parameter_combinations
+    summary["candidate_review_enabled"] = bool(write_candidate_review)
     summary["all_candidates_csv"] = str(csv_path)
     summary["review_perimeter_bounds"] = (
         {

@@ -2039,6 +2039,19 @@ def _cmd_optimize_video_ranges(args: argparse.Namespace) -> int:
             if video_path is None:
                 raise FileNotFoundError(f"Could not find video for {video_id} under {source_root}")
 
+            if args.replace_optimization_runs:
+                if args.dry_run:
+                    print(
+                        f"[optimize-video-ranges] {video_id}: dry run; "
+                        f"would remove previous optimization runs under {optimization_root}"
+                    )
+                elif optimization_root.exists():
+                    shutil.rmtree(optimization_root)
+                    print(
+                        f"[optimize-video-ranges] {video_id}: removed previous optimization runs "
+                        f"under {optimization_root}"
+                    )
+
             copied_video_path = output_root / video_path.name
             if args.dry_run:
                 print(f"[optimize-video-ranges] {video_id}: dry run; would copy {video_path} -> {copied_video_path}")
@@ -2160,6 +2173,7 @@ def _cmd_optimize_video_ranges(args: argparse.Namespace) -> int:
                         expected_tags=args.expected_tags,
                         output_dir=dict_dir,
                         write_preview=False,
+                        write_candidate_review=not args.no_candidate_review,
                         top_k=20,
                         review_perimeter_bounds=review_bounds,
                         valid_tag_ids=tag_filter_ids,
@@ -2192,6 +2206,7 @@ def _cmd_optimize_video_ranges(args: argparse.Namespace) -> int:
                     "tag_list_filter_enabled": tag_filter_ids is not None,
                     "allowed_tag_count": len(allowed_tag_ids) if allowed_tag_ids else None,
                     "excluded_tag_ids_filter": sorted(excluded_tag_ids) if excluded_tag_ids else None,
+                    "candidate_review_enabled": not args.no_candidate_review,
                     "review_perimeter_bounds": list(review_bounds) if review_bounds else None,
                     "source_optimization_summary": best_item["summary_json_path"],
                     "source_candidate_scores": best_item["candidates_csv_path"],
@@ -2307,6 +2322,7 @@ def _cmd_optimize_video_ranges(args: argparse.Namespace) -> int:
                     "tag_list_filter_enabled": tag_filter_ids is not None,
                     "allowed_tag_count": len(allowed_tag_ids) if allowed_tag_ids else None,
                     "excluded_tag_ids_filter": sorted(excluded_tag_ids) if excluded_tag_ids else None,
+                    "candidate_review_enabled": not args.no_candidate_review,
                     "detections": len(detection_rows),
                     "detection_audit": final_detection_audit,
                     "warnings": item_warnings,
@@ -2333,6 +2349,8 @@ def _cmd_optimize_video_ranges(args: argparse.Namespace) -> int:
                         "tag_list_path": str(tag_list_path) if tag_list_path else None,
                         "allowed_tag_count": len(allowed_tag_ids) if allowed_tag_ids else None,
                         "excluded_tag_ids_filter": sorted(excluded_tag_ids) if excluded_tag_ids else None,
+                        "candidate_review_enabled": not args.no_candidate_review,
+                        "replace_optimization_runs": bool(args.replace_optimization_runs),
                         "warnings": item_warnings,
                     }
                 )
@@ -2362,6 +2380,8 @@ def _cmd_optimize_video_ranges(args: argparse.Namespace) -> int:
         "output_root": str(output_root),
         "tag_list_root": str(tag_list_root) if tag_list_root else None,
         "tag_bounds_json": str(args.tag_bounds_json) if args.tag_bounds_json else None,
+        "candidate_review_enabled": not args.no_candidate_review,
+        "replace_optimization_runs": bool(args.replace_optimization_runs),
         "rows_loaded": len(manifest_rows),
         "processed": processed,
         "skipped": skipped,
@@ -4723,6 +4743,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also stitch optimized-frame annotated PNGs into a short MP4 review video for each row.",
     )
     optimize_video_ranges_parser.add_argument(
+        "--no-candidate-review",
+        action="store_true",
+        help=(
+            "Do not write per-candidate top_candidate_review PNGs during optimization. "
+            "This greatly reduces file counts for Dropbox-synced batch runs."
+        ),
+    )
+    optimize_video_ranges_parser.add_argument(
         "--annotated-video-fps",
         type=float,
         default=2.0,
@@ -4732,6 +4760,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Overwrite copied videos and extracted frames if they already exist.",
+    )
+    optimize_video_ranges_parser.add_argument(
+        "--replace-optimization-runs",
+        action="store_true",
+        help=(
+            "Remove each video's existing optimization/ folder before running, "
+            "so old timestamped optimize_tracking_* runs are not kept."
+        ),
     )
     optimize_video_ranges_parser.add_argument(
         "--limit",
