@@ -188,7 +188,9 @@ def capture_calibration_image(
 ) -> Path:
     from .camera_controls import (
         apply_autofocus_before_start,
+        apply_preflight_lens_lock,
         lock_autofocus_after_warmup,
+        run_autofocus_preflight,
         start_autofocus_after_camera_start,
     )
     from .camera_profiles import apply_camera_profile, validate_camera_ir_compatibility
@@ -258,7 +260,15 @@ def capture_calibration_image(
     picam2 = _construct_picamera2(tuning_file)
 
     started = False
+    autofocus_notes: list[str] = []
     try:
+        preflight_result = run_autofocus_preflight(
+            config,
+            picam2,
+            controls,
+            notes=autofocus_notes,
+            strict=True,
+        )
         try:
             still = picam2.create_still_configuration(
                 main={"size": (width, height), "format": "RGB888"}
@@ -292,13 +302,42 @@ def capture_calibration_image(
                 picam2.set_controls({"ScalerCrop": tuple(digital_zoom)})
             except Exception:
                 pass
-        apply_autofocus_before_start(config, picam2, controls, strict=True)
+        if preflight_result.performed:
+            apply_preflight_lens_lock(
+                preflight_result,
+                picam2,
+                controls,
+                notes=autofocus_notes,
+                strict=True,
+            )
+        else:
+            apply_autofocus_before_start(
+                config,
+                picam2,
+                controls,
+                notes=autofocus_notes,
+                strict=True,
+            )
 
         picam2.start()
         started = True
-        start_autofocus_after_camera_start(config, picam2, controls, strict=True)
+        if not preflight_result.performed:
+            start_autofocus_after_camera_start(
+                config,
+                picam2,
+                controls,
+                notes=autofocus_notes,
+                strict=True,
+            )
         time.sleep(max(0.0, warmup_s))
-        lock_autofocus_after_warmup(config, picam2, controls, strict=True)
+        if not preflight_result.performed:
+            lock_autofocus_after_warmup(
+                config,
+                picam2,
+                controls,
+                notes=autofocus_notes,
+                strict=True,
+            )
         picam2.capture_file(str(output_path))
         if bool(config.get("camera", {}).get("monochrome_output", False)):
             _force_grayscale_image(output_path)

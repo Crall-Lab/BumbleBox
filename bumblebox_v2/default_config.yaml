@@ -31,6 +31,13 @@ camera:
   autofocus_mode: "default"
   lens_position: null
   focus_lock_after_warmup: false
+  autofocus_range: "normal"
+  autofocus_speed: "normal"
+  autofocus_preflight_enabled: false
+  autofocus_preflight_width: 1920
+  autofocus_preflight_height: 1440
+  autofocus_preflight_timeout_seconds: 8.0
+  autofocus_preflight_stable_frames: 3
   mp4_codec: "libx264"
 
 thermal:

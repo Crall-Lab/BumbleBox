@@ -120,6 +120,13 @@ CAMERA_PROFILES: Dict[str, CameraProfile] = {
             "autofocus_mode": "default",
             "lens_position": None,
             "focus_lock_after_warmup": False,
+            "autofocus_range": "normal",
+            "autofocus_speed": "normal",
+            "autofocus_preflight_enabled": False,
+            "autofocus_preflight_width": 1920,
+            "autofocus_preflight_height": 1440,
+            "autofocus_preflight_timeout_seconds": 8.0,
+            "autofocus_preflight_stable_frames": 3,
         },
     ),
     "owlsight_reference": CameraProfile(
@@ -127,7 +134,8 @@ CAMERA_PROFILES: Dict[str, CameraProfile] = {
         label="OwlSight Reference",
         description=(
             "Arducam OwlSight comparison profile using the same 4056x3040 @ 7 fps "
-            "capture envelope as the HQ reference."
+            "capture envelope as the HQ reference, with a low-resolution autofocus "
+            "preflight followed by a locked recording focus."
         ),
         camera_values={
             "model": "owlsight_64mp",
@@ -144,6 +152,13 @@ CAMERA_PROFILES: Dict[str, CameraProfile] = {
             "autofocus_mode": "continuous",
             "lens_position": None,
             "focus_lock_after_warmup": False,
+            "autofocus_range": "normal",
+            "autofocus_speed": "normal",
+            "autofocus_preflight_enabled": True,
+            "autofocus_preflight_width": 1920,
+            "autofocus_preflight_height": 1440,
+            "autofocus_preflight_timeout_seconds": 8.0,
+            "autofocus_preflight_stable_frames": 3,
         },
     ),
 }

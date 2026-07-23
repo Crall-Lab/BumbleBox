@@ -2654,6 +2654,55 @@ class BumbleBoxV2GUI(tk.Tk):
                     ),
                     ("Manual lens position", "camera.lens_position", str, None, None),
                     ("Lock focus after warmup", "camera.focus_lock_after_warmup", bool, None, None),
+                    (
+                        "Autofocus range",
+                        "camera.autofocus_range",
+                        str,
+                        ["normal", "macro", "full"],
+                        None,
+                    ),
+                    (
+                        "Autofocus speed",
+                        "camera.autofocus_speed",
+                        str,
+                        ["normal", "fast"],
+                        None,
+                    ),
+                    (
+                        "Fast focus before capture",
+                        "camera.autofocus_preflight_enabled",
+                        bool,
+                        None,
+                        None,
+                    ),
+                    (
+                        "Focus stream width",
+                        "camera.autofocus_preflight_width",
+                        int,
+                        None,
+                        None,
+                    ),
+                    (
+                        "Focus stream height",
+                        "camera.autofocus_preflight_height",
+                        int,
+                        None,
+                        None,
+                    ),
+                    (
+                        "Focus timeout (s)",
+                        "camera.autofocus_preflight_timeout_seconds",
+                        float,
+                        None,
+                        None,
+                    ),
+                    (
+                        "Stable focus frames",
+                        "camera.autofocus_preflight_stable_frames",
+                        int,
+                        None,
+                        None,
+                    ),
                     ("IR lighting", "camera.infrared", bool, None, None),
                     ("Monochrome output", "camera.monochrome_output", bool, None, None),
                     ("Use thermal camera", "thermal.enabled", bool, None, None),
@@ -2830,6 +2879,30 @@ class BumbleBoxV2GUI(tk.Tk):
             "camera.focus_lock_after_warmup": (
                 "With auto or continuous focus, read the achieved lens position after camera warmup and "
                 "hold that position during capture."
+            ),
+            "camera.autofocus_range": (
+                "Normal covers typical distances, macro emphasizes close subjects, and full searches "
+                "the entire supported focus range."
+            ),
+            "camera.autofocus_speed": (
+                "Normal prioritizes smooth focus movement; fast requests quicker lens movement."
+            ),
+            "camera.autofocus_preflight_enabled": (
+                "Focus using a smaller, faster stream before full-resolution capture, retain the best "
+                "observed lens position, then hold it during recording. Enabled by the OwlSight profile."
+            ),
+            "camera.autofocus_preflight_width": (
+                "Width of the temporary low-resolution stream used only for autofocus."
+            ),
+            "camera.autofocus_preflight_height": (
+                "Height of the temporary low-resolution stream used only for autofocus."
+            ),
+            "camera.autofocus_preflight_timeout_seconds": (
+                "Maximum time allowed for the initial autofocus scan. If libcamera reports failure, "
+                "BumbleBox can still retain the lens position with the highest observed focus score."
+            ),
+            "camera.autofocus_preflight_stable_frames": (
+                "Number of consecutive focused frames required before accepting libcamera's focused state."
             ),
             "camera.infrared": (
                 "Use IR/NoIR sensor tuning when no manual tuning file is set. "
@@ -3319,6 +3392,12 @@ class BumbleBoxV2GUI(tk.Tk):
                 "camera.tuning_file",
                 "camera.lens_position",
                 "camera.focus_lock_after_warmup",
+                "camera.autofocus_range",
+                "camera.autofocus_speed",
+                "camera.autofocus_preflight_width",
+                "camera.autofocus_preflight_height",
+                "camera.autofocus_preflight_timeout_seconds",
+                "camera.autofocus_preflight_stable_frames",
                 "scheduling.backend",
                 "scheduling.scope",
                 "scheduling.unit_prefix",

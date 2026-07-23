@@ -9,8 +9,12 @@ from typing import Any, Optional
 
 from .camera_controls import (
     apply_autofocus_before_start,
+    apply_preflight_lens_lock,
+    autofocus_preflight_settings,
     autofocus_settings,
+    AutofocusPreflightResult,
     lock_autofocus_after_warmup,
+    run_autofocus_preflight,
     start_autofocus_after_camera_start,
 )
 from .camera_profiles import (
@@ -40,6 +44,11 @@ class CameraPreviewResult:
     autofocus_mode: str
     focus_lock_after_warmup: bool
     locked_lens_position: Optional[float]
+    autofocus_preflight_performed: bool
+    autofocus_preflight_selection_reason: str
+    autofocus_preflight_final_state: str
+    autofocus_preflight_best_score: Optional[float]
+    autofocus_preflight_elapsed_seconds: float
     notes: list[str]
 
     def to_dict(self) -> dict[str, Any]:
@@ -81,6 +90,12 @@ class CameraCheckResult:
     autofocus_mode: str
     lens_position: Optional[float]
     focus_lock_after_warmup: bool
+    autofocus_range: str
+    autofocus_speed: str
+    autofocus_preflight_enabled: bool
+    autofocus_preflight_width: int
+    autofocus_preflight_height: int
+    autofocus_preflight_timeout_seconds: float
     autofocus_controls_available: list[str]
     codec: str
     resolved_tuning_file: Optional[str]
@@ -192,7 +207,16 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
             if isinstance(advertised_controls, dict):
                 autofocus_controls_available = [
                     name
-                    for name in ("AfMode", "AfTrigger", "AfState", "LensPosition")
+                    for name in (
+                        "AfMode",
+                        "AfTrigger",
+                        "AfState",
+                        "AfRange",
+                        "AfSpeed",
+                        "AfMetering",
+                        "AfWindows",
+                        "LensPosition",
+                    )
                     if name in advertised_controls
                 ]
         except Exception as exc:
@@ -205,6 +229,7 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
                     pass
 
     focus_settings = autofocus_settings(config)
+    preflight_settings = autofocus_preflight_settings(config)
     return CameraCheckResult(
         camera_profile=configured_profile_name(config),
         camera_model=camera_model,
@@ -217,6 +242,12 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
         autofocus_mode=focus_settings.mode,
         lens_position=focus_settings.lens_position,
         focus_lock_after_warmup=focus_settings.lock_after_warmup,
+        autofocus_range=focus_settings.autofocus_range,
+        autofocus_speed=focus_settings.autofocus_speed,
+        autofocus_preflight_enabled=preflight_settings.enabled,
+        autofocus_preflight_width=preflight_settings.width,
+        autofocus_preflight_height=preflight_settings.height,
+        autofocus_preflight_timeout_seconds=preflight_settings.timeout_seconds,
         autofocus_controls_available=autofocus_controls_available,
         codec=str(camera_cfg.get("codec", "mp4")),
         resolved_tuning_file=tuning_info.get("resolved"),
@@ -246,6 +277,13 @@ def format_camera_check_result(result: CameraCheckResult) -> str:
         f"Autofocus mode: {result.autofocus_mode}",
         f"Manual lens position: {result.lens_position if result.lens_position is not None else 'default'}",
         f"Focus lock after warmup: {result.focus_lock_after_warmup}",
+        f"Autofocus range/speed: {result.autofocus_range}/{result.autofocus_speed}",
+        f"Low-resolution autofocus preflight: {result.autofocus_preflight_enabled}",
+        (
+            "Autofocus preflight stream: "
+            f"{result.autofocus_preflight_width}x{result.autofocus_preflight_height}"
+        ),
+        f"Autofocus preflight timeout: {result.autofocus_preflight_timeout_seconds:g} s",
         (
             "Autofocus controls advertised: "
             + (", ".join(result.autofocus_controls_available) or "none reported")
@@ -301,8 +339,13 @@ def _apply_custom_aruco_params(parameters: Any, aruco_params: Any, notes: list[s
 
 
 def _open_picamera2(
-    config: dict[str, Any], width: int, height: int, frame_format: Optional[str]
-) -> tuple[Any, Optional[str]]:
+    config: dict[str, Any],
+    width: int,
+    height: int,
+    frame_format: Optional[str],
+    *,
+    notes: Optional[list[str]] = None,
+) -> tuple[Any, Optional[str], AutofocusPreflightResult]:
     try:
         from picamera2 import Picamera2
     except Exception as exc:  # pragma: no cover - runtime dependency
@@ -345,6 +388,29 @@ def _open_picamera2(
 
     resolved_tuning_file = resolve_camera_tuning_file(config)
     picam2 = _construct_picamera2(resolved_tuning_file)
+    try:
+        from libcamera import controls
+    except Exception as exc:  # pragma: no cover - runtime dependency
+        try:
+            picam2.close()
+        except Exception:
+            pass
+        raise RuntimeError("libcamera controls are required for camera setup.") from exc
+
+    try:
+        preflight_result = run_autofocus_preflight(
+            config,
+            picam2,
+            controls,
+            notes=notes,
+            strict=True,
+        )
+    except Exception:
+        try:
+            picam2.close()
+        except Exception:
+            pass
+        raise
 
     main_stream = {"size": (int(width), int(height))}
     if frame_format:
@@ -355,13 +421,21 @@ def _open_picamera2(
         picam2.align_configuration(camera_config)
         picam2.configure(camera_config)
     except IndexError as exc:
+        try:
+            picam2.close()
+        except Exception:
+            pass
         raise RuntimeError(
             "Camera opened but failed to configure stream (IndexError). "
             "This usually means libcamera could not enumerate valid sensor modes."
         ) from exc
     except Exception as exc:
+        try:
+            picam2.close()
+        except Exception:
+            pass
         raise RuntimeError(f"Failed to configure camera preview stream: {exc}") from exc
-    return picam2, resolved_tuning_file
+    return picam2, resolved_tuning_file, preflight_result
 
 
 def _apply_camera_controls(config: dict[str, Any], picam2: Any, notes: list[str]) -> bool:
@@ -433,27 +507,38 @@ def run_camera_preview(
 
     preview_mode = getattr(Preview, window_name)
     notes: list[str] = []
-    picam2, resolved_tuning_file = _open_picamera2(
+    picam2, resolved_tuning_file, preflight_result = _open_picamera2(
         config,
         width=width,
         height=height,
         frame_format=None,
+        notes=notes,
     )
     digital_zoom_applied = _apply_camera_controls(config, picam2, notes)
-    apply_autofocus_before_start(config, picam2, controls, notes=notes)
+    if preflight_result.performed:
+        apply_preflight_lens_lock(
+            preflight_result,
+            picam2,
+            controls,
+            notes=notes,
+            strict=True,
+        )
+    else:
+        apply_autofocus_before_start(config, picam2, controls, notes=notes)
     focus_settings = autofocus_settings(config)
 
     started = False
     preview_started = False
-    locked_lens_position: Optional[float] = None
+    locked_lens_position: Optional[float] = preflight_result.selected_lens_position
     t0 = time.perf_counter()
     try:
         picam2.start_preview(preview_mode)
         preview_started = True
         picam2.start()
         started = True
-        start_autofocus_after_camera_start(config, picam2, controls, notes=notes)
-        if focus_settings.lock_after_warmup:
+        if not preflight_result.performed:
+            start_autofocus_after_camera_start(config, picam2, controls, notes=notes)
+        if focus_settings.lock_after_warmup and not preflight_result.performed:
             warmup_s = min(
                 float(preview_seconds),
                 max(0.0, float(config.get("runtime", {}).get("camera_warmup_seconds", 2.0))),
@@ -498,6 +583,11 @@ def run_camera_preview(
         autofocus_mode=focus_settings.mode,
         focus_lock_after_warmup=focus_settings.lock_after_warmup,
         locked_lens_position=locked_lens_position,
+        autofocus_preflight_performed=preflight_result.performed,
+        autofocus_preflight_selection_reason=preflight_result.selection_reason,
+        autofocus_preflight_final_state=preflight_result.final_af_state,
+        autofocus_preflight_best_score=preflight_result.best_focus_score,
+        autofocus_preflight_elapsed_seconds=preflight_result.elapsed_seconds,
         notes=notes,
     )
 
@@ -553,18 +643,28 @@ def run_camera_tracking_test(
 
     width = int(camera_cfg.get("width", 4056))
     height = int(camera_cfg.get("height", 3040))
-    picam2, _resolved_tuning_file = _open_picamera2(
+    picam2, _resolved_tuning_file, preflight_result = _open_picamera2(
         config,
         width=width,
         height=height,
         frame_format="YUV420",
+        notes=notes,
     )
     _apply_camera_controls(config, picam2, notes)
     try:
         from libcamera import controls
     except Exception as exc:  # pragma: no cover - runtime dependency
         raise RuntimeError("libcamera controls are required for camera-test-tracking.") from exc
-    apply_autofocus_before_start(config, picam2, controls, notes=notes)
+    if preflight_result.performed:
+        apply_preflight_lens_lock(
+            preflight_result,
+            picam2,
+            controls,
+            notes=notes,
+            strict=True,
+        )
+    else:
+        apply_autofocus_before_start(config, picam2, controls, notes=notes)
     warmup_s = float(config.get("runtime", {}).get("camera_warmup_seconds", 2.0))
 
     frame_tag_counts: list[int] = []
@@ -578,9 +678,11 @@ def run_camera_tracking_test(
     try:
         picam2.start()
         started = True
-        start_autofocus_after_camera_start(config, picam2, controls, notes=notes)
+        if not preflight_result.performed:
+            start_autofocus_after_camera_start(config, picam2, controls, notes=notes)
         time.sleep(max(0.0, warmup_s))
-        lock_autofocus_after_warmup(config, picam2, controls, notes=notes)
+        if not preflight_result.performed:
+            lock_autofocus_after_warmup(config, picam2, controls, notes=notes)
         start = time.perf_counter()
         while (time.perf_counter() - start) < float(test_seconds):
             frame = picam2.capture_array()
@@ -722,6 +824,14 @@ def format_camera_preview_result(result: CameraPreviewResult) -> str:
             "Locked lens position: "
             f"{result.locked_lens_position if result.locked_lens_position is not None else 'n/a'}"
         ),
+        f"Autofocus preflight performed: {result.autofocus_preflight_performed}",
+        f"Autofocus preflight selection: {result.autofocus_preflight_selection_reason}",
+        f"Autofocus preflight final state: {result.autofocus_preflight_final_state}",
+        (
+            "Autofocus preflight best score: "
+            f"{result.autofocus_preflight_best_score if result.autofocus_preflight_best_score is not None else 'n/a'}"
+        ),
+        f"Autofocus preflight elapsed (s): {result.autofocus_preflight_elapsed_seconds}",
         f"Tuning file: {result.tuning_file or '(default)'}",
     ]
     if result.notes:

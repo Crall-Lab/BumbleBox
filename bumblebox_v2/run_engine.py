@@ -16,8 +16,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .camera_controls import (
     apply_autofocus_before_start,
+    apply_preflight_lens_lock,
+    autofocus_preflight_settings,
     autofocus_settings,
     lock_autofocus_after_warmup,
+    run_autofocus_preflight,
     start_autofocus_after_camera_start,
 )
 from .camera_profiles import apply_camera_profile, configured_profile_name, validate_camera_ir_compatibility
@@ -48,6 +51,14 @@ class RunSummary:
     camera_autofocus_mode: str
     camera_lens_position: Optional[float]
     camera_focus_lock_after_warmup: bool
+    camera_autofocus_preflight_enabled: bool
+    camera_autofocus_preflight_performed: bool
+    camera_autofocus_preflight_lens_position: Optional[float]
+    camera_autofocus_preflight_selection_reason: Optional[str]
+    camera_autofocus_preflight_final_state: Optional[str]
+    camera_autofocus_preflight_best_score: Optional[float]
+    camera_autofocus_preflight_elapsed_seconds: Optional[float]
+    camera_autofocus_preflight_notes: List[str]
     resolved_tuning_file: Optional[str]
     frames_captured: int
     actual_fps: float
@@ -391,6 +402,7 @@ class _PicameraCaptureSession:
         self.noise_reduction = config["camera"].get("noise_reduction", "Auto")
         self.warmup_s = float(config["runtime"].get("camera_warmup_seconds", 2.0))
         self.resolved_tuning_file = resolve_camera_tuning_file(config)
+        self.autofocus_notes: list[str] = []
         self.picam2 = self._open_and_configure()
         self.started = False
 
@@ -450,6 +462,13 @@ class _PicameraCaptureSession:
     def _open_and_configure(self) -> Any:
         picam2 = self._construct_picamera2()
         try:
+            self.autofocus_preflight_result = run_autofocus_preflight(
+                self.config,
+                picam2,
+                self._controls,
+                notes=self.autofocus_notes,
+                strict=True,
+            )
             preview = picam2.create_preview_configuration({"format": "YUV420", "size": (self.width, self.height)})
             picam2.align_configuration(preview)
             picam2.configure(preview)
@@ -485,12 +504,22 @@ class _PicameraCaptureSession:
 
         if isinstance(self.digital_zoom, (list, tuple)) and len(self.digital_zoom) == 4:
             picam2.set_controls({"ScalerCrop": tuple(self.digital_zoom)})
-        apply_autofocus_before_start(
-            self.config,
-            picam2,
-            self._controls,
-            strict=True,
-        )
+        if self.autofocus_preflight_result.performed:
+            apply_preflight_lens_lock(
+                self.autofocus_preflight_result,
+                picam2,
+                self._controls,
+                notes=self.autofocus_notes,
+                strict=True,
+            )
+        else:
+            apply_autofocus_before_start(
+                self.config,
+                picam2,
+                self._controls,
+                notes=self.autofocus_notes,
+                strict=True,
+            )
         return picam2
 
     def start(self) -> None:
@@ -498,19 +527,23 @@ class _PicameraCaptureSession:
             return
         self.picam2.start()
         self.started = True
-        start_autofocus_after_camera_start(
-            self.config,
-            self.picam2,
-            self._controls,
-            strict=True,
-        )
+        if not self.autofocus_preflight_result.performed:
+            start_autofocus_after_camera_start(
+                self.config,
+                self.picam2,
+                self._controls,
+                notes=self.autofocus_notes,
+                strict=True,
+            )
         time.sleep(max(0.0, self.warmup_s))
-        lock_autofocus_after_warmup(
-            self.config,
-            self.picam2,
-            self._controls,
-            strict=True,
-        )
+        if not self.autofocus_preflight_result.performed:
+            lock_autofocus_after_warmup(
+                self.config,
+                self.picam2,
+                self._controls,
+                notes=self.autofocus_notes,
+                strict=True,
+            )
 
     def capture_for(
         self,
@@ -549,10 +582,25 @@ class _PicameraCaptureSession:
         self.close()
 
 
-def _capture_frames_picamera(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
+def _write_autofocus_capture_diagnostics(
+    diagnostics: Optional[dict[str, Any]],
+    session: _PicameraCaptureSession,
+) -> None:
+    if diagnostics is None:
+        return
+    diagnostics["autofocus_preflight"] = session.autofocus_preflight_result.to_dict()
+    diagnostics["autofocus_notes"] = list(session.autofocus_notes)
+
+
+def _capture_frames_picamera(
+    config: Dict[str, Any],
+    *,
+    diagnostics: Optional[dict[str, Any]] = None,
+) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     fps = float(config["camera"]["fps_target"])
     duration = float(config["capture"]["recording_seconds"])
     with _PicameraCaptureSession(config) as session:
+        _write_autofocus_capture_diagnostics(diagnostics, session)
         return session.capture_for(fps=fps, duration=duration)
 
 
@@ -759,13 +807,21 @@ def _mock_capture_thermal_frames(
 
 def _capture_rgb_and_optional_thermal(
     config: Dict[str, Any],
+    *,
+    diagnostics: Optional[dict[str, Any]] = None,
 ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord], Optional[dict[str, Any]]]:
     if not _thermal_enabled_for_recording(config):
-        frames, timestamps, actual_fps, timestamp_records = _capture_frames(config)
+        frames, timestamps, actual_fps, timestamp_records = _capture_frames(
+            config,
+            diagnostics=diagnostics,
+        )
         return frames, timestamps, actual_fps, timestamp_records, None
 
     if bool(config["runtime"].get("use_mock_camera", False)):
-        frames, timestamps, actual_fps, timestamp_records = _capture_frames(config)
+        frames, timestamps, actual_fps, timestamp_records = _capture_frames(
+            config,
+            diagnostics=diagnostics,
+        )
         thermal_frames, thermal_timestamps, thermal_actual_fps, raw16_layout, device_path, thermal_timestamp_records = _mock_capture_thermal_frames(
             config,
             timestamps=timestamps,
@@ -827,6 +883,7 @@ def _capture_rgb_and_optional_thermal(
             errors.append(f"Thermal synchronized capture failed: {exc}")
 
     with _PicameraCaptureSession(config) as rgb_session:
+        _write_autofocus_capture_diagnostics(diagnostics, rgb_session)
         rgb_session.start()
         with _ThermalCaptureSession(config) as thermal_session:
             # Flush queued frames immediately before the shared start so both streams begin from current data
@@ -1283,6 +1340,8 @@ def reset_camera_runtime(
     reset_config["camera"]["tuning_file"] = None
     reset_config["camera"]["model"] = "auto"
     reset_config["camera"]["infrared"] = None
+    reset_config["camera"]["autofocus_mode"] = "default"
+    reset_config["camera"]["autofocus_preflight_enabled"] = False
     reset_config["camera"].setdefault("shutter_us", 2500)
     reset_config["runtime"]["camera_warmup_seconds"] = min(
         max(float(reset_config["runtime"].get("camera_warmup_seconds", 0.25)), 0.0),
@@ -1359,10 +1418,14 @@ def reset_camera_runtime(
     )
 
 
-def _capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
+def _capture_frames(
+    config: Dict[str, Any],
+    *,
+    diagnostics: Optional[dict[str, Any]] = None,
+) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     if bool(config["runtime"].get("use_mock_camera", False)):
         return _mock_capture_frames(config)
-    return _capture_frames_picamera(config)
+    return _capture_frames_picamera(config, diagnostics=diagnostics)
 
 
 def capture_probe(
@@ -2105,7 +2168,9 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         raw_camera_monochrome_output if isinstance(raw_camera_monochrome_output, bool) else None
     )
     focus_settings = autofocus_settings(config)
+    preflight_settings = autofocus_preflight_settings(config)
     resolved_tuning_file = resolve_camera_tuning_file(config)
+    capture_diagnostics: dict[str, Any] = {}
 
     frames: List[Any] = []
     timestamps: List[float] = []
@@ -2144,7 +2209,10 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                         "Synchronized thermal recording follows camera.fps_target. "
                         f"thermal.fps_target={thermal_target_fps:.3f} was ignored for this run."
                     )
-                frames, timestamps, actual_fps, timestamp_records, thermal_capture = _capture_rgb_and_optional_thermal(config)
+                frames, timestamps, actual_fps, timestamp_records, thermal_capture = _capture_rgb_and_optional_thermal(
+                    config,
+                    diagnostics=capture_diagnostics,
+                )
                 if thermal_capture is not None:
                     thermal_artifacts = _write_thermal_recording_outputs(
                         session_dir=session_dir,
@@ -2184,7 +2252,10 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                     thermal_artifacts = None
                     thermal_side_by_side_artifacts = None
             else:
-                frames, timestamps, actual_fps, timestamp_records = _capture_frames(config)
+                frames, timestamps, actual_fps, timestamp_records = _capture_frames(
+                    config,
+                    diagnostics=capture_diagnostics,
+                )
                 if should_track and _thermal_enabled_for_recording(config) and not should_record:
                     warnings.append("thermal.enabled is set, but thermal capture runs only during recording modes.")
 
@@ -2315,6 +2386,14 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                 pass
 
     finished_at = _now_iso()
+    raw_preflight_result = capture_diagnostics.get("autofocus_preflight")
+    preflight_result = raw_preflight_result if isinstance(raw_preflight_result, dict) else {}
+    raw_autofocus_notes = capture_diagnostics.get("autofocus_notes")
+    autofocus_notes = (
+        [str(note) for note in raw_autofocus_notes]
+        if isinstance(raw_autofocus_notes, list)
+        else []
+    )
     summary = RunSummary(
         started_at=started_at,
         finished_at=finished_at,
@@ -2330,6 +2409,34 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         camera_autofocus_mode=focus_settings.mode,
         camera_lens_position=focus_settings.lens_position,
         camera_focus_lock_after_warmup=focus_settings.lock_after_warmup,
+        camera_autofocus_preflight_enabled=preflight_settings.enabled,
+        camera_autofocus_preflight_performed=bool(preflight_result.get("performed", False)),
+        camera_autofocus_preflight_lens_position=(
+            float(preflight_result["selected_lens_position"])
+            if preflight_result.get("selected_lens_position") is not None
+            else None
+        ),
+        camera_autofocus_preflight_selection_reason=(
+            str(preflight_result["selection_reason"])
+            if preflight_result.get("selection_reason") is not None
+            else None
+        ),
+        camera_autofocus_preflight_final_state=(
+            str(preflight_result["final_af_state"])
+            if preflight_result.get("final_af_state") is not None
+            else None
+        ),
+        camera_autofocus_preflight_best_score=(
+            float(preflight_result["best_focus_score"])
+            if preflight_result.get("best_focus_score") is not None
+            else None
+        ),
+        camera_autofocus_preflight_elapsed_seconds=(
+            float(preflight_result["elapsed_seconds"])
+            if preflight_result.get("elapsed_seconds") is not None
+            else None
+        ),
+        camera_autofocus_preflight_notes=autofocus_notes,
         resolved_tuning_file=resolved_tuning_file,
         frames_captured=len(frames),
         actual_fps=round(actual_fps, 6),
@@ -2433,6 +2540,28 @@ def format_run_summary(summary: RunSummary) -> str:
             f"{summary.camera_lens_position if summary.camera_lens_position is not None else 'default'}"
         ),
         f"Camera focus lock after warmup: {summary.camera_focus_lock_after_warmup}",
+        f"Camera autofocus preflight enabled: {summary.camera_autofocus_preflight_enabled}",
+        f"Camera autofocus preflight performed: {summary.camera_autofocus_preflight_performed}",
+        (
+            "Camera autofocus preflight lens position: "
+            f"{summary.camera_autofocus_preflight_lens_position if summary.camera_autofocus_preflight_lens_position is not None else 'n/a'}"
+        ),
+        (
+            "Camera autofocus preflight selection: "
+            f"{summary.camera_autofocus_preflight_selection_reason or 'n/a'}"
+        ),
+        (
+            "Camera autofocus preflight final state: "
+            f"{summary.camera_autofocus_preflight_final_state or 'n/a'}"
+        ),
+        (
+            "Camera autofocus preflight best score: "
+            f"{summary.camera_autofocus_preflight_best_score if summary.camera_autofocus_preflight_best_score is not None else 'n/a'}"
+        ),
+        (
+            "Camera autofocus preflight elapsed (s): "
+            f"{summary.camera_autofocus_preflight_elapsed_seconds if summary.camera_autofocus_preflight_elapsed_seconds is not None else 'n/a'}"
+        ),
         f"Resolved tuning file: {summary.resolved_tuning_file or 'default'}",
         f"Frames captured: {summary.frames_captured}",
         f"Actual FPS: {summary.actual_fps}",
@@ -2468,6 +2597,11 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Errors: {len(summary.errors)}",
         f"Success: {summary.success}",
     ]
+    if summary.camera_autofocus_preflight_notes:
+        lines.append("")
+        lines.append("Autofocus preflight details:")
+        for note in summary.camera_autofocus_preflight_notes:
+            lines.append(f"- {note}")
     if summary.warnings:
         lines.append("")
         lines.append("Warning details:")

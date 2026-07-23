@@ -14,7 +14,14 @@ from .camera_profiles import (
     normalize_camera_profile,
     validate_camera_ir_compatibility,
 )
-from .camera_controls import VALID_AUTOFOCUS_MODES, normalize_autofocus_mode
+from .camera_controls import (
+    VALID_AUTOFOCUS_MODES,
+    VALID_AUTOFOCUS_RANGES,
+    VALID_AUTOFOCUS_SPEEDS,
+    normalize_autofocus_mode,
+    normalize_autofocus_range,
+    normalize_autofocus_speed,
+)
 
 try:
     import yaml
@@ -381,6 +388,62 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ConfigError(
             "camera.focus_lock_after_warmup requires camera.autofocus_mode 'auto' or 'continuous'"
         )
+    autofocus_range = normalize_autofocus_range(
+        config["camera"].get("autofocus_range", "normal")
+    )
+    if autofocus_range not in VALID_AUTOFOCUS_RANGES:
+        raise ConfigError(
+            f"camera.autofocus_range must be one of {sorted(VALID_AUTOFOCUS_RANGES)}, "
+            f"got: {autofocus_range}"
+        )
+    autofocus_speed = normalize_autofocus_speed(
+        config["camera"].get("autofocus_speed", "normal")
+    )
+    if autofocus_speed not in VALID_AUTOFOCUS_SPEEDS:
+        raise ConfigError(
+            f"camera.autofocus_speed must be one of {sorted(VALID_AUTOFOCUS_SPEEDS)}, "
+            f"got: {autofocus_speed}"
+        )
+    autofocus_preflight_enabled = config["camera"].get("autofocus_preflight_enabled", False)
+    if not isinstance(autofocus_preflight_enabled, bool):
+        raise ConfigError("camera.autofocus_preflight_enabled must be true or false")
+    if autofocus_preflight_enabled and autofocus_mode not in {"auto", "continuous"}:
+        raise ConfigError(
+            "camera.autofocus_preflight_enabled requires camera.autofocus_mode "
+            "'auto' or 'continuous'"
+        )
+    if autofocus_preflight_enabled and focus_lock_after_warmup:
+        raise ConfigError(
+            "camera.focus_lock_after_warmup must be false when "
+            "camera.autofocus_preflight_enabled is true"
+        )
+    for key in ("autofocus_preflight_width", "autofocus_preflight_height"):
+        try:
+            value = int(config["camera"].get(key, 1920 if key.endswith("width") else 1440))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"camera.{key} must be an integer") from exc
+        if value <= 0:
+            raise ConfigError(f"camera.{key} must be > 0")
+    try:
+        autofocus_preflight_timeout = float(
+            config["camera"].get("autofocus_preflight_timeout_seconds", 8.0)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "camera.autofocus_preflight_timeout_seconds must be numeric"
+        ) from exc
+    if autofocus_preflight_timeout <= 0:
+        raise ConfigError("camera.autofocus_preflight_timeout_seconds must be > 0")
+    try:
+        autofocus_preflight_stable_frames = int(
+            config["camera"].get("autofocus_preflight_stable_frames", 3)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "camera.autofocus_preflight_stable_frames must be an integer"
+        ) from exc
+    if autofocus_preflight_stable_frames <= 0:
+        raise ConfigError("camera.autofocus_preflight_stable_frames must be > 0")
 
     thermal = config.get("thermal", {})
     if not isinstance(thermal, dict):
