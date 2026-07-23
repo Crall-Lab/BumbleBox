@@ -259,6 +259,7 @@ def _camera_tuning_check(config: Dict[str, Any]) -> CheckResult:
     resolved = info.get("resolved")
     resolved_path = info.get("resolved_path")
     camera_model = info.get("camera_model")
+    camera_profile = info.get("camera_profile")
     infrared = info.get("infrared")
     search_paths = ", ".join(str(path) for path in TUNING_SEARCH_DIRS)
 
@@ -266,7 +267,10 @@ def _camera_tuning_check(config: Dict[str, Any]) -> CheckResult:
         return CheckResult(
             "Camera tuning",
             "PASS",
-            "No tuning file selected; using libcamera default sensor tuning.",
+            (
+                "No tuning file selected; using libcamera default sensor tuning "
+                f"for camera.profile={camera_profile}, camera.model={camera_model}."
+            ),
         )
 
     if resolved_path:
@@ -281,7 +285,7 @@ def _camera_tuning_check(config: Dict[str, Any]) -> CheckResult:
             "PASS",
             (
                 f"Auto-selected tuning='{resolved}' for camera.model={camera_model}, "
-                f"camera.infrared={infrared}; resolved to {resolved_path}."
+                f"camera.profile={camera_profile}, camera.infrared={infrared}; resolved to {resolved_path}."
             ),
         )
 

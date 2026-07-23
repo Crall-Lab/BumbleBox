@@ -6,6 +6,15 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterable
 
+from .camera_profiles import (
+    apply_camera_profile,
+    camera_model_choices,
+    camera_profile_choices,
+    normalize_camera_model,
+    normalize_camera_profile,
+    validate_camera_ir_compatibility,
+)
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - runtime dependency check
@@ -27,15 +36,8 @@ VALID_TRACKING_SOURCES = {"ram", "video"}
 VALID_SCHED_BACKENDS = {"systemd", "cron"}
 VALID_SCHED_SCOPES = {"system", "user"}
 VALID_FLEET_ROLES = {"standalone", "queen", "worker"}
-VALID_CAMERA_MODELS = {
-    "auto",
-    "hq",
-    "hq_noir",
-    "module3",
-    "module3_wide",
-    "module3_standard",
-    "module3_noir",
-}
+VALID_CAMERA_MODELS = set(camera_model_choices())
+VALID_CAMERA_PROFILES = set(camera_profile_choices())
 VALID_PREVIEW_WINDOWS = {"QTGL", "QT", "DRM"}
 VALID_CAMERA_CODECS = {"mp4", "mjpeg"}
 VALID_THERMAL_PIXEL_FORMATS = {"auto", "y16", "gray8", "rgb"}
@@ -317,7 +319,13 @@ def validate_config(config: Dict[str, Any]) -> None:
         if not isinstance(allow_when_active, bool):
             raise ConfigError("fleet.queen_media_schedule.allow_when_queen_bbox_active must be true or false")
 
-    camera_model = config["camera"].get("model")
+    camera_profile = normalize_camera_profile(config["camera"].get("profile", "custom"))
+    if camera_profile not in VALID_CAMERA_PROFILES:
+        raise ConfigError(
+            f"camera.profile must be one of {sorted(VALID_CAMERA_PROFILES)}, got: {camera_profile}"
+        )
+
+    camera_model = normalize_camera_model(config["camera"].get("model"))
     if camera_model not in VALID_CAMERA_MODELS:
         raise ConfigError(
             f"camera.model must be one of {sorted(VALID_CAMERA_MODELS)}, got: {camera_model}"
@@ -328,6 +336,9 @@ def validate_config(config: Dict[str, Any]) -> None:
     camera_monochrome_output = config["camera"].get("monochrome_output", False)
     if not isinstance(camera_monochrome_output, bool):
         raise ConfigError("camera.monochrome_output must be true or false")
+    ir_error = validate_camera_ir_compatibility(config)
+    if ir_error:
+        raise ConfigError(ir_error)
     preview_window = str(config["camera"].get("preview_window", "QT")).upper()
     if preview_window not in VALID_PREVIEW_WINDOWS:
         raise ConfigError(
@@ -449,6 +460,7 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
     else:
         merged = defaults
 
+    merged = apply_camera_profile(merged)
     _normalize_service_user_in_config(merged)
     validate_config(merged)
     return merged
@@ -456,6 +468,7 @@ def load_config(config_path: str | Path) -> Dict[str, Any]:
 
 def save_config(config_path: str | Path, config: Dict[str, Any]) -> None:
     _require_yaml()
+    config = apply_camera_profile(config)
     _normalize_service_user_in_config(config)
     validate_config(config)
 

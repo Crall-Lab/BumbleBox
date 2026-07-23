@@ -7,20 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .camera_profiles import get_camera_model_info
+
 try:
     import cv2
 except ImportError:  # pragma: no cover - runtime dependency
     cv2 = None
-
-
-CAMERA_DEFAULT_RESOLUTION = {
-    "hq": (4056, 3040),
-    "hq_noir": (4056, 3040),
-    "module3": (4608, 2592),
-    "module3_standard": (4608, 2592),
-    "module3_wide": (4608, 2592),
-    "module3_noir": (4608, 2592),
-}
 
 
 @dataclass
@@ -232,7 +224,8 @@ def run_schedule_check(
         )
 
     camera_model = str(camera.get("model", "auto")).strip().lower()
-    expected_res = CAMERA_DEFAULT_RESOLUTION.get(camera_model)
+    camera_model_info = get_camera_model_info(camera_model)
+    expected_res = camera_model_info.max_resolution if camera_model_info else None
     if expected_res:
         if (width, height) == expected_res:
             items.append(

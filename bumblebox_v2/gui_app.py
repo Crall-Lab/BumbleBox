@@ -31,6 +31,13 @@ from .camera_setup import (
     format_tracking_test_result,
     run_camera_tracking_test,
 )
+from .camera_profiles import (
+    apply_camera_profile,
+    camera_model_choices,
+    camera_profile_choices,
+    get_camera_model_info,
+    get_camera_profile,
+)
 from .config import DEFAULT_USER_CONFIG_PATH, load_config, load_defaults, save_config, validate_config, write_default_config
 from .doctor import format_report as format_doctor_report
 from .doctor import run_doctor
@@ -2607,7 +2614,8 @@ class BumbleBoxV2GUI(tk.Tk):
         canvas.itemconfigure(window_id, width=max(1, int(event.width)))
 
     def _config_group_specs(self):
-        camera_models = ["auto", "hq", "hq_noir", "module3", "module3_wide", "module3_standard", "module3_noir"]
+        camera_models = camera_model_choices()
+        camera_profiles = camera_profile_choices()
         return [
             (
                 "basic",
@@ -2618,7 +2626,6 @@ class BumbleBoxV2GUI(tk.Tk):
                     ("Use local tracking index", "local_index.enabled", bool, None, None),
                     ("Local tracking index", "local_index.path", str, None, None),
                     ("Pi model", "system.pi_model", str, ["auto", "pi4", "pi5"], None),
-                    ("Camera model", "camera.model", str, camera_models, None),
                     ("Fleet role", "fleet.role", str, ["standalone", "queen", "worker"], None),
                     ("Unit prefix", "scheduling.unit_prefix", str, None, None),
                     ("Service user", "scheduling.service_user", str, None, None),
@@ -2630,6 +2637,8 @@ class BumbleBoxV2GUI(tk.Tk):
                 "camera",
                 "Camera Configuration",
                 [
+                    ("Camera profile", "camera.profile", str, camera_profiles, None),
+                    ("Camera model", "camera.model", str, camera_models, None),
                     ("Codec", "camera.codec", str, ["mp4", "mjpeg"], None),
                     ("MP4 encoder", "camera.mp4_codec", str, self._mp4_codec_display_options(), None),
                     ("Width (px)", "camera.width", int, None, None),
@@ -2762,7 +2771,7 @@ class BumbleBoxV2GUI(tk.Tk):
             return 24
         if key in {"system.colony_id"}:
             return 10
-        if key in {"scheduling.unit_prefix", "scheduling.service_user", "camera.model"}:
+        if key in {"scheduling.unit_prefix", "scheduling.service_user", "camera.model", "camera.profile"}:
             return 18
         if value_type in {int, float}:
             return 10
@@ -2781,6 +2790,10 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Generated index artifacts are ignored by Git, and large videos are intentionally not copied here."
             ),
             "system.pi_model": "Hardware target hint. Use auto unless you need to force Pi4/Pi5 assumptions.",
+            "camera.profile": (
+                "Optional camera preset. Use custom for manual fields, hq_reference for the known-good HQ test "
+                "envelope, or owlsight_reference to test OwlSight at the same 4056x3040 @ 7 fps envelope."
+            ),
             "camera.model": "Camera hardware model hint. Affects defaults and camera-specific assumptions.",
             "fleet.role": "Choose standalone, queen, or worker behavior mode.",
             "scheduling.unit_prefix": "Prefix for generated timer/service unit names in systemd.",
@@ -2800,7 +2813,8 @@ class BumbleBoxV2GUI(tk.Tk):
             "camera.infrared": (
                 "Use IR/NoIR sensor tuning when no manual tuning file is set. "
                 "When enabled, BumbleBox auto-resolves the camera's noir tuning file "
-                "(for example imx477_noir.json or imx708_noir.json) for preview, recording, and calibration."
+                "(for example imx477_noir.json or imx708_noir.json) for preview, recording, and calibration. "
+                "Do not enable this for stock OwlSight cameras, which have an IR-cut filter."
             ),
             "camera.monochrome_output": (
                 "Force grayscale-looking RGB output for preview, recording, and calibration captures. "
@@ -2971,9 +2985,14 @@ class BumbleBoxV2GUI(tk.Tk):
                 self._camera_actions_row = actions
                 ttk.Button(
                     actions,
+                    text="Apply Camera Profile",
+                    command=self._apply_camera_profile_to_editor,
+                ).pack(side=tk.LEFT)
+                ttk.Button(
+                    actions,
                     text="Use Max Resolution",
                     command=self._apply_camera_max_resolution,
-                ).pack(side=tk.LEFT)
+                ).pack(side=tk.LEFT, padx=(8, 0))
                 ttk.Label(actions, textvariable=self._camera_max_status_var).pack(side=tk.LEFT, padx=(8, 0))
                 row_index += 1
 
@@ -3084,17 +3103,57 @@ class BumbleBoxV2GUI(tk.Tk):
             return
         field[0].set(selected)
 
+    def _apply_camera_profile_to_editor(self) -> None:
+        profile_field = self.config_fields.get("camera.profile")
+        if profile_field is None:
+            return
+
+        profile_name = str(profile_field[0].get()).strip() or "custom"
+        profile = get_camera_profile(profile_name)
+        if profile is None:
+            self._show_error("Camera profile", f"Unknown camera profile: {profile_name}")
+            return
+
+        if profile.key == "custom":
+            message = "Camera profile is custom; no preset fields were changed."
+            if hasattr(self, "_camera_max_status_var"):
+                self._camera_max_status_var.set(message)
+            self.config_output.delete("1.0", tk.END)
+            self.config_output.insert(tk.END, message)
+            return
+
+        changed: list[str] = []
+        for key, value in profile.camera_values.items():
+            field = self.config_fields.get(f"camera.{key}")
+            if field is None:
+                continue
+            variable, value_type = field
+            if value_type is bool:
+                variable.set(bool(value))
+            elif value is None:
+                variable.set("")
+            else:
+                variable.set(str(value))
+            changed.append(f"camera.{key} = {value!r}")
+
+        profile_field[0].set(profile.key)
+        status = f"Applied camera profile: {profile.key} ({profile.description})"
+        if hasattr(self, "_camera_max_status_var"):
+            self._camera_max_status_var.set(status)
+        self.config_output.delete("1.0", tk.END)
+        self.config_output.insert(tk.END, status)
+        if changed:
+            self.config_output.insert(tk.END, "\n\nUpdated fields:\n- " + "\n- ".join(changed))
+        model_info = get_camera_model_info(profile.camera_values.get("model"))
+        if model_info is not None and not model_info.supports_infrared:
+            self.config_output.insert(
+                tk.END,
+                "\n\nNote: this camera profile is marked as not IR-capable; use visible illumination.",
+            )
+
     def _infer_camera_model_max_resolution(self, model: str) -> tuple[int, int] | None:
-        normalized = str(model or "").strip().lower()
-        mapping = {
-            "hq": (4056, 3040),
-            "hq_noir": (4056, 3040),
-            "module3": (4608, 2592),
-            "module3_wide": (4608, 2592),
-            "module3_standard": (4608, 2592),
-            "module3_noir": (4608, 2592),
-        }
-        return mapping.get(normalized)
+        model_info = get_camera_model_info(model)
+        return model_info.max_resolution if model_info else None
 
     def _coerce_size_tuple(self, value) -> tuple[int, int] | None:
         if isinstance(value, (list, tuple)) and len(value) >= 2:
@@ -7632,7 +7691,7 @@ class BumbleBoxV2GUI(tk.Tk):
                 else:
                     parsed = text
             self._set_nested(config, key, parsed)
-        return config
+        return apply_camera_profile(config)
 
     def _load_effective_action_config(self) -> tuple[dict, Path]:
         _, config_path = self._load_config_or_defaults()

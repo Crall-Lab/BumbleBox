@@ -186,6 +186,13 @@ def capture_calibration_image(
     output_dir: str | Path,
     filename_prefix: str = "calibration_capture",
 ) -> Path:
+    from .camera_profiles import apply_camera_profile, validate_camera_ir_compatibility
+
+    config = apply_camera_profile(config)
+    ir_error = validate_camera_ir_compatibility(config)
+    if ir_error:
+        raise ValueError(ir_error)
+
     try:
         from picamera2 import Picamera2
         from libcamera import controls

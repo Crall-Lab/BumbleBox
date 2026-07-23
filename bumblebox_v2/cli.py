@@ -20,11 +20,20 @@ from .calibration import (
     parse_point,
 )
 from .camera_setup import (
+    format_camera_check_result,
     format_camera_preview_result,
     format_tracking_test_result,
+    run_camera_check,
     run_camera_preview,
     run_camera_tracking_test,
+    write_camera_check_json,
     write_tracking_test_json,
+)
+from .camera_profiles import (
+    apply_camera_profile,
+    camera_profile_choices,
+    get_camera_profile,
+    validate_camera_ir_compatibility,
 )
 from .config import (
     DEFAULT_USER_CONFIG_PATH,
@@ -399,6 +408,63 @@ def _apply_infrared_override(
     )
 
 
+def _apply_camera_profile_override(
+    config: dict,
+    *,
+    requested_profile: str | None,
+    context_label: str,
+) -> bool:
+    if requested_profile is None:
+        updated = apply_camera_profile(config)
+        config.clear()
+        config.update(updated)
+        return True
+
+    profile_info = get_camera_profile(requested_profile)
+    if profile_info is None:
+        print(
+            f"Unknown camera profile: {requested_profile}. "
+            f"Expected one of: {', '.join(camera_profile_choices())}"
+        )
+        return False
+
+    config.setdefault("camera", {})
+    saved_profile = str(config["camera"].get("profile", "custom")).strip().lower() or "custom"
+    requested = str(profile_info.key)
+    if requested != saved_profile:
+        prompt = (
+            f"{context_label} is overriding saved camera.profile={saved_profile!r} "
+            f"with {requested!r} for this run only. Continue? [y/N]: "
+        )
+        if not sys.stdin.isatty():
+            print(
+                f"Refusing to override saved camera.profile in non-interactive mode. "
+                "Run interactively, change the config, or remove --camera-profile."
+            )
+            return False
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            print("Cancelled.")
+            return False
+        if answer not in {"y", "yes"}:
+            print("Cancelled.")
+            return False
+
+    updated = apply_camera_profile(config, requested)
+    config.clear()
+    config.update(updated)
+    return True
+
+
+def _check_camera_ir_compatibility_for_cli(config: dict) -> bool:
+    error = validate_camera_ir_compatibility(config)
+    if error:
+        print(f"Camera config error: {error}")
+        return False
+    return True
+
+
 def _apply_monochrome_output_override(
     config: dict,
     *,
@@ -606,6 +672,12 @@ def _cmd_camera_preview(args: argparse.Namespace) -> int:
         print(f"Config error: {exc}")
         return 1
 
+    if not _apply_camera_profile_override(
+        config,
+        requested_profile=getattr(args, "camera_profile", None),
+        context_label="camera-preview",
+    ):
+        return 1
     if not _apply_infrared_override(
         config,
         requested_infrared=getattr(args, "infrared", None),
@@ -617,6 +689,8 @@ def _cmd_camera_preview(args: argparse.Namespace) -> int:
         requested_monochrome_output=getattr(args, "monochrome_output", None),
         context_label="camera-preview",
     ):
+        return 1
+    if not _check_camera_ir_compatibility_for_cli(config):
         return 1
 
     try:
@@ -633,6 +707,38 @@ def _cmd_camera_preview(args: argparse.Namespace) -> int:
 
     print(format_camera_preview_result(result))
     return 0
+
+
+def _cmd_camera_check(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    if not _apply_camera_profile_override(
+        config,
+        requested_profile=getattr(args, "camera_profile", None),
+        context_label="camera-check",
+    ):
+        return 1
+
+    try:
+        result = run_camera_check(config)
+    except Exception as exc:
+        print(f"Camera check failed: {exc}")
+        return 1
+
+    print(format_camera_check_result(result))
+    if args.json_out:
+        try:
+            path = write_camera_check_json(result, args.json_out)
+            print(f"\nJSON report saved: {path}")
+        except Exception as exc:
+            print(f"Camera check completed, but failed to write JSON report: {exc}")
+            return 1
+    return 0 if result.ir_compatibility_error is None else 1
 
 
 def _format_camera_reset_result(result) -> str:
@@ -676,6 +782,15 @@ def _cmd_camera_test_tracking(args: argparse.Namespace) -> int:
         config = _load_or_defaults(config_path)
     except (FileNotFoundError, ConfigError, RuntimeError) as exc:
         print(f"Config error: {exc}")
+        return 1
+
+    if not _apply_camera_profile_override(
+        config,
+        requested_profile=getattr(args, "camera_profile", None),
+        context_label="camera-test-tracking",
+    ):
+        return 1
+    if not _check_camera_ir_compatibility_for_cli(config):
         return 1
 
     box_preset = args.box_preset
@@ -997,6 +1112,12 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
     if args.mock_camera:
         config.setdefault("runtime", {})
         config["runtime"]["use_mock_camera"] = True
+    if not _apply_camera_profile_override(
+        config,
+        requested_profile=getattr(args, "camera_profile", None),
+        context_label="run-once",
+    ):
+        return 1
     if args.codec:
         config.setdefault("camera", {})
         config["camera"]["codec"] = str(args.codec).strip().lower()
@@ -1011,6 +1132,8 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
         requested_monochrome_output=getattr(args, "monochrome_output", None),
         context_label="run-once",
     ):
+        return 1
+    if not _check_camera_ir_compatibility_for_cli(config):
         return 1
     if not _apply_runtime_bool_override(
         config,
@@ -3578,12 +3701,30 @@ def build_parser() -> argparse.ArgumentParser:
     storage_setup.add_argument("--dry-run", action="store_true", help="Show actions without editing /etc/fstab.")
     storage_setup.set_defaults(func=_cmd_storage_setup)
 
+    camera_check_parser = subparsers.add_parser(
+        "camera-check",
+        help="Report active camera profile/model, tuning selection, and Picamera2 sensor modes.",
+    )
+    _add_common_config_arg(camera_check_parser)
+    camera_check_parser.add_argument(
+        "--camera-profile",
+        choices=camera_profile_choices(),
+        help="Apply a named camera profile for this check only.",
+    )
+    camera_check_parser.add_argument("--json-out", help="Optional path to save JSON report.")
+    camera_check_parser.set_defaults(func=_cmd_camera_check)
+
     camera_preview_parser = subparsers.add_parser(
         "camera-preview",
         help="Open a timed live camera preview window (focus/exposure/framing check).",
     )
     _add_common_config_arg(camera_preview_parser)
     camera_preview_parser.add_argument("--seconds", type=float, default=20.0, help="Preview duration in seconds.")
+    camera_preview_parser.add_argument(
+        "--camera-profile",
+        choices=camera_profile_choices(),
+        help="Apply a named camera profile for this preview only.",
+    )
     camera_preview_parser.add_argument(
         "--window",
         choices=["QTGL", "QT", "DRM"],
@@ -3641,6 +3782,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_config_arg(camera_test_parser)
     camera_test_parser.add_argument("--seconds", type=float, default=20.0, help="Live tracking test duration in seconds.")
+    camera_test_parser.add_argument(
+        "--camera-profile",
+        choices=camera_profile_choices(),
+        help="Apply a named camera profile for this tracking test only.",
+    )
     camera_test_parser.add_argument(
         "--display-width",
         type=int,
@@ -3782,6 +3928,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--codec",
         choices=["mp4", "mjpeg"],
         help="Optional one-run recording codec override (default from camera.codec in config).",
+    )
+    run_once_parser.add_argument(
+        "--camera-profile",
+        choices=camera_profile_choices(),
+        help="Apply a named camera profile for this run only.",
     )
     infrared_group = run_once_parser.add_mutually_exclusive_group()
     infrared_group.add_argument(

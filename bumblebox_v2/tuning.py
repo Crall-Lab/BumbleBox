@@ -3,20 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .camera_profiles import configured_profile_name, get_camera_model_info, normalize_camera_model
+
 
 TUNING_SEARCH_DIRS = (
     Path("/usr/share/libcamera/ipa/rpi/pisp"),  # Raspberry Pi 5 pipeline.
     Path("/usr/share/libcamera/ipa/rpi/vc4"),   # Raspberry Pi 4 and earlier pipeline.
 )
-
-CAMERA_MODEL_TO_SENSOR = {
-    "hq": "imx477",
-    "hq_noir": "imx477",
-    "module3": "imx708",
-    "module3_standard": "imx708",
-    "module3_wide": "imx708",
-    "module3_noir": "imx708",
-}
 
 
 def _parse_bool(value: Any) -> Optional[bool]:
@@ -33,13 +26,16 @@ def _parse_bool(value: Any) -> Optional[bool]:
 
 
 def _detect_sensor_from_model(model: Any) -> Optional[str]:
-    text = str(model or "").strip().lower()
-    if text in CAMERA_MODEL_TO_SENSOR:
-        return CAMERA_MODEL_TO_SENSOR[text]
+    text = normalize_camera_model(model)
+    info = get_camera_model_info(text)
+    if info is not None and info.sensor:
+        return info.sensor
     if "imx477" in text or "hq" in text:
         return "imx477"
     if "imx708" in text or "module3" in text:
         return "imx708"
+    if "ov64a40" in text or "owlsight" in text:
+        return "ov64a40"
     if "imx219" in text:
         return "imx219"
     return None
@@ -55,15 +51,21 @@ def _detect_sensor_from_resolution(width: Any, height: Any) -> Optional[str]:
         return "imx477"
     if (w, h) == (4608, 2592):
         return "imx708"
+    if (w, h) == (9248, 6944):
+        return "ov64a40"
     return None
 
 
 def _is_noir_variant(model: Any, infrared: Any) -> bool:
+    model_info = get_camera_model_info(model)
+    if model_info is not None and not model_info.supports_infrared:
+        return False
+
     infrared_bool = _parse_bool(infrared)
     if infrared_bool is not None:
         return bool(infrared_bool)
 
-    model_text = str(model or "").strip().lower()
+    model_text = normalize_camera_model(model)
     if model_text in {"hq_noir", "module3_noir"}:
         return True
     if model_text in {"hq", "module3", "module3_standard", "module3_wide"}:
@@ -115,6 +117,8 @@ def resolve_camera_tuning_file(config: dict[str, Any]) -> Optional[str]:
     use_noir = _is_noir_variant(camera_model, camera_cfg.get("infrared"))
     basename = f"{sensor}{'_noir' if use_noir else ''}.json"
     found = _find_tuning_file(basename)
+    if sensor == "ov64a40" and found is None:
+        return None
     return str(found) if found else basename
 
 
@@ -142,5 +146,6 @@ def inspect_camera_tuning_resolution(config: dict[str, Any]) -> Dict[str, Any]:
         "resolved": resolved,
         "resolved_path": str(resolved_path) if resolved_path else None,
         "camera_model": str(camera_cfg.get("model", "auto")),
+        "camera_profile": configured_profile_name(config),
         "infrared": _parse_bool(camera_cfg.get("infrared")),
     }

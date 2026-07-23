@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .camera_profiles import apply_camera_profile, configured_profile_name, validate_camera_ir_compatibility
 from .thermal_camera import resolve_thermal_device_path, _set_v4l2_y16_format
 from .tracking_index import sync_run_summary_file
 from .tuning import resolve_camera_tuning_file
@@ -34,6 +35,8 @@ class RunSummary:
     session_dir: str
     hostname: str
     python_executable: str
+    camera_profile: str
+    camera_model: str
     camera_infrared: Optional[bool]
     camera_monochrome_output: Optional[bool]
     resolved_tuning_file: Optional[str]
@@ -2041,6 +2044,11 @@ def _run_fps_report_if_needed(
 
 
 def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> RunSummary:
+    config = apply_camera_profile(config)
+    ir_error = validate_camera_ir_compatibility(config)
+    if ir_error:
+        raise ValueError(ir_error)
+
     started_at = _now_iso()
     warnings: List[str] = []
     errors: List[str] = []
@@ -2061,6 +2069,8 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     session_name, session_dir = _make_session_paths(config)
     hostname = socket.gethostname()
     camera_cfg = config.get("camera", {}) if isinstance(config.get("camera", {}), dict) else {}
+    camera_profile = configured_profile_name(config)
+    camera_model = str(camera_cfg.get("model", "auto"))
     raw_camera_infrared = camera_cfg.get("infrared")
     camera_infrared = raw_camera_infrared if isinstance(raw_camera_infrared, bool) else None
     raw_camera_monochrome_output = camera_cfg.get("monochrome_output")
@@ -2285,6 +2295,8 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         session_dir=str(session_dir),
         hostname=hostname,
         python_executable=str(Path(sys.executable).resolve()),
+        camera_profile=camera_profile,
+        camera_model=camera_model,
         camera_infrared=camera_infrared,
         camera_monochrome_output=camera_monochrome_output,
         resolved_tuning_file=resolved_tuning_file,
@@ -2380,6 +2392,8 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Session: {summary.session_name}",
         f"Directory: {summary.session_dir}",
         f"Python executable: {summary.python_executable}",
+        f"Camera profile: {summary.camera_profile}",
+        f"Camera model: {summary.camera_model}",
         f"Camera IR setting: {summary.camera_infrared if summary.camera_infrared is not None else 'n/a'}",
         f"Camera monochrome output: {summary.camera_monochrome_output if summary.camera_monochrome_output is not None else 'n/a'}",
         f"Resolved tuning file: {summary.resolved_tuning_file or 'default'}",

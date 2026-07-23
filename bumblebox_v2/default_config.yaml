@@ -15,6 +15,7 @@ local_index:
   copy_fps_reports: true
 
 camera:
+  profile: "custom"
   model: "auto"
   width: 4056
   height: 3040

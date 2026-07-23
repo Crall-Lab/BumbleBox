@@ -7,8 +7,14 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Optional
 
+from .camera_profiles import (
+    apply_camera_profile,
+    configured_profile_name,
+    get_camera_model_info,
+    validate_camera_ir_compatibility,
+)
 from .qt_env import sanitize_current_qt_env
-from .tuning import resolve_camera_tuning_file
+from .tuning import inspect_camera_tuning_resolution, resolve_camera_tuning_file
 
 
 PREVIEW_WINDOWS = {"QTGL", "QT", "DRM"}
@@ -52,6 +58,62 @@ class CameraTrackingTestResult:
         return asdict(self)
 
 
+@dataclass
+class CameraCheckResult:
+    camera_profile: str
+    camera_model: str
+    requested_width: int
+    requested_height: int
+    requested_fps: float
+    shutter_us: int
+    infrared: bool
+    monochrome_output: bool
+    codec: str
+    resolved_tuning_file: Optional[str]
+    tuning_source: str
+    tuning_resolved_path: Optional[str]
+    model_supports_infrared: Optional[bool]
+    ir_compatibility_error: Optional[str]
+    picamera2_available: bool
+    detected_cameras: list[dict[str, Any]]
+    opened_camera_properties: dict[str, Any]
+    sensor_modes: list[dict[str, Any]]
+    notes: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return str(value)
+
+
+def _summarize_sensor_modes(sensor_modes: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(sensor_modes, (list, tuple)):
+        return out
+    for mode in sensor_modes:
+        if not isinstance(mode, dict):
+            out.append({"mode": _jsonable(mode)})
+            continue
+        summarized: dict[str, Any] = {}
+        for key in ("format", "size", "fps", "crop_limits", "bit_depth", "unpacked", "exposure_limits"):
+            if key in mode:
+                summarized[key] = _jsonable(mode.get(key))
+        if not summarized:
+            summarized = _jsonable(mode)
+        out.append(summarized)
+    return out
+
+
 def _normalize_dictionary_name(dictionary_name: str) -> str:
     name = str(dictionary_name or "4X4_50").strip().upper()
     if not name.startswith("DICT_"):
@@ -68,6 +130,114 @@ def _normalize_box_preset(box_preset: Any) -> Optional[str]:
     if text in {"custom", "koppert"}:
         return text
     return None
+
+
+def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
+    config = apply_camera_profile(config)
+    camera_cfg = config.get("camera", {}) if isinstance(config.get("camera", {}), dict) else {}
+    camera_model = str(camera_cfg.get("model", "auto"))
+    model_info = get_camera_model_info(camera_model)
+    tuning_info = inspect_camera_tuning_resolution(config)
+    ir_error = validate_camera_ir_compatibility(config)
+    notes: list[str] = []
+    detected_cameras: list[dict[str, Any]] = []
+    opened_camera_properties: dict[str, Any] = {}
+    sensor_modes: list[dict[str, Any]] = []
+
+    try:
+        from picamera2 import Picamera2
+
+        picamera2_available = True
+    except Exception as exc:  # pragma: no cover - runtime dependency
+        picamera2_available = False
+        notes.append(f"Picamera2 unavailable: {exc}")
+    else:
+        picam2 = None
+        try:
+            camera_info = Picamera2.global_camera_info()
+            if isinstance(camera_info, list):
+                detected_cameras = [_jsonable(item) for item in camera_info]
+            else:
+                detected_cameras = [{"camera_info": _jsonable(camera_info)}]
+        except Exception as exc:
+            notes.append(f"Could not read Picamera2.global_camera_info(): {exc}")
+
+        try:
+            resolved_tuning_file = tuning_info.get("resolved")
+            if resolved_tuning_file:
+                tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
+                picam2 = Picamera2(tuning=tuning)
+            else:
+                picam2 = Picamera2()
+            properties = getattr(picam2, "camera_properties", {})
+            if isinstance(properties, dict):
+                opened_camera_properties = _jsonable(properties)
+            sensor_modes = _summarize_sensor_modes(getattr(picam2, "sensor_modes", None))
+        except Exception as exc:
+            notes.append(f"Could not open Picamera2 for properties/modes: {exc}")
+        finally:
+            if picam2 is not None:
+                try:
+                    picam2.close()
+                except Exception:
+                    pass
+
+    return CameraCheckResult(
+        camera_profile=configured_profile_name(config),
+        camera_model=camera_model,
+        requested_width=int(camera_cfg.get("width", 4056)),
+        requested_height=int(camera_cfg.get("height", 3040)),
+        requested_fps=float(camera_cfg.get("fps_target", 5.0)),
+        shutter_us=int(camera_cfg.get("shutter_us", 2500)),
+        infrared=bool(camera_cfg.get("infrared", False)),
+        monochrome_output=bool(camera_cfg.get("monochrome_output", False)),
+        codec=str(camera_cfg.get("codec", "mp4")),
+        resolved_tuning_file=tuning_info.get("resolved"),
+        tuning_source=str(tuning_info.get("source", "default")),
+        tuning_resolved_path=tuning_info.get("resolved_path"),
+        model_supports_infrared=(model_info.supports_infrared if model_info is not None else None),
+        ir_compatibility_error=ir_error,
+        picamera2_available=picamera2_available,
+        detected_cameras=detected_cameras,
+        opened_camera_properties=opened_camera_properties,
+        sensor_modes=sensor_modes,
+        notes=notes,
+    )
+
+
+def format_camera_check_result(result: CameraCheckResult) -> str:
+    lines = [
+        "Camera Check",
+        "------------",
+        f"Camera profile: {result.camera_profile}",
+        f"Camera model: {result.camera_model}",
+        f"Requested size/FPS: {result.requested_width}x{result.requested_height} @ {result.requested_fps:g} fps",
+        f"Shutter: {result.shutter_us} us",
+        f"Codec: {result.codec}",
+        f"IR lighting/config: {result.infrared}",
+        f"Monochrome output: {result.monochrome_output}",
+        f"Model supports IR: {result.model_supports_infrared if result.model_supports_infrared is not None else 'unknown'}",
+        f"Tuning source: {result.tuning_source}",
+        f"Resolved tuning file: {result.resolved_tuning_file or 'default'}",
+        f"Resolved tuning path: {result.tuning_resolved_path or 'none'}",
+        f"Picamera2 available: {result.picamera2_available}",
+        f"Detected cameras: {len(result.detected_cameras)}",
+        f"Sensor modes reported: {len(result.sensor_modes)}",
+    ]
+    if result.ir_compatibility_error:
+        lines.extend(["", "Errors", "------", f"- {result.ir_compatibility_error}"])
+    if result.detected_cameras:
+        lines.extend(["", "Detected Camera Info", "--------------------"])
+        for idx, camera_info in enumerate(result.detected_cameras):
+            lines.append(f"- camera[{idx}]: {json.dumps(camera_info, sort_keys=True)}")
+    if result.sensor_modes:
+        lines.extend(["", "Sensor Modes", "------------"])
+        for idx, mode in enumerate(result.sensor_modes):
+            lines.append(f"- mode[{idx}]: {json.dumps(mode, sort_keys=True)}")
+    if result.notes:
+        lines.extend(["", "Notes", "-----"])
+        lines.extend(f"- {note}" for note in result.notes)
+    return "\n".join(lines)
 
 
 def _apply_preset_aruco_params(parameters: Any, box_preset: Optional[str]) -> None:
@@ -203,6 +373,11 @@ def run_camera_preview(
     width: Optional[int] = None,
     height: Optional[int] = None,
 ) -> CameraPreviewResult:
+    config = apply_camera_profile(config)
+    ir_error = validate_camera_ir_compatibility(config)
+    if ir_error:
+        raise ValueError(ir_error)
+
     if preview_seconds <= 0:
         raise ValueError("preview_seconds must be > 0")
 
@@ -281,6 +456,11 @@ def run_camera_tracking_test(
     use_clahe: bool = True,
     window_title: str = "BumbleBox Live Tracking Test (ESC to stop)",
 ) -> CameraTrackingTestResult:
+    config = apply_camera_profile(config)
+    ir_error = validate_camera_ir_compatibility(config)
+    if ir_error:
+        raise ValueError(ir_error)
+
     if test_seconds <= 0:
         raise ValueError("test_seconds must be > 0")
     if display_width <= 0:
@@ -448,6 +628,13 @@ def run_camera_tracking_test(
 
 
 def write_tracking_test_json(result: CameraTrackingTestResult, path: str | Path) -> Path:
+    out = Path(path).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result.to_dict(), indent=2))
+    return out
+
+
+def write_camera_check_json(result: CameraCheckResult, path: str | Path) -> Path:
     out = Path(path).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result.to_dict(), indent=2))
