@@ -186,6 +186,11 @@ def capture_calibration_image(
     output_dir: str | Path,
     filename_prefix: str = "calibration_capture",
 ) -> Path:
+    from .camera_controls import (
+        apply_autofocus_before_start,
+        lock_autofocus_after_warmup,
+        start_autofocus_after_camera_start,
+    )
     from .camera_profiles import apply_camera_profile, validate_camera_ir_compatibility
 
     config = apply_camera_profile(config)
@@ -287,10 +292,13 @@ def capture_calibration_image(
                 picam2.set_controls({"ScalerCrop": tuple(digital_zoom)})
             except Exception:
                 pass
+        apply_autofocus_before_start(config, picam2, controls, strict=True)
 
         picam2.start()
         started = True
+        start_autofocus_after_camera_start(config, picam2, controls, strict=True)
         time.sleep(max(0.0, warmup_s))
+        lock_autofocus_after_warmup(config, picam2, controls, strict=True)
         picam2.capture_file(str(output_path))
         if bool(config.get("camera", {}).get("monochrome_output", False)):
             _force_grayscale_image(output_path)

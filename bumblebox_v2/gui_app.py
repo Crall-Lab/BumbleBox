@@ -2645,6 +2645,15 @@ class BumbleBoxV2GUI(tk.Tk):
                     ("Height (px)", "camera.height", int, None, None),
                     ("FPS target", "camera.fps_target", float, None, None),
                     ("Shutter (us)", "camera.shutter_us", int, None, None),
+                    (
+                        "Autofocus mode",
+                        "camera.autofocus_mode",
+                        str,
+                        ["default", "manual", "auto", "continuous"],
+                        None,
+                    ),
+                    ("Manual lens position", "camera.lens_position", str, None, None),
+                    ("Lock focus after warmup", "camera.focus_lock_after_warmup", bool, None, None),
                     ("IR lighting", "camera.infrared", bool, None, None),
                     ("Monochrome output", "camera.monochrome_output", bool, None, None),
                     ("Use thermal camera", "thermal.enabled", bool, None, None),
@@ -2810,6 +2819,18 @@ class BumbleBoxV2GUI(tk.Tk):
             "camera.height": "Capture height in pixels. Higher values increase detail and resource usage.",
             "camera.fps_target": "Requested capture framerate. Real framerate can differ; verify with FPS Report.",
             "camera.shutter_us": "Exposure time in microseconds. Longer exposure can brighten image but increase motion blur.",
+            "camera.autofocus_mode": (
+                "Focus behavior: default leaves libcamera unchanged; continuous keeps refocusing; "
+                "auto performs one focus scan after startup; manual uses the optional lens position."
+            ),
+            "camera.lens_position": (
+                "Optional manual focus position in diopters. Leave blank unless autofocus mode is manual. "
+                "Zero represents infinity; larger values focus closer."
+            ),
+            "camera.focus_lock_after_warmup": (
+                "With auto or continuous focus, read the achieved lens position after camera warmup and "
+                "hold that position during capture."
+            ),
             "camera.infrared": (
                 "Use IR/NoIR sensor tuning when no manual tuning file is set. "
                 "When enabled, BumbleBox auto-resolves the camera's noir tuning file "
@@ -3296,6 +3317,8 @@ class BumbleBoxV2GUI(tk.Tk):
             if key in {
                 "camera.preview_window",
                 "camera.tuning_file",
+                "camera.lens_position",
+                "camera.focus_lock_after_warmup",
                 "scheduling.backend",
                 "scheduling.scope",
                 "scheduling.unit_prefix",
@@ -7678,8 +7701,10 @@ class BumbleBoxV2GUI(tk.Tk):
                 parsed = float(str(variable.get()).strip())
             else:
                 text = str(variable.get()).strip()
-                if key == "camera.tuning_file" and text == "":
+                if key in {"camera.tuning_file", "camera.lens_position"} and text == "":
                     parsed = None
+                elif key == "camera.lens_position":
+                    parsed = float(text)
                 elif key == "camera.codec":
                     parsed = text.lower() or "mp4"
                 elif key == "camera.mp4_codec":

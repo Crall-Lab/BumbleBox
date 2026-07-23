@@ -28,6 +28,9 @@ camera:
   preview_window: "QT"
   tuning_file: null
   digital_zoom: null
+  autofocus_mode: "default"
+  lens_position: null
+  focus_lock_after_warmup: false
   mp4_codec: "libx264"
 
 thermal:

@@ -14,6 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .camera_controls import (
+    apply_autofocus_before_start,
+    autofocus_settings,
+    lock_autofocus_after_warmup,
+    start_autofocus_after_camera_start,
+)
 from .camera_profiles import apply_camera_profile, configured_profile_name, validate_camera_ir_compatibility
 from .thermal_camera import resolve_thermal_device_path, _set_v4l2_y16_format
 from .tracking_index import sync_run_summary_file
@@ -39,6 +45,9 @@ class RunSummary:
     camera_model: str
     camera_infrared: Optional[bool]
     camera_monochrome_output: Optional[bool]
+    camera_autofocus_mode: str
+    camera_lens_position: Optional[float]
+    camera_focus_lock_after_warmup: bool
     resolved_tuning_file: Optional[str]
     frames_captured: int
     actual_fps: float
@@ -476,6 +485,12 @@ class _PicameraCaptureSession:
 
         if isinstance(self.digital_zoom, (list, tuple)) and len(self.digital_zoom) == 4:
             picam2.set_controls({"ScalerCrop": tuple(self.digital_zoom)})
+        apply_autofocus_before_start(
+            self.config,
+            picam2,
+            self._controls,
+            strict=True,
+        )
         return picam2
 
     def start(self) -> None:
@@ -483,7 +498,19 @@ class _PicameraCaptureSession:
             return
         self.picam2.start()
         self.started = True
+        start_autofocus_after_camera_start(
+            self.config,
+            self.picam2,
+            self._controls,
+            strict=True,
+        )
         time.sleep(max(0.0, self.warmup_s))
+        lock_autofocus_after_warmup(
+            self.config,
+            self.picam2,
+            self._controls,
+            strict=True,
+        )
 
     def capture_for(
         self,
@@ -2077,6 +2104,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     camera_monochrome_output = (
         raw_camera_monochrome_output if isinstance(raw_camera_monochrome_output, bool) else None
     )
+    focus_settings = autofocus_settings(config)
     resolved_tuning_file = resolve_camera_tuning_file(config)
 
     frames: List[Any] = []
@@ -2299,6 +2327,9 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         camera_model=camera_model,
         camera_infrared=camera_infrared,
         camera_monochrome_output=camera_monochrome_output,
+        camera_autofocus_mode=focus_settings.mode,
+        camera_lens_position=focus_settings.lens_position,
+        camera_focus_lock_after_warmup=focus_settings.lock_after_warmup,
         resolved_tuning_file=resolved_tuning_file,
         frames_captured=len(frames),
         actual_fps=round(actual_fps, 6),
@@ -2396,6 +2427,12 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Camera model: {summary.camera_model}",
         f"Camera IR setting: {summary.camera_infrared if summary.camera_infrared is not None else 'n/a'}",
         f"Camera monochrome output: {summary.camera_monochrome_output if summary.camera_monochrome_output is not None else 'n/a'}",
+        f"Camera autofocus mode: {summary.camera_autofocus_mode}",
+        (
+            "Camera manual lens position: "
+            f"{summary.camera_lens_position if summary.camera_lens_position is not None else 'default'}"
+        ),
+        f"Camera focus lock after warmup: {summary.camera_focus_lock_after_warmup}",
         f"Resolved tuning file: {summary.resolved_tuning_file or 'default'}",
         f"Frames captured: {summary.frames_captured}",
         f"Actual FPS: {summary.actual_fps}",

@@ -14,6 +14,7 @@ from .camera_profiles import (
     normalize_camera_profile,
     validate_camera_ir_compatibility,
 )
+from .camera_controls import VALID_AUTOFOCUS_MODES, normalize_autofocus_mode
 
 try:
     import yaml
@@ -352,6 +353,34 @@ def validate_config(config: Dict[str, Any]) -> None:
     mp4_codec = str(config["camera"].get("mp4_codec", "libx264")).strip()
     if not mp4_codec:
         raise ConfigError("camera.mp4_codec must be a non-empty string")
+
+    autofocus_mode = normalize_autofocus_mode(config["camera"].get("autofocus_mode", "default"))
+    if autofocus_mode not in VALID_AUTOFOCUS_MODES:
+        raise ConfigError(
+            f"camera.autofocus_mode must be one of {sorted(VALID_AUTOFOCUS_MODES)}, "
+            f"got: {autofocus_mode}"
+        )
+    lens_position = config["camera"].get("lens_position")
+    if lens_position is not None:
+        if isinstance(lens_position, bool):
+            raise ConfigError("camera.lens_position must be numeric or null")
+        try:
+            lens_position_value = float(lens_position)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("camera.lens_position must be numeric or null") from exc
+        if lens_position_value < 0:
+            raise ConfigError("camera.lens_position must be >= 0 when set")
+        if autofocus_mode != "manual":
+            raise ConfigError(
+                "camera.lens_position can only be set when camera.autofocus_mode is 'manual'"
+            )
+    focus_lock_after_warmup = config["camera"].get("focus_lock_after_warmup", False)
+    if not isinstance(focus_lock_after_warmup, bool):
+        raise ConfigError("camera.focus_lock_after_warmup must be true or false")
+    if focus_lock_after_warmup and autofocus_mode not in {"auto", "continuous"}:
+        raise ConfigError(
+            "camera.focus_lock_after_warmup requires camera.autofocus_mode 'auto' or 'continuous'"
+        )
 
     thermal = config.get("thermal", {})
     if not isinstance(thermal, dict):

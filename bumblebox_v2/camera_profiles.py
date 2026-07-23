@@ -117,6 +117,9 @@ CAMERA_PROFILES: Dict[str, CameraProfile] = {
             "noise_reduction": "Auto",
             "tuning_file": None,
             "digital_zoom": None,
+            "autofocus_mode": "default",
+            "lens_position": None,
+            "focus_lock_after_warmup": False,
         },
     ),
     "owlsight_reference": CameraProfile(
@@ -138,6 +141,9 @@ CAMERA_PROFILES: Dict[str, CameraProfile] = {
             "noise_reduction": "Auto",
             "tuning_file": None,
             "digital_zoom": None,
+            "autofocus_mode": "continuous",
+            "lens_position": None,
+            "focus_lock_after_warmup": False,
         },
     ),
 }

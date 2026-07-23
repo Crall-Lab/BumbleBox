@@ -7,6 +7,12 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Optional
 
+from .camera_controls import (
+    apply_autofocus_before_start,
+    autofocus_settings,
+    lock_autofocus_after_warmup,
+    start_autofocus_after_camera_start,
+)
 from .camera_profiles import (
     apply_camera_profile,
     configured_profile_name,
@@ -31,6 +37,10 @@ class CameraPreviewResult:
     noise_reduction: str
     digital_zoom_applied: bool
     tuning_file: Optional[str]
+    autofocus_mode: str
+    focus_lock_after_warmup: bool
+    locked_lens_position: Optional[float]
+    notes: list[str]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -68,6 +78,10 @@ class CameraCheckResult:
     shutter_us: int
     infrared: bool
     monochrome_output: bool
+    autofocus_mode: str
+    lens_position: Optional[float]
+    focus_lock_after_warmup: bool
+    autofocus_controls_available: list[str]
     codec: str
     resolved_tuning_file: Optional[str]
     tuning_source: str
@@ -143,6 +157,7 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
     detected_cameras: list[dict[str, Any]] = []
     opened_camera_properties: dict[str, Any] = {}
     sensor_modes: list[dict[str, Any]] = []
+    autofocus_controls_available: list[str] = []
 
     try:
         from picamera2 import Picamera2
@@ -173,6 +188,13 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
             if isinstance(properties, dict):
                 opened_camera_properties = _jsonable(properties)
             sensor_modes = _summarize_sensor_modes(getattr(picam2, "sensor_modes", None))
+            advertised_controls = getattr(picam2, "camera_controls", {})
+            if isinstance(advertised_controls, dict):
+                autofocus_controls_available = [
+                    name
+                    for name in ("AfMode", "AfTrigger", "AfState", "LensPosition")
+                    if name in advertised_controls
+                ]
         except Exception as exc:
             notes.append(f"Could not open Picamera2 for properties/modes: {exc}")
         finally:
@@ -182,6 +204,7 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
                 except Exception:
                     pass
 
+    focus_settings = autofocus_settings(config)
     return CameraCheckResult(
         camera_profile=configured_profile_name(config),
         camera_model=camera_model,
@@ -191,6 +214,10 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
         shutter_us=int(camera_cfg.get("shutter_us", 2500)),
         infrared=bool(camera_cfg.get("infrared", False)),
         monochrome_output=bool(camera_cfg.get("monochrome_output", False)),
+        autofocus_mode=focus_settings.mode,
+        lens_position=focus_settings.lens_position,
+        focus_lock_after_warmup=focus_settings.lock_after_warmup,
+        autofocus_controls_available=autofocus_controls_available,
         codec=str(camera_cfg.get("codec", "mp4")),
         resolved_tuning_file=tuning_info.get("resolved"),
         tuning_source=str(tuning_info.get("source", "default")),
@@ -216,6 +243,13 @@ def format_camera_check_result(result: CameraCheckResult) -> str:
         f"Codec: {result.codec}",
         f"IR lighting/config: {result.infrared}",
         f"Monochrome output: {result.monochrome_output}",
+        f"Autofocus mode: {result.autofocus_mode}",
+        f"Manual lens position: {result.lens_position if result.lens_position is not None else 'default'}",
+        f"Focus lock after warmup: {result.focus_lock_after_warmup}",
+        (
+            "Autofocus controls advertised: "
+            + (", ".join(result.autofocus_controls_available) or "none reported")
+        ),
         f"Model supports IR: {result.model_supports_infrared if result.model_supports_infrared is not None else 'unknown'}",
         f"Tuning source: {result.tuning_source}",
         f"Resolved tuning file: {result.resolved_tuning_file or 'default'}",
@@ -392,9 +426,10 @@ def run_camera_preview(
         raise ValueError(f"window must be one of {sorted(PREVIEW_WINDOWS)}")
 
     try:
+        from libcamera import controls
         from picamera2 import Preview
     except Exception as exc:  # pragma: no cover - runtime dependency
-        raise RuntimeError("picamera2 Preview backend is not available.") from exc
+        raise RuntimeError("picamera2/libcamera Preview backend is not available.") from exc
 
     preview_mode = getattr(Preview, window_name)
     notes: list[str] = []
@@ -405,16 +440,34 @@ def run_camera_preview(
         frame_format=None,
     )
     digital_zoom_applied = _apply_camera_controls(config, picam2, notes)
+    apply_autofocus_before_start(config, picam2, controls, notes=notes)
+    focus_settings = autofocus_settings(config)
 
     started = False
     preview_started = False
+    locked_lens_position: Optional[float] = None
     t0 = time.perf_counter()
     try:
         picam2.start_preview(preview_mode)
         preview_started = True
         picam2.start()
         started = True
-        time.sleep(float(preview_seconds))
+        start_autofocus_after_camera_start(config, picam2, controls, notes=notes)
+        if focus_settings.lock_after_warmup:
+            warmup_s = min(
+                float(preview_seconds),
+                max(0.0, float(config.get("runtime", {}).get("camera_warmup_seconds", 2.0))),
+            )
+            time.sleep(warmup_s)
+            locked_lens_position = lock_autofocus_after_warmup(
+                config,
+                picam2,
+                controls,
+                notes=notes,
+            )
+            time.sleep(max(0.0, float(preview_seconds) - warmup_s))
+        else:
+            time.sleep(float(preview_seconds))
     finally:
         if preview_started:
             try:
@@ -442,6 +495,10 @@ def run_camera_preview(
         noise_reduction=str(camera_cfg.get("noise_reduction", "Auto")),
         digital_zoom_applied=digital_zoom_applied,
         tuning_file=resolved_tuning_file,
+        autofocus_mode=focus_settings.mode,
+        focus_lock_after_warmup=focus_settings.lock_after_warmup,
+        locked_lens_position=locked_lens_position,
+        notes=notes,
     )
 
 
@@ -503,6 +560,11 @@ def run_camera_tracking_test(
         frame_format="YUV420",
     )
     _apply_camera_controls(config, picam2, notes)
+    try:
+        from libcamera import controls
+    except Exception as exc:  # pragma: no cover - runtime dependency
+        raise RuntimeError("libcamera controls are required for camera-test-tracking.") from exc
+    apply_autofocus_before_start(config, picam2, controls, notes=notes)
     warmup_s = float(config.get("runtime", {}).get("camera_warmup_seconds", 2.0))
 
     frame_tag_counts: list[int] = []
@@ -516,7 +578,9 @@ def run_camera_tracking_test(
     try:
         picam2.start()
         started = True
+        start_autofocus_after_camera_start(config, picam2, controls, notes=notes)
         time.sleep(max(0.0, warmup_s))
+        lock_autofocus_after_warmup(config, picam2, controls, notes=notes)
         start = time.perf_counter()
         while (time.perf_counter() - start) < float(test_seconds):
             frame = picam2.capture_array()
@@ -652,8 +716,17 @@ def format_camera_preview_result(result: CameraPreviewResult) -> str:
         f"Shutter (us): {result.shutter_us}",
         f"Noise reduction: {result.noise_reduction}",
         f"Digital zoom applied: {result.digital_zoom_applied}",
+        f"Autofocus mode: {result.autofocus_mode}",
+        f"Focus lock after warmup: {result.focus_lock_after_warmup}",
+        (
+            "Locked lens position: "
+            f"{result.locked_lens_position if result.locked_lens_position is not None else 'n/a'}"
+        ),
         f"Tuning file: {result.tuning_file or '(default)'}",
     ]
+    if result.notes:
+        lines.extend(["", "Notes:"])
+        lines.extend(f"- {note}" for note in result.notes)
     return "\n".join(lines)
 
 
