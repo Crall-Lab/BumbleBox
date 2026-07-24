@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import gc
 import json
+import math
 import shutil
 import socket
 import subprocess
@@ -33,6 +34,65 @@ CAMERA_REOPEN_RETRY_DELAY_SECONDS = 0.75
 CAMERA_RELEASE_SETTLE_SECONDS = 0.75
 SYNC_CAPTURE_START_DELAY_SECONDS = 0.20
 SYNC_CAPTURE_FLUSH_FRAMES = 4
+PROGRESS_UPDATE_INTERVAL_SECONDS = 2.0
+PROGRESS_UPDATE_STEPS = 10
+
+_PROGRESS_PRINT_LOCK = threading.Lock()
+
+
+def _progress_message(stage: str, message: str) -> None:
+    with _PROGRESS_PRINT_LOCK:
+        print(f"[{stage}] {message}", flush=True)
+
+
+class _FrameProgress:
+    def __init__(
+        self,
+        *,
+        stage: str,
+        label: str,
+        total: int,
+        unit: str = "frames",
+    ) -> None:
+        self.stage = str(stage)
+        self.label = str(label)
+        self.total = max(1, int(total))
+        self.unit = str(unit)
+        self.step = max(1, (self.total + PROGRESS_UPDATE_STEPS - 1) // PROGRESS_UPDATE_STEPS)
+        self.next_count = self.step
+        self.last_count = 0
+        self.last_print_monotonic = time.perf_counter()
+
+    def start(self, *, detail: Optional[str] = None) -> None:
+        suffix = f" ({detail})" if detail else ""
+        _progress_message(
+            self.stage,
+            f"{self.label}: starting; approximately {self.total} {self.unit}{suffix}.",
+        )
+
+    def update(self, completed: int) -> None:
+        completed = max(0, int(completed))
+        if completed < self.next_count:
+            return
+        now = time.perf_counter()
+        if now - self.last_print_monotonic < PROGRESS_UPDATE_INTERVAL_SECONDS:
+            return
+        percent = min(100.0, 100.0 * float(completed) / float(self.total))
+        _progress_message(
+            self.stage,
+            f"{self.label}: {completed}/{self.total} {self.unit} ({percent:.0f}%).",
+        )
+        self.last_count = completed
+        self.last_print_monotonic = now
+        self.next_count = ((completed // self.step) + 1) * self.step
+
+    def finish(self, completed: int) -> None:
+        completed = max(0, int(completed))
+        _progress_message(
+            self.stage,
+            f"{self.label}: complete; {completed} {self.unit}.",
+        )
+        self.last_count = completed
 
 
 @dataclass
@@ -302,7 +362,11 @@ def _write_named_timestamps(
     return path
 
 
-def _mock_capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
+def _mock_capture_frames(
+    config: Dict[str, Any],
+    *,
+    progress_label: Optional[str] = None,
+) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     try:
         import numpy as np
     except ImportError as exc:  # pragma: no cover - dependency/runtime
@@ -314,6 +378,13 @@ def _mock_capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float]
     height = int(config["camera"]["height"])
 
     frame_count = max(1, int(round(duration * fps)))
+    progress = (
+        _FrameProgress(stage="capture", label=progress_label, total=frame_count)
+        if progress_label
+        else None
+    )
+    if progress is not None:
+        progress.start(detail=f"mock capture, {duration:.1f}s at {fps:.3f} FPS")
     frames = []
     timestamps = []
     timestamp_records: List[FrameTimestampRecord] = []
@@ -332,8 +403,12 @@ def _mock_capture_frames(config: Dict[str, Any]) -> Tuple[List[Any], List[float]
                 monotonic_to_unix_offset_s=monotonic_to_unix_offset_s,
             )
         )
+        if progress is not None:
+            progress.update(i + 1)
 
     actual_fps = frame_count / duration if duration > 0 else fps
+    if progress is not None:
+        progress.finish(frame_count)
     return frames, timestamps, actual_fps, timestamp_records
 
 
@@ -343,6 +418,7 @@ def _capture_frames_from_started_picamera(
     duration: float,
     *,
     start_monotonic: float | None = None,
+    progress_label: Optional[str] = None,
 ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     frames: List[Any] = []
     timestamps: List[float] = []
@@ -360,6 +436,14 @@ def _capture_frames_from_started_picamera(
     monotonic_to_unix_offset_s = time.time() - time.perf_counter()
     frame_index = 0
     target_interval = 1.0 / fps
+    estimated_frames = max(1, int(math.ceil(float(duration) * float(fps))))
+    progress = (
+        _FrameProgress(stage="capture", label=progress_label, total=estimated_frames)
+        if progress_label
+        else None
+    )
+    if progress is not None:
+        progress.start(detail=f"{duration:.1f}s at {fps:.3f} FPS")
     while (time.perf_counter() - start) < duration:
         now = time.perf_counter()
         expected = start + frame_index * target_interval
@@ -375,9 +459,13 @@ def _capture_frames_from_started_picamera(
             timestamps.append(record.time_s)
             timestamp_records.append(record)
             frame_index += 1
+            if progress is not None:
+                progress.update(frame_index)
 
     elapsed = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else duration
     actual_fps = (len(timestamps) - 1) / elapsed if elapsed > 0 and len(timestamps) > 1 else float(len(frames)) / max(duration, 1e-6)
+    if progress is not None:
+        progress.finish(len(frames))
     return frames, timestamps, actual_fps, timestamp_records
 
 
@@ -551,6 +639,7 @@ class _PicameraCaptureSession:
         fps: float,
         duration: float,
         start_monotonic: float | None = None,
+        progress_label: Optional[str] = None,
     ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
         self.start()
         return _capture_frames_from_started_picamera(
@@ -558,6 +647,7 @@ class _PicameraCaptureSession:
             float(fps),
             float(duration),
             start_monotonic=start_monotonic,
+            progress_label=progress_label,
         )
 
     def close(self) -> None:
@@ -596,12 +686,17 @@ def _capture_frames_picamera(
     config: Dict[str, Any],
     *,
     diagnostics: Optional[dict[str, Any]] = None,
+    progress_label: Optional[str] = None,
 ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     fps = float(config["camera"]["fps_target"])
     duration = float(config["capture"]["recording_seconds"])
     with _PicameraCaptureSession(config) as session:
         _write_autofocus_capture_diagnostics(diagnostics, session)
-        return session.capture_for(fps=fps, duration=duration)
+        return session.capture_for(
+            fps=fps,
+            duration=duration,
+            progress_label=progress_label,
+        )
 
 
 def _thermal_enabled_for_recording(config: Dict[str, Any]) -> bool:
@@ -703,6 +798,7 @@ class _ThermalCaptureSession:
         fps: float,
         duration: float,
         start_monotonic: float | None = None,
+        progress_label: Optional[str] = None,
     ) -> Tuple[List[Any], List[float], float, str, List[FrameTimestampRecord]]:
         frames: List[Any] = []
         timestamps: List[float] = []
@@ -721,6 +817,14 @@ class _ThermalCaptureSession:
 
         frame_index = 0
         target_interval = 1.0 / float(fps)
+        estimated_frames = max(1, int(math.ceil(float(duration) * float(fps))))
+        progress = (
+            _FrameProgress(stage="capture", label=progress_label, total=estimated_frames)
+            if progress_label
+            else None
+        )
+        if progress is not None:
+            progress.start(detail=f"{duration:.1f}s at {float(fps):.3f} FPS")
         first_error: Optional[str] = None
         while (time.perf_counter() - start) < float(duration):
             now = time.perf_counter()
@@ -758,6 +862,8 @@ class _ThermalCaptureSession:
             timestamps.append(record.time_s)
             timestamp_records.append(record)
             frame_index += 1
+            if progress is not None:
+                progress.update(frame_index)
 
         if self.raw16_layout is None:
             raise RuntimeError(first_error or "Thermal synchronized capture did not yield any usable raw16 frames.")
@@ -768,6 +874,8 @@ class _ThermalCaptureSession:
             if elapsed > 0 and len(timestamps) > 1
             else float(len(frames)) / max(float(duration), 1e-6)
         )
+        if progress is not None:
+            progress.finish(len(frames))
         return frames, timestamps, float(actual_fps), self.raw16_layout, timestamp_records
 
     def close(self) -> None:
@@ -811,22 +919,35 @@ def _capture_rgb_and_optional_thermal(
     diagnostics: Optional[dict[str, Any]] = None,
 ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord], Optional[dict[str, Any]]]:
     if not _thermal_enabled_for_recording(config):
+        _progress_message("capture", "Preparing RGB capture.")
         frames, timestamps, actual_fps, timestamp_records = _capture_frames(
             config,
             diagnostics=diagnostics,
+            progress_label="RGB capture",
+        )
+        _progress_message(
+            "capture",
+            f"RGB acquisition finished: {len(frames)} frames at {actual_fps:.3f} FPS.",
         )
         return frames, timestamps, actual_fps, timestamp_records, None
 
     if bool(config["runtime"].get("use_mock_camera", False)):
+        _progress_message("capture", "Preparing synchronized mock RGB+thermal capture.")
         frames, timestamps, actual_fps, timestamp_records = _capture_frames(
             config,
             diagnostics=diagnostics,
+            progress_label="RGB capture",
         )
         thermal_frames, thermal_timestamps, thermal_actual_fps, raw16_layout, device_path, thermal_timestamp_records = _mock_capture_thermal_frames(
             config,
             timestamps=timestamps,
             actual_fps=actual_fps,
             timestamp_records=timestamp_records,
+        )
+        _progress_message(
+            "capture",
+            "Synchronized mock acquisition finished: "
+            f"{len(frames)} RGB and {len(thermal_frames)} thermal frames.",
         )
         return frames, timestamps, actual_fps, timestamp_records, {
             "device_path": device_path,
@@ -843,6 +964,7 @@ def _capture_rgb_and_optional_thermal(
     rgb_result: dict[str, Any] = {}
     thermal_result: dict[str, Any] = {}
     errors: list[str] = []
+    _progress_message("capture", "Preparing synchronized RGB+thermal capture.")
 
     def rgb_worker(session: _PicameraCaptureSession) -> None:
         try:
@@ -850,6 +972,7 @@ def _capture_rgb_and_optional_thermal(
                 fps=fps,
                 duration=duration,
                 start_monotonic=start_monotonic,
+                progress_label="RGB capture",
             )
             rgb_result.update(
                 {
@@ -868,6 +991,7 @@ def _capture_rgb_and_optional_thermal(
                 fps=fps,
                 duration=duration,
                 start_monotonic=start_monotonic,
+                progress_label="Thermal capture",
             )
             thermal_result.update(
                 {
@@ -891,6 +1015,10 @@ def _capture_rgb_and_optional_thermal(
             _flush_rgb_capture_queue(rgb_session.picam2, SYNC_CAPTURE_FLUSH_FRAMES)
             _flush_thermal_capture_queue(thermal_session.capture, SYNC_CAPTURE_FLUSH_FRAMES)
             start_monotonic = time.perf_counter() + SYNC_CAPTURE_START_DELAY_SECONDS
+            _progress_message(
+                "capture",
+                f"Starting both streams for {duration:.1f}s at {fps:.3f} FPS.",
+            )
             rgb_thread = threading.Thread(target=rgb_worker, args=(rgb_session,), daemon=True)
             thermal_thread = threading.Thread(target=thermal_worker, args=(thermal_session,), daemon=True)
             rgb_thread.start()
@@ -900,6 +1028,11 @@ def _capture_rgb_and_optional_thermal(
 
     if errors:
         raise RuntimeError(" | ".join(errors))
+    _progress_message(
+        "capture",
+        "Synchronized acquisition finished: "
+        f"{len(rgb_result['frames'])} RGB and {len(thermal_result['frames'])} thermal frames.",
+    )
     return (
         rgb_result["frames"],
         rgb_result["timestamps"],
@@ -929,6 +1062,7 @@ def _write_thermal_recording_outputs(
     if not frames:
         raise RuntimeError("No thermal frames were captured.")
 
+    _progress_message("output", f"Writing thermal raw data for {len(frames)} frames.")
     stack = np.stack(frames, axis=0)
     raw_npy_path = session_dir / f"{session_name}_thermal_raw16.npy"
     np.save(raw_npy_path, stack)
@@ -956,11 +1090,19 @@ def _write_thermal_recording_outputs(
     )
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open thermal preview video writer for {preview_video_path}")
+    preview_progress = _FrameProgress(
+        stage="output",
+        label="Thermal preview video",
+        total=int(stack.shape[0]),
+    )
+    preview_progress.start()
     try:
-        for frame8 in preview8:
+        for frame_index, frame8 in enumerate(preview8, start=1):
             writer.write(cv2.applyColorMap(frame8, cv2.COLORMAP_INFERNO))
+            preview_progress.update(frame_index)
     finally:
         writer.release()
+    preview_progress.finish(int(stack.shape[0]))
 
     mid_idx = max(0, min(int(stack.shape[0]) - 1, int(stack.shape[0]) // 2))
     preview_png_path = session_dir / f"{session_name}_thermal_midframe.png"
@@ -990,6 +1132,7 @@ def _write_thermal_recording_outputs(
             indent=2,
         )
     )
+    _progress_message("output", "Thermal raw data, timestamps, preview, and metadata are complete.")
 
     return ThermalRecordingArtifacts(
         device_path=device_path,
@@ -1102,6 +1245,12 @@ def _write_rgb_thermal_side_by_side_outputs(
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open RGB+thermal side-by-side writer for {video_path}")
 
+    progress = _FrameProgress(
+        stage="output",
+        label="RGB+thermal side-by-side video",
+        total=frame_count,
+    )
+    progress.start()
     midpoint_png_path: Optional[Path] = None
     midpoint_idx = max(0, min(frame_count - 1, frame_count // 2))
     try:
@@ -1129,11 +1278,13 @@ def _write_rgb_thermal_side_by_side_outputs(
 
             combined = np.concatenate([rgb_bgr, thermal_scaled], axis=1)
             writer.write(combined)
+            progress.update(pair_index + 1)
             if pair_index == midpoint_idx:
                 midpoint_png_path = session_dir / f"{session_name}_rgb_thermal_side_by_side_midframe.png"
                 cv2.imwrite(str(midpoint_png_path), combined)
     finally:
         writer.release()
+    progress.finish(frame_count)
 
     return ThermalSideBySideArtifacts(
         frame_count=frame_count,
@@ -1201,6 +1352,12 @@ def _write_tracked_rgb_thermal_side_by_side_outputs(
         if not writer.isOpened():
             raise RuntimeError(f"Failed to open tracked RGB+thermal side-by-side writer for {video_path}")
 
+        progress = _FrameProgress(
+            stage="output",
+            label="Tracked RGB+thermal side-by-side video",
+            total=len(matched_pairs),
+        )
+        progress.start()
         midpoint_png_path: Optional[Path] = None
         midpoint_idx = max(0, min(len(matched_pairs) - 1, len(matched_pairs) // 2))
         current_rgb = first_rgb
@@ -1236,11 +1393,13 @@ def _write_tracked_rgb_thermal_side_by_side_outputs(
                 )
                 combined = np.concatenate([rgb_bgr, thermal_scaled], axis=1)
                 writer.write(combined)
+                progress.update(pair_index + 1)
                 if pair_index == midpoint_idx:
                     midpoint_png_path = session_dir / f"{session_name}_tracked_rgb_thermal_side_by_side_midframe.png"
                     cv2.imwrite(str(midpoint_png_path), combined)
         finally:
             writer.release()
+        progress.finish(len(matched_pairs))
     finally:
         capture.release()
 
@@ -1422,10 +1581,15 @@ def _capture_frames(
     config: Dict[str, Any],
     *,
     diagnostics: Optional[dict[str, Any]] = None,
+    progress_label: Optional[str] = None,
 ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     if bool(config["runtime"].get("use_mock_camera", False)):
-        return _mock_capture_frames(config)
-    return _capture_frames_picamera(config, diagnostics=diagnostics)
+        return _mock_capture_frames(config, progress_label=progress_label)
+    return _capture_frames_picamera(
+        config,
+        diagnostics=diagnostics,
+        progress_label=progress_label,
+    )
 
 
 def capture_probe(
@@ -1748,10 +1912,19 @@ def _write_recording_video(
         if not writer.isOpened():
             raise RuntimeError(f"Failed to open VideoWriter for {output}")
 
-        for frame in frames:
-            writer.write(_frame_to_bgr(frame, monochrome_output=monochrome_output))
-
-        writer.release()
+        progress = _FrameProgress(
+            stage="output",
+            label="RGB MJPEG video",
+            total=len(frames),
+        )
+        progress.start()
+        try:
+            for frame_index, frame in enumerate(frames, start=1):
+                writer.write(_frame_to_bgr(frame, monochrome_output=monochrome_output))
+                progress.update(frame_index)
+        finally:
+            writer.release()
+        progress.finish(len(frames))
         return output
 
     output = session_dir / f"{session_name}.mp4"
@@ -1848,11 +2021,18 @@ def _write_mp4_video_with_ffmpeg(
     )
 
     stderr_text = ""
+    progress = _FrameProgress(
+        stage="output",
+        label=f"RGB MP4 video ({ffmpeg_codec})",
+        total=len(frames),
+    )
+    progress.start()
     try:
         if process.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin for MP4 encoding.")
-        for frame in frames:
+        for frame_index, frame in enumerate(frames, start=1):
             process.stdin.write(_frame_to_bgr(frame, monochrome_output=monochrome_output).tobytes())
+            progress.update(frame_index)
     except BrokenPipeError as exc:
         stderr_bytes = b""
         if process.stderr is not None:
@@ -1882,6 +2062,7 @@ def _write_mp4_video_with_ffmpeg(
         raise RuntimeError(
             f"ffmpeg finished but MP4 output '{output.name}' is unreadable ({size_bytes} bytes)."
         )
+    progress.finish(len(frames))
     return output
 
 
@@ -2196,6 +2377,10 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     try:
         should_record = mode in {"record_only", "record_and_track"}
         should_track = mode in {"track_only", "record_and_track"}
+        _progress_message(
+            "run",
+            f"Session {session_name} started in {mode} mode.",
+        )
 
         if should_record or should_track:
             if should_record and _thermal_enabled_for_recording(config):
@@ -2252,23 +2437,35 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                     thermal_artifacts = None
                     thermal_side_by_side_artifacts = None
             else:
+                _progress_message("capture", "Preparing RGB capture.")
                 frames, timestamps, actual_fps, timestamp_records = _capture_frames(
                     config,
                     diagnostics=capture_diagnostics,
+                    progress_label="RGB capture",
+                )
+                _progress_message(
+                    "capture",
+                    f"RGB acquisition finished: {len(frames)} frames at {actual_fps:.3f} FPS.",
                 )
                 if should_track and _thermal_enabled_for_recording(config) and not should_record:
                     warnings.append("thermal.enabled is set, but thermal capture runs only during recording modes.")
 
         if bool(config["runtime"].get("save_frame_timestamps", True)) and timestamps:
+            _progress_message("output", "Writing RGB frame timestamps.")
             timestamp_path = _write_timestamps(
                 timestamps,
                 session_dir,
                 session_name,
                 timestamp_records=timestamp_records,
             )
+            _progress_message("output", "RGB frame timestamps are complete.")
 
         if should_record:
             video_codec = _normalize_recording_codec(config)
+            _progress_message(
+                "output",
+                f"Encoding RGB recording as {video_codec.upper()}.",
+            )
             video_path = _write_recording_video(
                 frames,
                 session_dir,
@@ -2280,7 +2477,9 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                 mp4_codec=str(config["camera"].get("mp4_codec", "libx264")),
                 monochrome_output=_camera_monochrome_output_enabled(config),
             )
+            _progress_message("output", f"RGB recording complete: {video_path.name}.")
 
+            _progress_message("output", "Writing RGB midpoint preview.")
             recording_preview_png_path = _write_midpoint_preview_png(
                 frames,
                 session_dir,
@@ -2289,6 +2488,11 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
             )
             if recording_preview_png_path is None:
                 warnings.append("Could not write midpoint preview PNG.")
+            else:
+                _progress_message(
+                    "output",
+                    f"RGB midpoint preview complete: {recording_preview_png_path.name}.",
+                )
 
             if video_codec == "mp4" and bool(config["runtime"].get("save_mp4_sidecar_fps_txt", True)):
                 sidecar = session_dir / f"{session_name}_actual_fps.txt"
@@ -2300,6 +2504,10 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                 warnings.append("Non-deferred tracking is not implemented yet; using deferred tracking.")
 
             tracking_started = time.perf_counter()
+            _progress_message(
+                "tracking",
+                f"Starting tag tracking from {source.upper()} input for {len(frames)} captured frames.",
+            )
             if source == "video":
                 if video_path is None:
                     warnings.append("tracking_source=video requires recording; falling back to RAM tracking.")
@@ -2312,7 +2520,13 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
             tracking_frames_processed = len(frames)
             if tracking_elapsed_seconds > 0 and tracking_frames_processed > 0:
                 tracking_processing_fps = tracking_frames_processed / tracking_elapsed_seconds
+            _progress_message(
+                "tracking",
+                "Tag tracking complete: "
+                f"{tracking_frames_processed} frames in {tracking_elapsed_seconds:.1f}s.",
+            )
 
+            _progress_message("tracking", "Writing tracking CSV outputs.")
             raw_csv = session_dir / f"{session_name}_raw.csv"
             noid_csv = session_dir / f"{session_name}_noID.csv"
             excluded_tag_ids = _excluded_tracking_tag_ids(config)
@@ -2325,8 +2539,10 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                 )
             df.to_csv(raw_csv, index=False)
             df2.to_csv(noid_csv, index=False)
+            _progress_message("tracking", "Raw and unidentified-tag CSV outputs are complete.")
 
             if not df.empty:
+                _progress_message("tracking", "Cleaning tracks and calculating configured metrics.")
                 df_clean = _run_cleaning(config, df, actual_fps if actual_fps > 0 else float(config["camera"]["fps_target"]))
                 cleaned_csv = session_dir / f"{session_name}_cleaned.csv"
                 df_clean.to_csv(cleaned_csv, index=False)
@@ -2338,6 +2554,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                     session_name=session_name,
                     warnings=warnings,
                 )
+                _progress_message("tracking", "Track cleaning and metrics are complete.")
 
             if bool(config["runtime"].get("render_tracking_video", False)):
                 if video_path is None:
@@ -2346,6 +2563,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                     warnings.append("Tracked video visualization skipped because tracking raw CSV was not found.")
                 else:
                     try:
+                        _progress_message("tracking", "Rendering tracked RGB visualization.")
                         tracking_visualization_artifacts = _render_tracking_visualizations(
                             config=config,
                             session_dir=session_dir,
@@ -2365,9 +2583,11 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                             ),
                             fps=float(actual_fps if actual_fps > 0 else config["camera"]["fps_target"]),
                         )
+                        _progress_message("tracking", "Tracked visualization outputs are complete.")
                     except Exception as exc:
                         warnings.append(f"Tracked video visualization failed: {exc}")
 
+        _progress_message("output", "Writing run reports and configuration snapshot.")
         fps_report_json = _run_fps_report_if_needed(config, session_dir, session_name, video_path, timestamp_path)
 
         try:
@@ -2375,9 +2595,14 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
             config_snapshot_path.write_text(json.dumps(config, indent=2))
         except Exception as exc:
             warnings.append(f"Config snapshot write failed: {exc}")
+        _progress_message(
+            "output",
+            "Recording and analysis outputs are complete; finalizing the run summary.",
+        )
 
     except Exception as exc:
         errors.append(str(exc))
+        _progress_message("error", str(exc))
     finally:
         if thermal_capture is not None and "frames" in thermal_capture:
             try:
@@ -2521,6 +2746,11 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         summary.warnings.append(f"Local tracking index update failed: {exc}")
         summary.success = len(summary.errors) == 0
         summary_path.write_text(json.dumps(asdict(summary), indent=2))
+    _progress_message(
+        "run",
+        f"Session finalized with {len(summary.errors)} error(s) and "
+        f"{len(summary.warnings)} warning(s): {session_dir}.",
+    )
     return summary
 
 
