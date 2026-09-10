@@ -143,6 +143,7 @@ sudo apt install python3-pyqt5 labelme
 
 ## Design and Workflow Docs
 
+- `/Users/aec/Desktop/BumbleBox/docs/Development_Backlog.md`
 - `/Users/aec/Desktop/BumbleBox/docs/BumbleBox_V2_Design.md`
 - `/Users/aec/Desktop/BumbleBox/docs/BumbleBox_V2_Roadmap.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Camera_Setup.md`

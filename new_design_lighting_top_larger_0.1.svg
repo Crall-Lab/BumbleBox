@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="_0" data-name="0" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 511.0564 511.0554">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: none;
+        stroke: #000;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: .7087px;
+      }
+    </style>
+  </defs>
+  <g id="CIRCLE">
+    <circle class="cls-1" cx="43.1159" cy="42.9654" r="9.18"/>
+  </g>
+  <g id="CIRCLE-2" data-name="CIRCLE">
+    <circle class="cls-1" cx="43.1099" cy="468.0841" r="9.18"/>
+  </g>
+  <g id="CIRCLE-3" data-name="CIRCLE">
+    <circle class="cls-1" cx="467.9405" cy="42.9654" r="9.18"/>
+  </g>
+  <g id="CIRCLE-4" data-name="CIRCLE">
+    <circle class="cls-1" cx="467.9465" cy="468.0841" r="9.18"/>
+  </g>
+  <g id="LWPOLYLINE">
+    <path class="cls-1" d="m341.982,89.854v242.2438h-172.6848v-57.4899c.6166-1.0021.6166-2.266,0-3.2681v-64.4799c.6166-1.0021.6166-2.266,0-3.2681v-113.7378h172.6848Z"/>
+  </g>
+  <g id="LWPOLYLINE-2" data-name="LWPOLYLINE">
+    <path class="cls-1" d="m.3543,82.2158l.0274,346.6102c.0118,45.1975,36.6366,81.8406,81.8341,81.8751l346.6112-.0274c45.1975-.0118,81.8406-36.6366,81.8751-81.8341l-.0274-346.6102c-.0118-45.1975-36.6366-81.8406-81.8341-81.8751l-346.6112.0274C37.0319.3935.3888,37.0184.3543,82.2158Z"/>
+  </g>
+</svg>
