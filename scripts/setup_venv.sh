@@ -494,7 +494,10 @@ if PI_MODEL="$(detect_pi_model)"; then
     SKIPPED_PIP_PICAMERA2_ON_PI=1
   fi
 
-  maybe_install_apt_packages "Pi camera + thermal + GUI stack" python3-picamera2 python3-pyqt5 libcamera-apps ffmpeg v4l-utils || true
+  maybe_install_apt_packages \
+    "Pi camera, GUI, and distributed-capture stack" \
+    python3-picamera2 python3-pyqt5 libcamera-apps ffmpeg v4l-utils \
+    chrony rsync openssh-client || true
   if [[ "$INSTALL_REALSENSE" -eq 1 ]]; then
     maybe_install_apt_packages "RealSense USB support" libusb-1.0-0 udev || true
   fi
@@ -611,6 +614,12 @@ if shutil.which("v4l2-ctl"):
     print("v4l2-ctl available on PATH.")
 else:
     print("Warning: v4l2-ctl not found on PATH. Thermal camera diagnostics work better with v4l-utils installed.")
+
+for command, purpose in (("ssh", "second-Pi control"), ("rsync", "resumable artifact transfer")):
+    if shutil.which(command):
+        print(f"{command} available on PATH.")
+    else:
+        print(f"Warning: {command} not found on PATH. It is required for {purpose}.")
 
 print("Main env smoke checks passed.")
 PY

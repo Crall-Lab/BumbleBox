@@ -73,7 +73,7 @@ Minimum Python packages:
 pip3 install pyyaml opencv-contrib-python pandas numpy
 ```
 
-On Raspberry Pi, install and enable the camera stack (`rpicam`/`libcamera` + `picamera2`) using Raspberry Pi OS package sources. MP4 recording also requires `ffmpeg`; thermal camera diagnostics work better with `v4l-utils`. `scripts/setup_venv.sh` now tries to install both automatically on Pi via `apt`, and also enables `loginctl linger` for the BumbleBox user so GUI-started user timers can continue after logout.
+On Raspberry Pi, install and enable the camera stack (`rpicam`/`libcamera` + `picamera2`) using Raspberry Pi OS package sources. MP4 recording also requires `ffmpeg`; thermal camera diagnostics work better with `v4l-utils`. `scripts/setup_venv.sh` installs those tools plus `chrony`, SSH, and `rsync` support for optional multi-Pi capture, and enables `loginctl linger` so GUI-started user timers can continue after logout.
 
 For nest labeling on Debian/Pi, prefer distro packages for Qt compatibility:
 
@@ -89,6 +89,8 @@ sudo apt install python3-pyqt5 labelme
 - USB thermal camera discovery/probe/snapshot path for PureThermal/Lepton-style devices (`thermal-check`, `thermal-snapshot`)
 - RealSense discovery, stream-profile probe, serial pinning, raw depth/color snapshots, and synchronized incremental recording (`realsense-check`, `realsense-snapshot`, `run-once`)
 - hardware-free RGB + thermal + RealSense integration recordings with a shared moving synchronization cue (`simulate-capture`)
+- optional two-Pi RGB, thermal, and RealSense capture with configurable assignments, prepare-and-arm coordination, clock/revision/storage preflight, distributed manifests, and resumable post-capture collection (`distributed-capture`)
+- shared-cue temporal offset and jitter analysis for RGB, thermal, and RealSense sessions (`distributed-capture analyze-sync`)
 - actionable OwlSight/OV64A40 connection diagnostics for chip-ID and CSI/I2C failures (`camera-check`)
 - versioned RGB + thermal + RealSense calibration projects and capture readiness checks (`calibration-project`)
 - conditional hardware profiles for RGB-only, RGB+thermal, RGB+depth, and full multimodal systems
@@ -121,14 +123,14 @@ sudo apt install python3-pyqt5 labelme
 
 ## Primary PyQt GUI
 
-`bbx gui` opens the new PyQt interface. On first launch, a profile-based wizard collects the primary camera, optional thermal/depth hardware, data location, run mode, and recording cadence. Thermal and RealSense setup pages are skipped when those devices are not selected.
+`bbx gui` opens the new PyQt interface. On first launch, a profile-based wizard collects the primary camera, optional thermal/depth hardware, data location, run mode, recording cadence, and optional second-Pi assignments. Thermal, RealSense, and distributed-capture pages are skipped when those capabilities are not selected.
 
 The current Qt pages are:
 
 - `Overview`: profile, camera, optional-device, and storage status
-- `Run`: one-shot runs and start/stop controls for automated recordings
-- `Results`: asynchronous run history with RGB, thermal, and RealSense status plus direct artifact access
-- `Hardware`: only the checks relevant to the selected hardware profile
+- `Run`: one-shot runs, start/stop controls for automated recordings, and optional two-Pi readiness checks
+- `Results`: asynchronous run history with RGB, thermal, RealSense, distributed-node status, timing analysis, and direct artifact access
+- `Hardware`: only the checks relevant to the selected hardware profile and assigned capture node
 - `Advanced`: multimodal calibration-project controls and access to existing specialized tools while their Qt pages are migrated
 
 Only one primary Qt GUI instance is allowed per user. During migration, run `bbx gui --legacy` to open the previous Tk advanced interface.
@@ -184,4 +186,5 @@ Only one primary Qt GUI instance is allowed per user. During migration, run `bbx
 - `/Users/aec/Desktop/BumbleBox/docs/Thermal_Camera.md`
 - `/Users/aec/Desktop/BumbleBox/docs/RealSense_Camera.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Multimodal_Calibration.md`
+- `/Users/aec/Desktop/BumbleBox/docs/Distributed_Capture.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Legacy_Function_Review.md`

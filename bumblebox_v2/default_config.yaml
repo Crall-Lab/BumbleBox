@@ -67,6 +67,33 @@ realsense:
   save_depth: true
   save_color: true
 
+# Optional coordinated capture across two or more Raspberry Pis. The controller
+# owns scheduling and the GUI; each node records only its assigned sensors.
+distributed_capture:
+  enabled: false
+  role: "standalone"
+  controller_node: "primary"
+  start_lead_seconds: 8.0
+  ready_timeout_seconds: 30.0
+  maximum_clock_offset_ms: 5.0
+  clock_samples: 5
+  failure_policy: "all_or_nothing"
+  transfer_after_capture: false
+  require_same_revision: true
+  nodes:
+    - name: "primary"
+      host: "localhost"
+      local: true
+      enabled: true
+      sensors:
+        - "rgb"
+        - "thermal"
+        - "realsense"
+      user: null
+      port: 22
+      repo_path: null
+      config_path: null
+
 pipeline:
   mode: "record_and_track"
   tracking_source: "ram"

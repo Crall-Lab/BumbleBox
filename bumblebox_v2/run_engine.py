@@ -239,6 +239,8 @@ class FrameTimestampRecord:
     time_s: float
     captured_monotonic_s: float
     captured_unix_s: float
+    sensor_timestamp_ns: Optional[int] = None
+    timestamp_source: str = "host_receive"
 
 
 def _now_iso() -> str:
@@ -258,11 +260,15 @@ def _build_timestamp_record(
     start_monotonic: float,
     captured_monotonic_s: float,
     monotonic_to_unix_offset_s: float,
+    sensor_timestamp_ns: Optional[int] = None,
+    timestamp_source: str = "host_receive",
 ) -> FrameTimestampRecord:
     return FrameTimestampRecord(
         time_s=float(captured_monotonic_s - start_monotonic),
         captured_monotonic_s=float(captured_monotonic_s),
         captured_unix_s=float(captured_monotonic_s + monotonic_to_unix_offset_s),
+        sensor_timestamp_ns=sensor_timestamp_ns,
+        timestamp_source=timestamp_source,
     )
 
 
@@ -341,20 +347,23 @@ def _write_timestamps(
     session_name: str,
     *,
     timestamp_records: Optional[List[FrameTimestampRecord]] = None,
+    node_name: Optional[str] = None,
 ) -> Path:
     path = session_dir / f"{session_name}_frame_timestamps.csv"
     with path.open("w") as f:
         f.write(
-            "frame,time_s,captured_monotonic_s,captured_unix_s,captured_iso_local,captured_iso_utc\n"
+            "frame,node,sensor,timestamp_source,time_s,captured_monotonic_s,captured_unix_s,sensor_timestamp_ns,captured_iso_local,captured_iso_utc\n"
         )
+        node = str(node_name or socket.gethostname())
         records = list(timestamp_records or [])
         for i, value in enumerate(timestamps):
             record = records[i] if i < len(records) else None
             if record is None:
-                f.write(f"{i},{value:.6f},,,,\n")
+                f.write(f"{i},{node},rgb,host_receive,{value:.6f},,,,,\n")
                 continue
             f.write(
-                f"{i},{record.time_s:.6f},{record.captured_monotonic_s:.6f},{record.captured_unix_s:.6f},"
+                f"{i},{node},rgb,{record.timestamp_source},{record.time_s:.6f},{record.captured_monotonic_s:.6f},{record.captured_unix_s:.6f},"
+                f"{record.sensor_timestamp_ns if record.sensor_timestamp_ns is not None else ''},"
                 f"{_to_iso_local(record.captured_unix_s)},{_to_iso_utc(record.captured_unix_s)}\n"
             )
     return path
@@ -366,20 +375,24 @@ def _write_named_timestamps(
     stem: str,
     *,
     timestamp_records: Optional[List[FrameTimestampRecord]] = None,
+    node_name: Optional[str] = None,
+    sensor_name: str = "thermal",
 ) -> Path:
     path = session_dir / f"{stem}.csv"
     with path.open("w") as f:
         f.write(
-            "frame,time_s,captured_monotonic_s,captured_unix_s,captured_iso_local,captured_iso_utc\n"
+            "frame,node,sensor,timestamp_source,time_s,captured_monotonic_s,captured_unix_s,sensor_timestamp_ns,captured_iso_local,captured_iso_utc\n"
         )
+        node = str(node_name or socket.gethostname())
         records = list(timestamp_records or [])
         for i, value in enumerate(timestamps):
             record = records[i] if i < len(records) else None
             if record is None:
-                f.write(f"{i},{value:.6f},,,,\n")
+                f.write(f"{i},{node},{sensor_name},host_receive,{value:.6f},,,,,\n")
                 continue
             f.write(
-                f"{i},{record.time_s:.6f},{record.captured_monotonic_s:.6f},{record.captured_unix_s:.6f},"
+                f"{i},{node},{sensor_name},{record.timestamp_source},{record.time_s:.6f},{record.captured_monotonic_s:.6f},{record.captured_unix_s:.6f},"
+                f"{record.sensor_timestamp_ns if record.sensor_timestamp_ns is not None else ''},"
                 f"{_to_iso_local(record.captured_unix_s)},{_to_iso_utc(record.captured_unix_s)}\n"
             )
     return path
@@ -470,13 +483,28 @@ def _capture_frames_from_started_picamera(
         now = time.perf_counter()
         expected = start + frame_index * target_interval
         if now >= expected:
-            yuv420 = picam2.capture_array()
+            sensor_timestamp_ns = None
+            capture_request = getattr(picam2, "capture_request", None)
+            if callable(capture_request):
+                request = capture_request()
+                try:
+                    yuv420 = request.make_array("main")
+                    metadata = request.get_metadata()
+                    raw_sensor_timestamp = metadata.get("SensorTimestamp")
+                    if raw_sensor_timestamp is not None:
+                        sensor_timestamp_ns = int(raw_sensor_timestamp)
+                finally:
+                    request.release()
+            else:
+                yuv420 = picam2.capture_array()
             captured_monotonic_s = time.perf_counter()
             frames.append(yuv420)
             record = _build_timestamp_record(
                 start_monotonic=start,
                 captured_monotonic_s=captured_monotonic_s,
                 monotonic_to_unix_offset_s=monotonic_to_unix_offset_s,
+                sensor_timestamp_ns=sensor_timestamp_ns,
+                timestamp_source=("sensor_and_host" if sensor_timestamp_ns is not None else "host_receive"),
             )
             timestamps.append(record.time_s)
             timestamp_records.append(record)
@@ -946,6 +974,9 @@ def _capture_rgb_and_optional_sensors(
     session_dir: Path,
     session_name: str,
     diagnostics: Optional[dict[str, Any]] = None,
+    start_monotonic_override: Optional[float] = None,
+    ready_callback: Optional[Any] = None,
+    capture_node_name: Optional[str] = None,
 ) -> Tuple[
     List[Any],
     List[float],
@@ -956,7 +987,11 @@ def _capture_rgb_and_optional_sensors(
 ]:
     thermal_enabled = _thermal_enabled_for_recording(config)
     realsense_enabled = _realsense_enabled_for_recording(config)
-    if not thermal_enabled and not realsense_enabled:
+    if (
+        not thermal_enabled
+        and not realsense_enabled
+        and start_monotonic_override is None
+    ):
         _progress_message("capture", "Preparing RGB capture.")
         frames, timestamps, actual_fps, timestamp_records = _capture_frames(
             config,
@@ -977,6 +1012,16 @@ def _capture_rgb_and_optional_sensors(
             active_streams.append("RealSense")
         sensor_label = "+".join(active_streams)
         _progress_message("capture", f"Preparing synchronized mock {sensor_label} capture.")
+        if ready_callback is not None:
+            ready_callback()
+        if start_monotonic_override is not None:
+            while time.perf_counter() < float(start_monotonic_override):
+                time.sleep(
+                    min(
+                        0.001,
+                        max(0.0, float(start_monotonic_override) - time.perf_counter()),
+                    )
+                )
         frames, timestamps, actual_fps, timestamp_records = _capture_frames(
             config,
             diagnostics=diagnostics,
@@ -1045,6 +1090,7 @@ def _capture_rgb_and_optional_sensors(
                 progress_callback=lambda completed, _total: progress.update(completed),
                 status_callback=lambda message: _progress_message("output", message),
                 depth_preview_progress_callback=update_depth_preview,
+                node_name=capture_node_name,
             )
             progress.finish(realsense_artifacts.frames_captured)
 
@@ -1176,6 +1222,7 @@ def _capture_rgb_and_optional_sensors(
                     config,
                     session_dir=session_dir,
                     session_name=session_name,
+                    node_name=capture_node_name,
                 )
             )
             if realsense_enabled
@@ -1187,7 +1234,13 @@ def _capture_rgb_and_optional_sensors(
         _flush_rgb_capture_queue(rgb_session.picam2, SYNC_CAPTURE_FLUSH_FRAMES)
         if thermal_session is not None:
             _flush_thermal_capture_queue(thermal_session.capture, SYNC_CAPTURE_FLUSH_FRAMES)
-        start_monotonic = time.perf_counter() + SYNC_CAPTURE_START_DELAY_SECONDS
+        start_monotonic = (
+            float(start_monotonic_override)
+            if start_monotonic_override is not None
+            else time.perf_counter() + SYNC_CAPTURE_START_DELAY_SECONDS
+        )
+        if ready_callback is not None:
+            ready_callback()
         _progress_message(
             "capture",
             f"Starting {len(active_streams)} streams from one host deadline for {duration:.1f}s.",
@@ -1233,6 +1286,7 @@ def _write_thermal_recording_outputs(
     actual_fps: float,
     raw16_layout: str,
     timestamp_records: Optional[List[FrameTimestampRecord]] = None,
+    node_name: Optional[str] = None,
 ) -> ThermalRecordingArtifacts:
     try:
         import cv2
@@ -1253,6 +1307,8 @@ def _write_thermal_recording_outputs(
         session_dir,
         f"{session_name}_thermal_frame_timestamps",
         timestamp_records=timestamp_records,
+        node_name=node_name,
+        sensor_name="thermal",
     ) if timestamps else None
 
     min_value = int(stack.min())
@@ -2495,8 +2551,35 @@ def _run_fps_report_if_needed(
         return None
 
 
-def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> RunSummary:
+def run_once(
+    config: Dict[str, Any],
+    mode_override: Optional[str] = None,
+    *,
+    session_name_override: Optional[str] = None,
+    session_dir_override: Optional[str | Path] = None,
+    capture_start_unix_ns: Optional[int] = None,
+    capture_ready_callback: Optional[Any] = None,
+    sensor_names_override: Optional[List[str]] = None,
+    capture_node_name: Optional[str] = None,
+) -> RunSummary:
     config = apply_camera_profile(config)
+    if sensor_names_override is not None:
+        assigned_sensors = {
+            str(sensor).strip().lower() for sensor in sensor_names_override
+        }
+        unknown_sensors = assigned_sensors - {"rgb", "thermal", "realsense"}
+        if unknown_sensors:
+            raise ValueError(
+                "Unknown capture sensor assignment(s): "
+                + ", ".join(sorted(unknown_sensors))
+            )
+        if "rgb" not in assigned_sensors:
+            raise ValueError(
+                "run_once requires the RGB sensor. Sensor-only distributed nodes use "
+                "the capture-node runner instead."
+            )
+        config.setdefault("thermal", {})["enabled"] = "thermal" in assigned_sensors
+        config.setdefault("realsense", {})["enabled"] = "realsense" in assigned_sensors
     ir_error = validate_camera_ir_compatibility(config)
     if ir_error:
         raise ValueError(ir_error)
@@ -2518,7 +2601,23 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     if mode not in {"record_only", "track_only", "record_and_track"}:
         raise ValueError(f"Unsupported run mode: {mode}")
 
-    session_name, session_dir = _make_session_paths(config)
+    if session_name_override is None and session_dir_override is None:
+        session_name, session_dir = _make_session_paths(config)
+    else:
+        session_name = str(session_name_override or "").strip()
+        if not session_name:
+            raise ValueError("session_name_override must be set with session_dir_override")
+        if session_dir_override is None:
+            data_root = Path(config["system"]["data_root"])
+            session_dir = data_root / datetime.now().strftime("%Y-%m-%d") / session_name
+        else:
+            session_dir = Path(session_dir_override).expanduser()
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+    capture_start_monotonic: Optional[float] = None
+    if capture_start_unix_ns is not None:
+        remaining_seconds = (int(capture_start_unix_ns) - time.time_ns()) / 1_000_000_000.0
+        capture_start_monotonic = time.perf_counter() + max(0.0, remaining_seconds)
     hostname = socket.gethostname()
     camera_cfg = config.get("camera", {}) if isinstance(config.get("camera", {}), dict) else {}
     camera_profile = configured_profile_name(config)
@@ -2569,7 +2668,9 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                 _thermal_enabled_for_recording(config)
                 or _realsense_enabled_for_recording(config)
             )
-            if should_record and optional_sensor_recording:
+            if should_record and (
+                optional_sensor_recording or capture_start_monotonic is not None
+            ):
                 if _thermal_enabled_for_recording(config):
                     thermal_cfg = config.get("thermal", {})
                     try:
@@ -2595,6 +2696,9 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                     session_dir=session_dir,
                     session_name=session_name,
                     diagnostics=capture_diagnostics,
+                    start_monotonic_override=capture_start_monotonic,
+                    ready_callback=capture_ready_callback,
+                    capture_node_name=capture_node_name,
                 )
                 if thermal_capture is not None:
                     thermal_artifacts = _write_thermal_recording_outputs(
@@ -2606,6 +2710,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                         actual_fps=float(thermal_capture["actual_fps"]),
                         raw16_layout=str(thermal_capture["raw16_layout"]),
                         timestamp_records=list(thermal_capture.get("timestamp_records") or []),
+                        node_name=capture_node_name,
                     )
                     if thermal_artifacts.frames_captured != len(frames):
                         warnings.append(
@@ -2657,6 +2762,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                 session_dir,
                 session_name,
                 timestamp_records=timestamp_records,
+                node_name=capture_node_name,
             )
             _progress_message("output", "RGB frame timestamps are complete.")
 

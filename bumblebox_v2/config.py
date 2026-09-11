@@ -54,6 +54,9 @@ VALID_UI_THEME_MODES = {"dark", "light"}
 VALID_ARUCO_TAG_DICTIONARIES = {"4X4_50", "4X4_100", "4X4_250", "4X4_1000"}
 VALID_HARDWARE_PROFILES = set(hardware_profile_choices())
 VALID_REALSENSE_ALIGN_TARGETS = {"none", "color", "depth"}
+VALID_DISTRIBUTED_CAPTURE_ROLES = {"standalone", "controller", "worker"}
+VALID_DISTRIBUTED_CAPTURE_SENSORS = {"rgb", "thermal", "realsense"}
+VALID_DISTRIBUTED_FAILURE_POLICIES = {"all_or_nothing", "continue_available"}
 SERVICE_USER_AUTO_SENTINELS = {"", "auto", "current", "default", "pi", "root"}
 
 
@@ -137,6 +140,7 @@ def validate_config(config: Dict[str, Any]) -> None:
             "camera",
             "thermal",
             "realsense",
+            "distributed_capture",
             "pipeline",
             "capture",
             "tracking",
@@ -531,6 +535,133 @@ def validate_config(config: Dict[str, Any]) -> None:
     for key in ("save_depth", "save_color"):
         if not isinstance(realsense.get(key, True), bool):
             raise ConfigError(f"realsense.{key} must be true or false")
+
+    distributed = config.get("distributed_capture", {})
+    if not isinstance(distributed, dict):
+        raise ConfigError("distributed_capture must be a mapping/object")
+    distributed_enabled = distributed.get("enabled", False)
+    if not isinstance(distributed_enabled, bool):
+        raise ConfigError("distributed_capture.enabled must be true or false")
+    distributed_role = str(distributed.get("role", "standalone")).strip().lower()
+    if distributed_role not in VALID_DISTRIBUTED_CAPTURE_ROLES:
+        raise ConfigError(
+            "distributed_capture.role must be one of "
+            f"{sorted(VALID_DISTRIBUTED_CAPTURE_ROLES)}, got: {distributed_role}"
+        )
+    failure_policy = str(
+        distributed.get("failure_policy", "all_or_nothing")
+    ).strip().lower()
+    if failure_policy not in VALID_DISTRIBUTED_FAILURE_POLICIES:
+        raise ConfigError(
+            "distributed_capture.failure_policy must be one of "
+            f"{sorted(VALID_DISTRIBUTED_FAILURE_POLICIES)}, got: {failure_policy}"
+        )
+    for key, minimum, default in (
+        ("start_lead_seconds", 0.1, 8.0),
+        ("ready_timeout_seconds", 1.0, 30.0),
+        ("maximum_clock_offset_ms", 0.0, 5.0),
+    ):
+        try:
+            value = float(distributed.get(key, default))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"distributed_capture.{key} must be numeric") from exc
+        if value < minimum:
+            raise ConfigError(f"distributed_capture.{key} must be >= {minimum}")
+    try:
+        clock_samples = int(distributed.get("clock_samples", 5))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("distributed_capture.clock_samples must be an integer") from exc
+    if clock_samples <= 0:
+        raise ConfigError("distributed_capture.clock_samples must be > 0")
+    for key in ("transfer_after_capture", "require_same_revision"):
+        if not isinstance(distributed.get(key, key == "require_same_revision"), bool):
+            raise ConfigError(f"distributed_capture.{key} must be true or false")
+
+    distributed_nodes = distributed.get("nodes", [])
+    if not isinstance(distributed_nodes, list):
+        raise ConfigError("distributed_capture.nodes must be a list")
+    node_names: set[str] = set()
+    local_nodes: list[str] = []
+    sensor_owners: dict[str, str] = {}
+    for index, node in enumerate(distributed_nodes):
+        prefix = f"distributed_capture.nodes[{index}]"
+        if not isinstance(node, dict):
+            raise ConfigError(f"{prefix} must be a mapping/object")
+        name = str(node.get("name", "")).strip()
+        if not name:
+            raise ConfigError(f"{prefix}.name must be set")
+        if name in node_names:
+            raise ConfigError(f"distributed_capture node name is duplicated: {name}")
+        node_names.add(name)
+        enabled = node.get("enabled", True)
+        local = node.get("local", False)
+        if not isinstance(enabled, bool):
+            raise ConfigError(f"{prefix}.enabled must be true or false")
+        if not isinstance(local, bool):
+            raise ConfigError(f"{prefix}.local must be true or false")
+        host = str(node.get("host", "")).strip()
+        if enabled and not host:
+            raise ConfigError(f"{prefix}.host must be set")
+        try:
+            port = int(node.get("port", 22))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{prefix}.port must be an integer") from exc
+        if port <= 0:
+            raise ConfigError(f"{prefix}.port must be > 0")
+        for path_key in ("repo_path", "config_path", "data_root"):
+            path_value = node.get(path_key)
+            if path_value is not None and not isinstance(path_value, str):
+                raise ConfigError(f"{prefix}.{path_key} must be null or a string")
+        user_value = node.get("user")
+        if user_value is not None and not isinstance(user_value, str):
+            raise ConfigError(f"{prefix}.user must be null or a string")
+        sensors = node.get("sensors", [])
+        if not isinstance(sensors, list):
+            raise ConfigError(f"{prefix}.sensors must be a list")
+        normalized_sensors = [str(sensor).strip().lower() for sensor in sensors]
+        unknown = set(normalized_sensors) - VALID_DISTRIBUTED_CAPTURE_SENSORS
+        if unknown:
+            raise ConfigError(
+                f"{prefix}.sensors contains unsupported values: {sorted(unknown)}"
+            )
+        if len(normalized_sensors) != len(set(normalized_sensors)):
+            raise ConfigError(f"{prefix}.sensors contains duplicate values")
+        if enabled:
+            if local:
+                local_nodes.append(name)
+            for sensor in normalized_sensors:
+                if sensor in sensor_owners:
+                    raise ConfigError(
+                        f"distributed sensor '{sensor}' is assigned to both "
+                        f"{sensor_owners[sensor]} and {name}"
+                    )
+                sensor_owners[sensor] = name
+
+    if distributed_enabled:
+        if distributed_role == "standalone":
+            raise ConfigError(
+                "distributed_capture.enabled=true requires role='controller' or role='worker'"
+            )
+        if distributed_role == "controller" and len(local_nodes) != 1:
+            raise ConfigError(
+                "distributed capture requires exactly one enabled node with local=true"
+            )
+        controller_node = str(distributed.get("controller_node", "")).strip()
+        if distributed_role == "controller" and controller_node not in local_nodes:
+            raise ConfigError(
+                "distributed_capture.controller_node must name the enabled local node"
+            )
+        required_sensors = {"rgb"}
+        if thermal_enabled:
+            required_sensors.add("thermal")
+        if bool(realsense.get("enabled", False)):
+            required_sensors.add("realsense")
+        missing_sensors = required_sensors - set(sensor_owners)
+        if distributed_role == "controller" and missing_sensors:
+            raise ConfigError(
+                "distributed capture has no enabled node assignment for: "
+                + ", ".join(sorted(missing_sensors))
+            )
 
     ram_override = config["system"].get("ram_gb_override")
     if ram_override not in (None, "", 0):

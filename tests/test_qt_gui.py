@@ -17,6 +17,7 @@ try:
     from bumblebox_v2.qt_gui import (
         BumbleBoxQtGUI,
         BumbleBoxSetupWizard,
+        PAGE_DISTRIBUTED,
         PAGE_EXPERIMENT,
         PAGE_THERMAL,
     )
@@ -52,6 +53,13 @@ class QtGuiTests(unittest.TestCase):
                 self.assertEqual(wizard.rgb_page.nextId(), PAGE_THERMAL)
                 self.assertTrue(wizard.uses_thermal())
                 self.assertTrue(wizard.uses_realsense())
+
+                wizard.hardware_page.second_pi.setChecked(True)
+                self.assertTrue(wizard.uses_second_pi())
+                self.assertEqual(wizard.realsense_page.nextId(), PAGE_DISTRIBUTED)
+                self.assertEqual(
+                    wizard.distributed_page.realsense_location.currentData(), "worker"
+                )
             finally:
                 wizard.close()
                 window.close()

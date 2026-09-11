@@ -108,7 +108,7 @@ When `realsense.enabled: true`, each recording session includes:
 - `*_realsense_frame_timestamps.csv`: host arrival clocks, device clocks, timestamp domains, and frame numbers
 - `*_realsense_metadata.json`: profiles, depth scale, observed FPS, ranges, paths, and frame-number gaps
 
-OwlSight/HQ, thermal, and RealSense workers wait on the same host monotonic start deadline. This makes their host timestamps directly comparable, but does not imply simultaneous exposure: each camera and driver still has its own buffering and transport latency.
+On one Pi, OwlSight/HQ, thermal, and RealSense workers wait on the same host monotonic start deadline. In optional two-Pi mode they prepare independently and wait for one shared UTC deadline, after a clock-offset preflight. Timestamp rows identify their node and source clock. Neither mode implies simultaneous exposure: each camera and driver still has its own buffering and transport latency. See `docs/Distributed_Capture.md` for the distributed protocol and shared-cue validation workflow.
 
 ## Hardware-Free Integration Test
 

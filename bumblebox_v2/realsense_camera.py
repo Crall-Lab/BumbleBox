@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import socket
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -328,9 +329,15 @@ def _iso_utc(unix_seconds: float) -> str:
     return datetime.fromtimestamp(float(unix_seconds), tz=timezone.utc).isoformat(timespec="milliseconds")
 
 
-def _write_recording_timestamps(path: Path, records: list[dict[str, Any]]) -> None:
+def _write_recording_timestamps(
+    path: Path,
+    records: list[dict[str, Any]],
+    *,
+    node_name: Optional[str] = None,
+) -> None:
+    node = str(node_name or socket.gethostname())
     header = (
-        "frame,time_s,host_receive_monotonic_s,host_receive_unix_s,"
+        "frame,node,sensor,timestamp_source,time_s,host_receive_monotonic_s,host_receive_unix_s,"
         "host_receive_iso_local,host_receive_iso_utc,depth_device_timestamp_ms,"
         "color_device_timestamp_ms,depth_frame_number,color_frame_number,"
         "depth_timestamp_domain,color_timestamp_domain\n"
@@ -340,7 +347,7 @@ def _write_recording_timestamps(path: Path, records: list[dict[str, Any]]) -> No
         for index, record in enumerate(records):
             unix_seconds = float(record["host_receive_unix_seconds"])
             handle.write(
-                f"{index},{float(record['time_s']):.6f},"
+                f"{index},{node},realsense,device_and_host,{float(record['time_s']):.6f},"
                 f"{float(record['host_receive_monotonic_seconds']):.6f},"
                 f"{unix_seconds:.6f},{_iso_local(unix_seconds)},{_iso_utc(unix_seconds)},"
                 f"{float(record['depth_device_timestamp_ms']):.6f},"
@@ -418,6 +425,7 @@ def capture_simulated_realsense_recording(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
     depth_preview_progress_callback: Optional[Callable[[int, int], None]] = None,
+    node_name: Optional[str] = None,
 ) -> RealSenseRecordingResult:
     """Generate RealSense-compatible artifacts on a shared synthetic timeline."""
     try:
@@ -527,7 +535,7 @@ def capture_simulated_realsense_recording(
         if color_writer is not None:
             color_writer.release()
 
-    _write_recording_timestamps(timestamp_path, records)
+    _write_recording_timestamps(timestamp_path, records, node_name=node_name)
     actual_fps = fps
 
     depth_video_path: Optional[Path] = None
@@ -611,6 +619,7 @@ class RealSenseRecordingSession:
         *,
         session_dir: str | Path,
         session_name: str,
+        node_name: Optional[str] = None,
     ) -> None:
         try:
             import cv2
@@ -625,6 +634,7 @@ class RealSenseRecordingSession:
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.session_name = str(session_name)
+        self.node_name = str(node_name or socket.gethostname())
         section = config.get("realsense", {})
         self.save_depth = bool(section.get("save_depth", True))
         self.save_color = bool(section.get("save_color", True))
@@ -922,7 +932,7 @@ class RealSenseRecordingSession:
             if elapsed > 0 and len(records) > 1
             else float(len(records)) / max(duration, 1e-6)
         )
-        _write_recording_timestamps(timestamp_path, records)
+        _write_recording_timestamps(timestamp_path, records, node_name=self.node_name)
 
         depth_video_path: Optional[Path] = None
         depth_png_path: Optional[Path] = None

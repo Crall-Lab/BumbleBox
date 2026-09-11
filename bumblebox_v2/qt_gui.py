@@ -82,8 +82,9 @@ PAGE_HARDWARE = 1
 PAGE_RGB = 2
 PAGE_THERMAL = 3
 PAGE_REALSENSE = 4
-PAGE_EXPERIMENT = 5
-PAGE_SUMMARY = 6
+PAGE_DISTRIBUTED = 5
+PAGE_EXPERIMENT = 6
+PAGE_SUMMARY = 7
 
 
 APP_STYLE = """
@@ -510,8 +511,11 @@ class HardwarePage(QWizardPage):
         self.thermal.setChecked(bool(config.get("thermal", {}).get("enabled", False)))
         self.realsense = QCheckBox("Use a RealSense depth camera")
         self.realsense.setChecked(bool(config.get("realsense", {}).get("enabled", False)))
+        self.second_pi = QCheckBox("Use a second Raspberry Pi for simultaneous capture")
+        self.second_pi.setChecked(bool(config.get("distributed_capture", {}).get("enabled", False)))
         layout.addWidget(self.thermal)
         layout.addWidget(self.realsense)
+        layout.addWidget(self.second_pi)
         layout.addStretch(1)
         self.profile.currentIndexChanged.connect(self._profile_changed)
         self._profile_changed()
@@ -573,7 +577,7 @@ class RgbPage(QWizardPage):
             return PAGE_THERMAL
         if wizard.uses_realsense():
             return PAGE_REALSENSE
-        return PAGE_EXPERIMENT
+        return PAGE_DISTRIBUTED if wizard.uses_second_pi() else PAGE_EXPERIMENT
 
 
 class ThermalPage(QWizardPage):
@@ -598,7 +602,9 @@ class ThermalPage(QWizardPage):
         form.addRow("Height", self.height)
 
     def nextId(self) -> int:
-        return PAGE_REALSENSE if self.wizard().uses_realsense() else PAGE_EXPERIMENT
+        if self.wizard().uses_realsense():
+            return PAGE_REALSENSE
+        return PAGE_DISTRIBUTED if self.wizard().uses_second_pi() else PAGE_EXPERIMENT
 
 
 class RealSensePage(QWizardPage):
@@ -637,7 +643,121 @@ class RealSensePage(QWizardPage):
         form.addRow("Frames per second", self.fps)
 
     def nextId(self) -> int:
+        return PAGE_DISTRIBUTED if self.wizard().uses_second_pi() else PAGE_EXPERIMENT
+
+
+class DistributedCapturePage(QWizardPage):
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__()
+        self.setTitle("Configure the second capture Pi")
+        self.setSubTitle(
+            "Each camera records locally. Both Pis prepare first, then begin from one shared UTC deadline."
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 14)
+        layout.setSpacing(12)
+        distributed = config.get("distributed_capture", {})
+        remote = next(
+            (item for item in distributed.get("nodes", []) if not bool(item.get("local", False))),
+            {},
+        )
+        fleet_ssh = config.get("fleet", {}).get("ssh", {})
+        default_user = str(remote.get("user") or fleet_ssh.get("user") or "pi")
+
+        connection = QFormLayout()
+        connection.setHorizontalSpacing(18)
+        connection.setVerticalSpacing(10)
+        self.host = QLineEdit(str(remote.get("host") or "bumblebox-02.local"))
+        self.user = QLineEdit(default_user)
+        self.repo_path = QLineEdit(
+            str(remote.get("repo_path") or f"/home/{default_user}/Desktop/BumbleBox")
+        )
+        self.config_path = QLineEdit(
+            str(
+                remote.get("config_path")
+                or f"/home/{default_user}/Desktop/BumbleBox/bumblebox_v2/config.yaml"
+            )
+        )
+        self.data_root = QLineEdit(
+            str(remote.get("data_root") or f"/home/{default_user}/Desktop/BumbleBoxData")
+        )
+        connection.addRow("Second Pi hostname or IP", self.host)
+        connection.addRow("SSH username", self.user)
+        connection.addRow("BumbleBox repository", self.repo_path)
+        connection.addRow("Worker config file", self.config_path)
+        connection.addRow("Worker data folder", self.data_root)
+        layout.addLayout(connection)
+
+        assignments = QGroupBox("Camera assignments")
+        assignment_form = QFormLayout(assignments)
+        assignment_form.setHorizontalSpacing(18)
+        current_owners = {}
+        for item in distributed.get("nodes", []):
+            owner = "primary" if bool(item.get("local", False)) else "worker"
+            for sensor in item.get("sensors", []):
+                current_owners[str(sensor).lower()] = owner
+
+        has_saved_remote = bool(remote)
+
+        def location_combo(sensor: str, default_owner: str = "primary") -> QComboBox:
+            combo = QComboBox()
+            combo.addItem("Primary Pi", "primary")
+            combo.addItem("Second Pi", "worker")
+            owner = current_owners.get(sensor, default_owner) if has_saved_remote else default_owner
+            _set_combo_data(combo, owner)
+            return combo
+
+        self.rgb_location = location_combo("rgb")
+        self.thermal_location = location_combo("thermal")
+        self.realsense_location = location_combo("realsense", "worker")
+        assignment_form.addRow("RGB / OwlSight", self.rgb_location)
+        assignment_form.addRow("Thermal", self.thermal_location)
+        assignment_form.addRow("RealSense", self.realsense_location)
+        layout.addWidget(assignments)
+        self.transfer_after_capture = QCheckBox(
+            "Copy second-Pi outputs back to the primary Pi after each recording"
+        )
+        self.transfer_after_capture.setChecked(bool(distributed.get("transfer_after_capture", False)))
+        layout.addWidget(self.transfer_after_capture)
+        note = QLabel(
+            "Recommended first layout: OwlSight RGB + thermal on the primary Pi, RealSense on the second Pi. "
+            "You can change any assignment later without changing recording commands."
+        )
+        note.setObjectName("Hint")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch(1)
+
+    def initializePage(self) -> None:
+        wizard = self.wizard()
+        self.thermal_location.setEnabled(wizard.uses_thermal())
+        self.realsense_location.setEnabled(wizard.uses_realsense())
+
+    def nextId(self) -> int:
         return PAGE_EXPERIMENT
+
+    def validatePage(self) -> bool:
+        if not self.host.text().strip() or not self.user.text().strip():
+            QMessageBox.warning(
+                self,
+                "Second Pi details required",
+                "Enter the second Pi hostname/IP and SSH username.",
+            )
+            return False
+        wizard = self.wizard()
+        locations = [str(self.rgb_location.currentData())]
+        if wizard.uses_thermal():
+            locations.append(str(self.thermal_location.currentData()))
+        if wizard.uses_realsense():
+            locations.append(str(self.realsense_location.currentData()))
+        if "worker" not in locations:
+            QMessageBox.warning(
+                self,
+                "No camera assigned to second Pi",
+                "Assign at least one enabled camera to the second Pi, or go back and disable two-Pi capture.",
+            )
+            return False
+        return True
 
 
 class ExperimentPage(QWizardPage):
@@ -716,10 +836,19 @@ class SummaryPage(QWizardPage):
             optional.append("PureThermal / Lepton")
         if wizard.uses_realsense():
             optional.append("RealSense depth")
+        capture_layout = "One Pi"
+        if wizard.uses_second_pi():
+            capture_layout = (
+                "Two Pis; "
+                f"RGB={wizard.distributed_page.rgb_location.currentText()}, "
+                f"thermal={wizard.distributed_page.thermal_location.currentText() if wizard.uses_thermal() else 'off'}, "
+                f"depth={wizard.distributed_page.realsense_location.currentText() if wizard.uses_realsense() else 'off'}"
+            )
         self.summary.setText(
             f"<b>Hardware profile:</b> {hardware}<br>"
             f"<b>Primary camera:</b> {camera}<br>"
             f"<b>Optional devices:</b> {', '.join(optional) if optional else 'None'}<br>"
+            f"<b>Capture layout:</b> {capture_layout}<br>"
             f"<b>Colony:</b> {wizard.experiment_page.colony.text().strip()}<br>"
             f"<b>Data folder:</b> {wizard.experiment_page.data_root.text().strip()}<br>"
             f"<b>Run mode:</b> {wizard.experiment_page.mode.currentData()}"
@@ -745,6 +874,7 @@ class BumbleBoxSetupWizard(QWizard):
         self.rgb_page = RgbPage(config)
         self.thermal_page = ThermalPage(config)
         self.realsense_page = RealSensePage(config)
+        self.distributed_page = DistributedCapturePage(config)
         self.experiment_page = ExperimentPage(config)
         self.summary_page = SummaryPage()
         self.setPage(PAGE_WELCOME, self.welcome_page)
@@ -752,6 +882,7 @@ class BumbleBoxSetupWizard(QWizard):
         self.setPage(PAGE_RGB, self.rgb_page)
         self.setPage(PAGE_THERMAL, self.thermal_page)
         self.setPage(PAGE_REALSENSE, self.realsense_page)
+        self.setPage(PAGE_DISTRIBUTED, self.distributed_page)
         self.setPage(PAGE_EXPERIMENT, self.experiment_page)
         self.setPage(PAGE_SUMMARY, self.summary_page)
         self.setStartId(PAGE_WELCOME)
@@ -763,6 +894,9 @@ class BumbleBoxSetupWizard(QWizard):
 
     def uses_realsense(self) -> bool:
         return self.hardware_page.realsense.isChecked()
+
+    def uses_second_pi(self) -> bool:
+        return self.hardware_page.second_pi.isChecked()
 
     def accept(self) -> None:
         profile_key = str(self.hardware_page.profile.currentData())
@@ -789,6 +923,57 @@ class BumbleBoxSetupWizard(QWizard):
         realsense["color_width"] = self.realsense_page.color_width.value()
         realsense["color_height"] = self.realsense_page.color_height.value()
         realsense["fps"] = self.realsense_page.fps.value()
+
+        distributed = updated.setdefault("distributed_capture", {})
+        distributed["enabled"] = self.uses_second_pi()
+        distributed["role"] = "controller" if self.uses_second_pi() else "standalone"
+        distributed["controller_node"] = "primary"
+        distributed["transfer_after_capture"] = self.distributed_page.transfer_after_capture.isChecked()
+        primary_sensors = []
+        worker_sensors = []
+        locations = {"rgb": str(self.distributed_page.rgb_location.currentData())}
+        if self.uses_thermal():
+            locations["thermal"] = str(self.distributed_page.thermal_location.currentData())
+        if self.uses_realsense():
+            locations["realsense"] = str(self.distributed_page.realsense_location.currentData())
+        for sensor, owner in locations.items():
+            (worker_sensors if owner == "worker" else primary_sensors).append(sensor)
+        if not self.uses_second_pi():
+            primary_sensors = list(locations)
+        worker_user = self.distributed_page.user.text().strip() or "pi"
+        distributed["nodes"] = [
+            {
+                "name": "primary",
+                "host": "localhost",
+                "local": True,
+                "enabled": True,
+                "sensors": primary_sensors,
+                "user": None,
+                "port": 22,
+                "repo_path": None,
+                "config_path": None,
+                "data_root": None,
+            }
+        ]
+        had_remote_node = any(
+            not bool(node.get("local", False))
+            for node in self.config.get("distributed_capture", {}).get("nodes", [])
+        )
+        if self.uses_second_pi() or had_remote_node:
+            distributed["nodes"].append(
+                {
+                    "name": "worker",
+                    "host": self.distributed_page.host.text().strip(),
+                    "local": False,
+                    "enabled": self.uses_second_pi(),
+                    "sensors": worker_sensors,
+                    "user": worker_user,
+                    "port": 22,
+                    "repo_path": self.distributed_page.repo_path.text().strip() or None,
+                    "config_path": self.distributed_page.config_path.text().strip() or None,
+                    "data_root": self.distributed_page.data_root.text().strip() or None,
+                }
+            )
 
         updated.setdefault("system", {})["colony_id"] = self.experiment_page.colony.text().strip() or "01"
         updated["system"]["data_root"] = self.experiment_page.data_root.text().strip()
@@ -998,6 +1183,27 @@ class BumbleBoxQtGUI(QMainWindow):
         automation_layout.addLayout(buttons)
         layout.addWidget(automation)
 
+        self.distributed_run_group = QGroupBox("Two-Pi capture readiness")
+        self.distributed_run_group.setProperty("tone", "sky")
+        distributed_layout = QHBoxLayout(self.distributed_run_group)
+        self.distributed_run_status = QLabel()
+        self.distributed_run_status.setWordWrap(True)
+        distributed_check = QPushButton("Check Both Pis")
+        distributed_check.setObjectName("Quiet")
+        distributed_check.clicked.connect(
+            lambda: self.run_bbx_command(["distributed-capture", "check"])
+        )
+        distributed_hardware_check = QPushButton("Check All Assigned Cameras")
+        distributed_hardware_check.clicked.connect(
+            lambda: self.run_bbx_command(
+                ["distributed-capture", "check", "--probe-hardware"]
+            )
+        )
+        distributed_layout.addWidget(self.distributed_run_status, 1)
+        distributed_layout.addWidget(distributed_check)
+        distributed_layout.addWidget(distributed_hardware_check)
+        layout.addWidget(self.distributed_run_group)
+
         latest = QGroupBox("Latest recording")
         latest.setProperty("tone", "sky")
         latest_layout = QVBoxLayout(latest)
@@ -1085,6 +1291,7 @@ class BumbleBoxQtGUI(QMainWindow):
             ("depth_color", "Open RealSense Color", "realsense_color_video_path"),
             ("depth_data", "Open Depth Data Folder", "realsense_raw_depth_npy_path"),
             ("metadata", "Open RealSense Metadata", "realsense_metadata_json_path"),
+            ("manifest", "Open Multi-Pi Manifest", "distributed_manifest_path"),
         )
         self.result_artifact_buttons: dict[str, tuple[QPushButton, str]] = {}
         for index, (key, label, payload_key) in enumerate(button_specs):
@@ -1107,7 +1314,15 @@ class BumbleBoxQtGUI(QMainWindow):
         )
         self.result_add_calibration_button.clicked.connect(self._add_selected_run_to_calibration)
         self.result_add_calibration_button.setEnabled(False)
-        artifact_buttons.addWidget(self.result_add_calibration_button, 2, 1)
+        artifact_buttons.addWidget(self.result_add_calibration_button, 2, 2)
+        self.result_sync_analysis_button = QPushButton("Analyze Shared Timing Cue")
+        self.result_sync_analysis_button.setObjectName("Quiet")
+        self.result_sync_analysis_button.setToolTip(
+            "Estimate thermal and depth offset/jitter from a recording with a shared moving or occlusion cue."
+        )
+        self.result_sync_analysis_button.clicked.connect(self._analyze_selected_run_sync)
+        self.result_sync_analysis_button.setEnabled(False)
+        artifact_buttons.addWidget(self.result_sync_analysis_button, 3, 0)
         selected_layout.addLayout(artifact_buttons)
         layout.addWidget(selected)
         return page
@@ -1159,6 +1374,19 @@ class BumbleBoxQtGUI(QMainWindow):
         depth_buttons.addWidget(depth_snapshot)
         depth_buttons.addStretch(1)
         layout.addWidget(self.realsense_group)
+
+        self.distributed_hardware_group = QGroupBox("Second Raspberry Pi")
+        self.distributed_hardware_group.setProperty("tone", "mint")
+        distributed_buttons = QHBoxLayout(self.distributed_hardware_group)
+        self.distributed_hardware_label = QLabel()
+        self.distributed_hardware_label.setWordWrap(True)
+        distributed_check = QPushButton("Check Two-Pi Connection")
+        distributed_check.clicked.connect(
+            lambda: self.run_bbx_command(["distributed-capture", "check"])
+        )
+        distributed_buttons.addWidget(self.distributed_hardware_label, 1)
+        distributed_buttons.addWidget(distributed_check)
+        layout.addWidget(self.distributed_hardware_group)
         change = QPushButton("Change Hardware Profile")
         change.setObjectName("Quiet")
         change.clicked.connect(self.open_setup_wizard)
@@ -1328,6 +1556,17 @@ class BumbleBoxQtGUI(QMainWindow):
                 f"{self._format_optional_fps(payload.get('realsense_actual_fps'))} fps; "
                 f"scale {payload.get('realsense_depth_scale_meters') or 'n/a'} m/unit"
             )
+        distributed = payload.get("distributed_capture")
+        distributed_status = "disabled"
+        if isinstance(distributed, dict) and bool(distributed.get("enabled", False)):
+            nodes = distributed.get("nodes", {})
+            successful = sum(
+                1 for item in nodes.values() if isinstance(item, dict) and bool(item.get("success"))
+            ) if isinstance(nodes, dict) else 0
+            distributed_status = (
+                f"plan {distributed.get('plan_id') or 'unknown'}; "
+                f"{successful}/{len(nodes) if isinstance(nodes, dict) else 0} nodes successful"
+            )
         return "\n".join(
             (
                 f"Session: {payload.get('session_name') or 'unknown'}",
@@ -1338,6 +1577,7 @@ class BumbleBoxQtGUI(QMainWindow):
                 f"{self._format_optional_fps(payload.get('actual_fps'))} fps",
                 f"Thermal: {thermal_status}",
                 f"RealSense: {depth_status}",
+                f"Distributed capture: {distributed_status}",
                 f"Warnings: {warning_count} | Errors: {error_count}",
             )
         )
@@ -1348,6 +1588,16 @@ class BumbleBoxQtGUI(QMainWindow):
         summary_available = self._run_artifact_path(payload, "_summary_path") is not None
         self.result_add_calibration_button.setEnabled(
             summary_available and self._configured_calibration_project() is not None
+        )
+        self.result_sync_analysis_button.setEnabled(summary_available)
+
+    def _analyze_selected_run_sync(self) -> None:
+        summary = self._run_artifact_path(self._selected_run_payload, "_summary_path")
+        if summary is None:
+            QMessageBox.warning(self, "Run summary unavailable", "Select a locally available recording first.")
+            return
+        self.run_bbx_command(
+            ["distributed-capture", "analyze-sync", "--summary", str(summary)]
         )
 
     def _configured_calibration_project(self) -> Path | None:
@@ -1630,14 +1880,50 @@ class BumbleBoxQtGUI(QMainWindow):
         self.setup_status.style().polish(self.setup_status)
 
         camera_profile = str(self.config.get("camera", {}).get("profile", "custom"))
-        self.camera_card.value_label.setText(CAMERA_PROFILES.get(camera_profile, CAMERA_PROFILES["custom"]).label)
+        camera_label = CAMERA_PROFILES.get(camera_profile, CAMERA_PROFILES["custom"]).label
         thermal_enabled = bool(self.config.get("thermal", {}).get("enabled", False))
         depth_enabled = bool(self.config.get("realsense", {}).get("enabled", False))
-        self.thermal_card.value_label.setText("Enabled" if thermal_enabled else "Not used")
-        self.realsense_card.value_label.setText("Enabled" if depth_enabled else "Not used")
+        distributed = self.config.get("distributed_capture", {})
+        distributed_enabled = bool(distributed.get("enabled", False))
+        local_sensors = {"rgb", "thermal", "realsense"}
+        if distributed_enabled:
+            local_node = next(
+                (node for node in distributed.get("nodes", []) if bool(node.get("local", False))),
+                {},
+            )
+            local_sensors = {str(item) for item in local_node.get("sensors", [])}
+        self.camera_card.value_label.setText(
+            camera_label + (" on second Pi" if distributed_enabled and "rgb" not in local_sensors else "")
+        )
+        self.thermal_card.value_label.setText(
+            "Enabled on this Pi" if thermal_enabled and "thermal" in local_sensors
+            else "Enabled on second Pi" if thermal_enabled
+            else "Not used"
+        )
+        self.realsense_card.value_label.setText(
+            "Enabled on this Pi" if depth_enabled and "realsense" in local_sensors
+            else "Enabled on second Pi" if depth_enabled
+            else "Not used"
+        )
         self.storage_card.value_label.setText(str(self.config.get("system", {}).get("data_root", "Not set")))
-        self.thermal_group.setVisible(thermal_enabled)
-        self.realsense_group.setVisible(depth_enabled)
+        self.rgb_group.setVisible(not distributed_enabled or "rgb" in local_sensors)
+        self.thermal_group.setVisible(thermal_enabled and (not distributed_enabled or "thermal" in local_sensors))
+        self.realsense_group.setVisible(depth_enabled and (not distributed_enabled or "realsense" in local_sensors))
+        node_descriptions = []
+        for node in distributed.get("nodes", []):
+            if not bool(node.get("enabled", True)):
+                continue
+            location = "this Pi" if bool(node.get("local", False)) else str(node.get("host") or "second Pi")
+            node_descriptions.append(
+                f"{location}: {', '.join(str(item) for item in node.get('sensors', [])) or 'no cameras'}"
+            )
+        distributed_text = "; ".join(node_descriptions)
+        self.distributed_run_group.setVisible(distributed_enabled)
+        self.distributed_hardware_group.setVisible(distributed_enabled)
+        self.distributed_run_status.setText(
+            "Assignments: " + distributed_text + ". Run a check before production capture."
+        )
+        self.distributed_hardware_label.setText(distributed_text)
         _set_combo_data(self.run_mode, str(self.config.get("pipeline", {}).get("mode", "record_and_track")))
         calibration_path = self._configured_calibration_project()
         configured_path = str(

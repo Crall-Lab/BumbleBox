@@ -46,6 +46,18 @@ from .config import (
 )
 from .doctor import format_report as format_doctor_report
 from .doctor import has_failures, run_doctor
+from .distributed_capture import (
+    check_distributed_capture,
+    collect_distributed_capture,
+    create_capture_plan,
+    decode_capture_plan,
+    distributed_capture_enabled,
+    execute_capture_node,
+    format_distributed_check,
+    format_distributed_result,
+    run_distributed_capture,
+    setup_distributed_worker,
+)
 from .fps_report import build_fps_report, format_report as format_fps_report, write_report_json
 from .fps_sweep import (
     format_fps_sweep_report,
@@ -125,6 +137,7 @@ from .systemd_units import (
     run_systemd_action,
     write_systemd_units,
 )
+from .temporal_sync import analyze_session_sync, format_sync_report
 from .thermal_camera import (
     apply_detected_thermal_config,
     capture_thermal_snapshot,
@@ -1268,6 +1281,19 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        selected_mode = str(args.mode or config.get("pipeline", {}).get("mode", "record_and_track"))
+        if (
+            distributed_capture_enabled(config)
+            and not bool(getattr(args, "no_distributed", False))
+            and selected_mode in {"record_only", "record_and_track"}
+        ):
+            manifest = run_distributed_capture(
+                config,
+                config_path=config_path,
+                mode=selected_mode,
+            )
+            print(format_distributed_result(manifest))
+            return 0 if bool(manifest.get("success")) else 1
         summary = run_once(config=config, mode_override=args.mode)
     except Exception as exc:
         print(f"Run failed to start: {exc}")
@@ -1275,6 +1301,138 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
 
     print(format_run_summary(summary))
     return 0 if summary.success else 1
+
+
+def _cmd_distributed_check(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+        report = check_distributed_capture(
+            config,
+            config_path=config_path,
+            probe_hardware=bool(args.probe_hardware),
+        )
+    except Exception as exc:
+        print(f"Distributed capture check failed: {exc}")
+        return 1
+    print(format_distributed_check(report))
+    if args.json_out:
+        output = Path(args.json_out).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report.to_dict(), indent=2) + "\n")
+        print(f"Report: {output}")
+    return 0 if report.success else 1
+
+
+def _cmd_distributed_plan(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+        start_ns = None
+        if args.start_in_seconds is not None:
+            start_ns = time.time_ns() + int(float(args.start_in_seconds) * 1_000_000_000)
+        mode = str(args.mode or config.get("pipeline", {}).get("mode", "record_and_track"))
+        if mode not in {"record_only", "record_and_track"}:
+            raise ValueError("Use --mode record_only or --mode record_and_track")
+        plan = create_capture_plan(
+            config,
+            config_path=config_path,
+            mode=mode,
+            start_unix_ns=start_ns,
+        )
+    except Exception as exc:
+        print(f"Distributed capture plan failed: {exc}")
+        return 1
+    rendered = json.dumps(plan, indent=2)
+    if args.output:
+        output = Path(args.output).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered + "\n")
+        print(f"Plan: {output}")
+    else:
+        print(rendered)
+    return 0
+
+
+def _cmd_distributed_collect(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+        manifest = collect_distributed_capture(config, manifest_path=args.manifest)
+    except Exception as exc:
+        print(f"Distributed artifact collection failed: {exc}")
+        return 1
+    print(format_distributed_result(manifest))
+    failed = any(
+        str(item.get("status")) == "failed"
+        for item in manifest.get("transfers", {}).values()
+    )
+    return 1 if failed else 0
+
+
+def _cmd_distributed_setup_worker(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+        result = setup_distributed_worker(
+            config,
+            node_name=str(args.node),
+            install_key=not bool(args.skip_key_install),
+            run_environment_setup=bool(args.install_runtime),
+        )
+    except Exception as exc:
+        print(f"Distributed worker setup failed: {exc}")
+        return 1
+    print("Distributed worker setup complete")
+    print(f"Node: {result['node']} ({result['user']}@{result['host']})")
+    print(f"SSH identity: {result['identity_file']}")
+    print(f"Runtime setup run: {result['environment_setup_run']}")
+    return 0
+
+
+def _cmd_distributed_analyze_sync(args: argparse.Namespace) -> int:
+    roi = None
+    if args.roi:
+        try:
+            values = tuple(float(item.strip()) for item in str(args.roi).split(","))
+            if len(values) != 4:
+                raise ValueError
+            x, y, width, height = values
+            if min(x, y, width, height) < 0 or x + width > 1 or y + height > 1:
+                raise ValueError
+            roi = values
+        except ValueError:
+            print("Sync analysis error: --roi must be normalized x,y,width,height within 0..1")
+            return 1
+    try:
+        report = analyze_session_sync(
+            args.summary,
+            output_path=args.output,
+            max_lag_seconds=float(args.max_lag_seconds),
+            roi=roi,
+        )
+    except Exception as exc:
+        print(f"Sync analysis failed: {exc}")
+        return 1
+    print(format_sync_report(report))
+    return 0 if bool(report.get("success")) else 1
+
+
+def _cmd_capture_node_run(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+        if args.plan_base64:
+            plan = decode_capture_plan(args.plan_base64)
+        elif args.plan:
+            plan = json.loads(Path(args.plan).expanduser().read_text())
+        else:
+            raise ValueError("One of --plan or --plan-base64 is required")
+        result = execute_capture_node(config, plan=plan, node_name=str(args.node))
+    except Exception as exc:
+        print(f"Capture node failed: {exc}")
+        return 1
+    return 0 if bool(result.get("success")) else 1
 
 
 def _cmd_simulate_capture(args: argparse.Namespace) -> int:
@@ -4224,7 +4382,104 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not render tracked overlay video artifacts for this run.",
     )
     run_once_parser.set_defaults(visualization=None)
+    run_once_parser.add_argument(
+        "--no-distributed",
+        action="store_true",
+        help="Run only on this computer even when distributed_capture.enabled is true.",
+    )
     run_once_parser.set_defaults(func=_cmd_run_once)
+
+    distributed_parser = subparsers.add_parser(
+        "distributed-capture",
+        help="Check, inspect, and collect optional multi-Pi synchronized captures.",
+    )
+    distributed_sub = distributed_parser.add_subparsers(
+        dest="distributed_command", required=True
+    )
+    distributed_check_parser = distributed_sub.add_parser(
+        "check",
+        help="Check SSH, storage, clocks, revisions, and optionally all assigned cameras.",
+    )
+    _add_common_config_arg(distributed_check_parser)
+    distributed_check_parser.add_argument(
+        "--probe-hardware",
+        action="store_true",
+        help="Open each assigned camera during the check; slower but recommended before an experiment.",
+    )
+    distributed_check_parser.add_argument("--json-out", help="Optional JSON report path.")
+    distributed_check_parser.set_defaults(func=_cmd_distributed_check)
+
+    distributed_plan_parser = distributed_sub.add_parser(
+        "plan",
+        help="Print the capture plan without starting cameras.",
+    )
+    _add_common_config_arg(distributed_plan_parser)
+    distributed_plan_parser.add_argument(
+        "--mode", choices=["record_only", "record_and_track"]
+    )
+    distributed_plan_parser.add_argument(
+        "--start-in-seconds",
+        type=float,
+        help="Override the configured lead time for this diagnostic plan.",
+    )
+    distributed_plan_parser.add_argument("--output", help="Optional JSON plan path.")
+    distributed_plan_parser.set_defaults(func=_cmd_distributed_plan)
+
+    distributed_collect_parser = distributed_sub.add_parser(
+        "collect",
+        help="Resume transfer of remote node artifacts for an existing manifest.",
+    )
+    _add_common_config_arg(distributed_collect_parser)
+    distributed_collect_parser.add_argument("--manifest", required=True)
+    distributed_collect_parser.set_defaults(func=_cmd_distributed_collect)
+
+    distributed_setup_parser = distributed_sub.add_parser(
+        "setup-worker",
+        help="Install the controller SSH key and optionally prepare the BumbleBox runtime on a worker.",
+    )
+    _add_common_config_arg(distributed_setup_parser)
+    distributed_setup_parser.add_argument(
+        "--node", default="worker", help="Configured remote node name (default: worker)."
+    )
+    distributed_setup_parser.add_argument(
+        "--skip-key-install",
+        action="store_true",
+        help="Verify using the existing SSH key without running ssh-copy-id.",
+    )
+    distributed_setup_parser.add_argument(
+        "--install-runtime",
+        action="store_true",
+        help="Run scripts/setup_venv.sh remotely after key/repository verification.",
+    )
+    distributed_setup_parser.set_defaults(func=_cmd_distributed_setup_worker)
+
+    distributed_sync_parser = distributed_sub.add_parser(
+        "analyze-sync",
+        help="Estimate thermal/depth offset and jitter from a shared moving or occlusion cue.",
+    )
+    distributed_sync_parser.add_argument("--summary", required=True, help="Run summary JSON path.")
+    distributed_sync_parser.add_argument("--output", help="Optional report JSON path.")
+    distributed_sync_parser.add_argument(
+        "--max-lag-seconds", type=float, default=2.0, help="Search window in either direction (default: 2)."
+    )
+    distributed_sync_parser.add_argument(
+        "--roi",
+        help="Optional normalized x,y,width,height region containing the shared cue.",
+    )
+    distributed_sync_parser.set_defaults(func=_cmd_distributed_analyze_sync)
+
+    capture_node_parser = subparsers.add_parser(
+        "capture-node",
+        help=argparse.SUPPRESS,
+    )
+    capture_node_sub = capture_node_parser.add_subparsers(dest="capture_node_command", required=True)
+    capture_node_run_parser = capture_node_sub.add_parser("run", help=argparse.SUPPRESS)
+    _add_common_config_arg(capture_node_run_parser)
+    capture_node_run_parser.add_argument("--node", required=True)
+    capture_node_plan = capture_node_run_parser.add_mutually_exclusive_group(required=True)
+    capture_node_plan.add_argument("--plan")
+    capture_node_plan.add_argument("--plan-base64")
+    capture_node_run_parser.set_defaults(func=_cmd_capture_node_run)
 
     simulate_parser = subparsers.add_parser(
         "simulate-capture",
