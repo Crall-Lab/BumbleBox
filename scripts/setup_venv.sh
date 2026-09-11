@@ -17,7 +17,7 @@ Options:
   --skip-picamera2          Skip pip install of picamera2 in main env
   --force-pip-nest-label    Force pip install for labelme in main env (Pi defaults to skip)
   --force-pip-picamera2     Force pip install for picamera2 in main env (Pi defaults to skip)
-  --install-realsense       Attempt to install optional pyrealsense2 support
+  --install-realsense       Install optional pyrealsense2 support (source fallback on ARM64 Pi)
   --skip-label-env          Do not create/update dedicated labeling env
   --label-venv-dir <path>   Dedicated labeling env path (default: <repo>/.venvs/bbx-label)
   --label-python <bin>      Python interpreter for dedicated labeling env (default: --python value)
@@ -54,6 +54,7 @@ PI_MODEL=""
 SKIPPED_PIP_NEST_LABEL_ON_PI=0
 SKIPPED_PIP_PICAMERA2_ON_PI=0
 LINGER_RESULT=""
+REALSENSE_VERSION="${BUMBLEBOX_REALSENSE_VERSION:-2.58.1}"
 
 detect_pi_model() {
   local model=""
@@ -194,6 +195,93 @@ maybe_install_apt_packages() {
     return 1
   fi
   return 0
+}
+
+run_privileged() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    "$@"
+    return
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+    return
+  fi
+  echo "[BumbleBox] ERROR: This RealSense installation step requires root access." >&2
+  return 1
+}
+
+install_realsense_from_source() {
+  local architecture
+  architecture="$(uname -m)"
+  if [[ -z "$PI_MODEL" || "$architecture" != "aarch64" ]]; then
+    return 1
+  fi
+
+  echo "[BumbleBox] No ARM64 pyrealsense2 wheel is available; building Librealsense ${REALSENSE_VERSION}."
+  maybe_install_apt_packages \
+    "Librealsense source build" \
+    cmake build-essential git libssl-dev libusb-1.0-0-dev pkg-config libudev-dev python3-dev || return 1
+
+  local cache_root="${XDG_CACHE_HOME:-${HOME}/.cache}/bumblebox"
+  local source_dir="${cache_root}/librealsense-v${REALSENSE_VERSION}"
+  local build_dir="${source_dir}/build-bbx"
+  mkdir -p "$cache_root"
+
+  if [[ ! -f "${source_dir}/CMakeLists.txt" ]]; then
+    if [[ -e "$source_dir" ]]; then
+      echo "[BumbleBox] ERROR: RealSense source cache is incomplete: ${source_dir}" >&2
+      echo "           Move that path aside and rerun setup." >&2
+      return 1
+    fi
+    git clone \
+      --branch "v${REALSENSE_VERSION}" \
+      --depth 1 \
+      https://github.com/realsenseai/librealsense.git \
+      "$source_dir" || return 1
+  else
+    echo "[BumbleBox] Reusing cached Librealsense source: ${source_dir}"
+  fi
+
+  cmake \
+    -S "$source_dir" \
+    -B "$build_dir" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_PYTHON_BINDINGS=ON \
+    -DPYTHON_EXECUTABLE="$VENV_PY" \
+    -DFORCE_RSUSB_BACKEND=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DBUILD_EXAMPLES=OFF \
+    -DBUILD_GRAPHICAL_EXAMPLES=OFF \
+    -DBUILD_TOOLS=OFF \
+    -DBUILD_ROSBAG2=OFF || return 1
+
+  local build_jobs=1
+  if command -v nproc >/dev/null 2>&1; then
+    build_jobs="$(nproc)"
+    if [[ "$build_jobs" -gt 1 ]]; then
+      build_jobs=$((build_jobs - 1))
+    fi
+  fi
+  cmake --build "$build_dir" --parallel "$build_jobs" || return 1
+  run_privileged cmake --install "$build_dir" || return 1
+
+  local udev_rule="${source_dir}/config/99-realsense-libusb.rules"
+  if [[ -f "$udev_rule" ]]; then
+    run_privileged install -m 0644 "$udev_rule" /etc/udev/rules.d/99-realsense-libusb.rules || return 1
+    run_privileged udevadm control --reload-rules || return 1
+    run_privileged udevadm trigger || return 1
+  fi
+  run_privileged ldconfig || return 1
+
+  # Source installs use /usr/local, which isolated venvs do not always include.
+  local python_minor
+  local venv_site
+  python_minor="$("$VENV_PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  venv_site="$("$VENV_PY" -c 'import site; print(site.getsitepackages()[0])')"
+  printf "/usr/local/lib/python%s/dist-packages\n" "$python_minor" \
+    > "${venv_site}/bumblebox_realsense.pth"
+
+  "$VENV_PY" -c "import pyrealsense2" >/dev/null 2>&1
 }
 
 linger_target_user() {
@@ -443,11 +531,20 @@ fi
 
 if [[ "$INSTALL_REALSENSE" -eq 1 ]]; then
   echo "[BumbleBox] Installing optional RealSense Python support"
-  if ! "$VENV_PY" -m pip install pyrealsense2; then
-    echo "[BumbleBox] WARNING: pyrealsense2 installation failed for this Python/architecture."
-    echo "           Follow the official librealsense Raspberry Pi/source-build instructions,"
-    echo "           then make its Python bindings visible to this runtime."
+  if "$VENV_PY" -c "import pyrealsense2" >/dev/null 2>&1; then
+    echo "[BumbleBox] Existing RealSense Python support is importable; skipping installation."
+  elif ! "$VENV_PY" -m pip install pyrealsense2; then
+    if ! install_realsense_from_source; then
+      echo "[BumbleBox] ERROR: pyrealsense2 installation failed for this Python/architecture." >&2
+      echo "           Follow the official Librealsense source-build instructions, then retry." >&2
+      exit 1
+    fi
   fi
+  if ! "$VENV_PY" -c "import pyrealsense2" >/dev/null 2>&1; then
+    echo "[BumbleBox] ERROR: RealSense installation completed, but pyrealsense2 is not importable." >&2
+    exit 1
+  fi
+  echo "[BumbleBox] RealSense Python support is ready."
 fi
 
 if [[ "$INSTALL_NEST_LABEL" -eq 1 ]]; then

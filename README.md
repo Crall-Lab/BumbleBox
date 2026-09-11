@@ -86,7 +86,7 @@ sudo apt install python3-pyqt5 labelme
 - Pi 4/5 compatibility checks (`doctor`)
 - camera stack checks for HQ/Module3 workflows
 - USB thermal camera discovery/probe/snapshot path for PureThermal/Lepton-style devices (`thermal-check`, `thermal-snapshot`)
-- RealSense discovery, stream-profile probe, serial pinning, and raw depth/color snapshots (`realsense-check`, `realsense-snapshot`)
+- RealSense discovery, stream-profile probe, serial pinning, raw depth/color snapshots, and synchronized incremental recording (`realsense-check`, `realsense-snapshot`, `run-once`)
 - conditional hardware profiles for RGB-only, RGB+thermal, RGB+depth, and full multimodal systems
 - First-pass synchronized RGB + thermal recording when `thermal.enabled=true`
 - Automatic RGB + thermal side-by-side inspection video for synchronized thermal runs

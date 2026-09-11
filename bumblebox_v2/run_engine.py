@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from copy import deepcopy
 import gc
 import json
@@ -25,6 +26,7 @@ from .camera_controls import (
     start_autofocus_after_camera_start,
 )
 from .camera_profiles import apply_camera_profile, configured_profile_name, validate_camera_ir_compatibility
+from .realsense_camera import RealSenseRecordingResult, RealSenseRecordingSession
 from .thermal_camera import resolve_thermal_device_path, _set_v4l2_y16_format
 from .tracking_index import sync_run_summary_file
 from .tuning import resolve_camera_tuning_file
@@ -140,6 +142,18 @@ class RunSummary:
     thermal_metadata_json_path: Optional[str]
     thermal_side_by_side_video_path: Optional[str]
     thermal_side_by_side_png_path: Optional[str]
+    realsense_enabled: bool
+    realsense_device_serial: Optional[str]
+    realsense_frames_captured: int
+    realsense_actual_fps: Optional[float]
+    realsense_depth_scale_meters: Optional[float]
+    realsense_timestamp_path: Optional[str]
+    realsense_raw_depth_npy_path: Optional[str]
+    realsense_depth_preview_video_path: Optional[str]
+    realsense_depth_preview_png_path: Optional[str]
+    realsense_color_video_path: Optional[str]
+    realsense_color_preview_png_path: Optional[str]
+    realsense_metadata_json_path: Optional[str]
     tracked_video_path: Optional[str]
     tracked_thermal_side_by_side_video_path: Optional[str]
     tracked_thermal_side_by_side_png_path: Optional[str]
@@ -704,6 +718,11 @@ def _thermal_enabled_for_recording(config: Dict[str, Any]) -> bool:
     return isinstance(thermal, dict) and bool(thermal.get("enabled", False))
 
 
+def _realsense_enabled_for_recording(config: Dict[str, Any]) -> bool:
+    realsense = config.get("realsense", {})
+    return isinstance(realsense, dict) and bool(realsense.get("enabled", False))
+
+
 def _camera_monochrome_output_enabled(config: Dict[str, Any]) -> bool:
     camera = config.get("camera", {})
     return isinstance(camera, dict) and bool(camera.get("monochrome_output", False))
@@ -913,12 +932,23 @@ def _mock_capture_thermal_frames(
     return frames, list(timestamps), float(actual_fps), "uint16_mono16", "mock://thermal", list(timestamp_records)
 
 
-def _capture_rgb_and_optional_thermal(
+def _capture_rgb_and_optional_sensors(
     config: Dict[str, Any],
     *,
+    session_dir: Path,
+    session_name: str,
     diagnostics: Optional[dict[str, Any]] = None,
-) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord], Optional[dict[str, Any]]]:
-    if not _thermal_enabled_for_recording(config):
+) -> Tuple[
+    List[Any],
+    List[float],
+    float,
+    List[FrameTimestampRecord],
+    Optional[dict[str, Any]],
+    Optional[RealSenseRecordingResult],
+]:
+    thermal_enabled = _thermal_enabled_for_recording(config)
+    realsense_enabled = _realsense_enabled_for_recording(config)
+    if not thermal_enabled and not realsense_enabled:
         _progress_message("capture", "Preparing RGB capture.")
         frames, timestamps, actual_fps, timestamp_records = _capture_frames(
             config,
@@ -929,15 +959,19 @@ def _capture_rgb_and_optional_thermal(
             "capture",
             f"RGB acquisition finished: {len(frames)} frames at {actual_fps:.3f} FPS.",
         )
-        return frames, timestamps, actual_fps, timestamp_records, None
+        return frames, timestamps, actual_fps, timestamp_records, None, None
 
     if bool(config["runtime"].get("use_mock_camera", False)):
-        _progress_message("capture", "Preparing synchronized mock RGB+thermal capture.")
+        sensor_label = "RGB+thermal" if thermal_enabled else "RGB"
+        _progress_message("capture", f"Preparing synchronized mock {sensor_label} capture.")
         frames, timestamps, actual_fps, timestamp_records = _capture_frames(
             config,
             diagnostics=diagnostics,
             progress_label="RGB capture",
         )
+        thermal_result = None
+        if not thermal_enabled:
+            return frames, timestamps, actual_fps, timestamp_records, None, None
         thermal_frames, thermal_timestamps, thermal_actual_fps, raw16_layout, device_path, thermal_timestamp_records = _mock_capture_thermal_frames(
             config,
             timestamps=timestamps,
@@ -949,7 +983,7 @@ def _capture_rgb_and_optional_thermal(
             "Synchronized mock acquisition finished: "
             f"{len(frames)} RGB and {len(thermal_frames)} thermal frames.",
         )
-        return frames, timestamps, actual_fps, timestamp_records, {
+        thermal_result = {
             "device_path": device_path,
             "frames": thermal_frames,
             "timestamps": thermal_timestamps,
@@ -957,14 +991,21 @@ def _capture_rgb_and_optional_thermal(
             "raw16_layout": raw16_layout,
             "timestamp_records": thermal_timestamp_records,
         }
+        return frames, timestamps, actual_fps, timestamp_records, thermal_result, None
 
     fps = float(config["camera"]["fps_target"])
     duration = float(config["capture"]["recording_seconds"])
 
     rgb_result: dict[str, Any] = {}
     thermal_result: dict[str, Any] = {}
+    realsense_result: dict[str, RealSenseRecordingResult] = {}
     errors: list[str] = []
-    _progress_message("capture", "Preparing synchronized RGB+thermal capture.")
+    active_streams = ["RGB"]
+    if thermal_enabled:
+        active_streams.append("thermal")
+    if realsense_enabled:
+        active_streams.append("RealSense")
+    _progress_message("capture", f"Preparing synchronized {'+'.join(active_streams)} capture.")
 
     def rgb_worker(session: _PicameraCaptureSession) -> None:
         try:
@@ -1006,32 +1047,98 @@ def _capture_rgb_and_optional_thermal(
         except Exception as exc:
             errors.append(f"Thermal synchronized capture failed: {exc}")
 
-    with _PicameraCaptureSession(config) as rgb_session:
+    def realsense_worker(session: RealSenseRecordingSession) -> None:
+        requested_frames = max(
+            1,
+            int(math.ceil(duration * float(config.get("realsense", {}).get("fps", 30)))),
+        )
+        progress = _FrameProgress(
+            stage="capture",
+            label="RealSense capture",
+            total=requested_frames,
+        )
+        progress.start(
+            detail=(
+                f"{duration:.1f}s at {float(config.get('realsense', {}).get('fps', 30)):.3f} FPS"
+            )
+        )
+        depth_preview_progress: Optional[_FrameProgress] = None
+
+        def update_depth_preview(completed: int, total: int) -> None:
+            nonlocal depth_preview_progress
+            if depth_preview_progress is None:
+                depth_preview_progress = _FrameProgress(
+                    stage="output",
+                    label="RealSense depth preview video",
+                    total=total,
+                )
+                depth_preview_progress.start()
+            depth_preview_progress.update(completed)
+            if completed >= total:
+                depth_preview_progress.finish(completed)
+
+        try:
+            result = session.capture_for(
+                duration=duration,
+                start_monotonic=start_monotonic,
+                progress_callback=lambda completed, _total: progress.update(completed),
+                status_callback=lambda message: _progress_message("output", message),
+                depth_preview_progress_callback=update_depth_preview,
+            )
+            realsense_result["artifacts"] = result
+            progress.finish(result.frames_captured)
+        except Exception as exc:
+            errors.append(f"RealSense synchronized capture failed: {exc}")
+
+    with ExitStack() as stack:
+        rgb_session = stack.enter_context(_PicameraCaptureSession(config))
         _write_autofocus_capture_diagnostics(diagnostics, rgb_session)
         rgb_session.start()
-        with _ThermalCaptureSession(config) as thermal_session:
-            # Flush queued frames immediately before the shared start so both streams begin from current data
-            # instead of buffered warmup frames.
-            _flush_rgb_capture_queue(rgb_session.picam2, SYNC_CAPTURE_FLUSH_FRAMES)
-            _flush_thermal_capture_queue(thermal_session.capture, SYNC_CAPTURE_FLUSH_FRAMES)
-            start_monotonic = time.perf_counter() + SYNC_CAPTURE_START_DELAY_SECONDS
-            _progress_message(
-                "capture",
-                f"Starting both streams for {duration:.1f}s at {fps:.3f} FPS.",
+        thermal_session = (
+            stack.enter_context(_ThermalCaptureSession(config)) if thermal_enabled else None
+        )
+        realsense_session = (
+            stack.enter_context(
+                RealSenseRecordingSession(
+                    config,
+                    session_dir=session_dir,
+                    session_name=session_name,
+                )
             )
-            rgb_thread = threading.Thread(target=rgb_worker, args=(rgb_session,), daemon=True)
-            thermal_thread = threading.Thread(target=thermal_worker, args=(thermal_session,), daemon=True)
-            rgb_thread.start()
-            thermal_thread.start()
-            rgb_thread.join()
-            thermal_thread.join()
+            if realsense_enabled
+            else None
+        )
+
+        # Flush queued frames immediately before the shared start so streams begin from current data
+        # instead of buffered warmup frames.
+        _flush_rgb_capture_queue(rgb_session.picam2, SYNC_CAPTURE_FLUSH_FRAMES)
+        if thermal_session is not None:
+            _flush_thermal_capture_queue(thermal_session.capture, SYNC_CAPTURE_FLUSH_FRAMES)
+        start_monotonic = time.perf_counter() + SYNC_CAPTURE_START_DELAY_SECONDS
+        _progress_message(
+            "capture",
+            f"Starting {len(active_streams)} streams from one host deadline for {duration:.1f}s.",
+        )
+        threads = [threading.Thread(target=rgb_worker, args=(rgb_session,), daemon=True)]
+        if thermal_session is not None:
+            threads.append(threading.Thread(target=thermal_worker, args=(thermal_session,), daemon=True))
+        if realsense_session is not None:
+            threads.append(threading.Thread(target=realsense_worker, args=(realsense_session,), daemon=True))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
 
     if errors:
         raise RuntimeError(" | ".join(errors))
+    counts = [f"{len(rgb_result['frames'])} RGB"]
+    if thermal_enabled:
+        counts.append(f"{len(thermal_result['frames'])} thermal")
+    if realsense_enabled:
+        counts.append(f"{realsense_result['artifacts'].frames_captured} RealSense")
     _progress_message(
         "capture",
-        "Synchronized acquisition finished: "
-        f"{len(rgb_result['frames'])} RGB and {len(thermal_result['frames'])} thermal frames.",
+        "Synchronized acquisition finished: " + ", ".join(counts) + " frames.",
     )
     return (
         rgb_result["frames"],
@@ -1039,6 +1146,7 @@ def _capture_rgb_and_optional_thermal(
         float(rgb_result["actual_fps"]),
         rgb_result["timestamp_records"],
         thermal_result or None,
+        realsense_result.get("artifacts"),
     )
 
 
@@ -2367,6 +2475,7 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     thermal_capture: Optional[dict[str, Any]] = None
     thermal_artifacts: Optional[ThermalRecordingArtifacts] = None
     thermal_side_by_side_artifacts: Optional[ThermalSideBySideArtifacts] = None
+    realsense_artifacts: Optional[RealSenseRecordingResult] = None
     tracking_visualization_artifacts: Optional[TrackingVisualizationArtifacts] = None
     raw_csv: Optional[Path] = None
     noid_csv: Optional[Path] = None
@@ -2377,10 +2486,13 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     try:
         should_record = mode in {"record_only", "record_and_track"}
         should_track = mode in {"track_only", "record_and_track"}
-        if should_record and bool(config.get("realsense", {}).get("enabled", False)):
+        if (
+            should_record
+            and _realsense_enabled_for_recording(config)
+            and bool(config["runtime"].get("use_mock_camera", False))
+        ):
             warnings.append(
-                "RealSense is enabled, but synchronized RealSense recording is not yet integrated "
-                "into run-once. Phase 1 supports realsense-check and realsense-snapshot only."
+                "RealSense capture was skipped because runtime.use_mock_camera is enabled."
             )
         _progress_message(
             "run",
@@ -2388,19 +2500,35 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
         )
 
         if should_record or should_track:
-            if should_record and _thermal_enabled_for_recording(config):
-                thermal_cfg = config.get("thermal", {})
-                try:
-                    thermal_target_fps = float(thermal_cfg.get("fps_target", config["camera"]["fps_target"]))
-                except Exception:
-                    thermal_target_fps = float(config["camera"]["fps_target"])
-                if abs(thermal_target_fps - float(config["camera"]["fps_target"])) > 1e-6:
-                    warnings.append(
-                        "Synchronized thermal recording follows camera.fps_target. "
-                        f"thermal.fps_target={thermal_target_fps:.3f} was ignored for this run."
-                    )
-                frames, timestamps, actual_fps, timestamp_records, thermal_capture = _capture_rgb_and_optional_thermal(
+            optional_sensor_recording = (
+                _thermal_enabled_for_recording(config)
+                or _realsense_enabled_for_recording(config)
+            )
+            if should_record and optional_sensor_recording:
+                if _thermal_enabled_for_recording(config):
+                    thermal_cfg = config.get("thermal", {})
+                    try:
+                        thermal_target_fps = float(
+                            thermal_cfg.get("fps_target", config["camera"]["fps_target"])
+                        )
+                    except Exception:
+                        thermal_target_fps = float(config["camera"]["fps_target"])
+                    if abs(thermal_target_fps - float(config["camera"]["fps_target"])) > 1e-6:
+                        warnings.append(
+                            "Synchronized thermal recording follows camera.fps_target. "
+                            f"thermal.fps_target={thermal_target_fps:.3f} was ignored for this run."
+                        )
+                (
+                    frames,
+                    timestamps,
+                    actual_fps,
+                    timestamp_records,
+                    thermal_capture,
+                    realsense_artifacts,
+                ) = _capture_rgb_and_optional_sensors(
                     config,
+                    session_dir=session_dir,
+                    session_name=session_name,
                     diagnostics=capture_diagnostics,
                 )
                 if thermal_capture is not None:
@@ -2454,6 +2582,8 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
                 )
                 if should_track and _thermal_enabled_for_recording(config) and not should_record:
                     warnings.append("thermal.enabled is set, but thermal capture runs only during recording modes.")
+                if should_track and _realsense_enabled_for_recording(config) and not should_record:
+                    warnings.append("realsense.enabled is set, but RealSense capture runs only during recording modes.")
 
         if bool(config["runtime"].get("save_frame_timestamps", True)) and timestamps:
             _progress_message("output", "Writing RGB frame timestamps.")
@@ -2698,6 +2828,40 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
             if thermal_side_by_side_artifacts and thermal_side_by_side_artifacts.midpoint_png_path
             else None
         ),
+        realsense_enabled=bool(_realsense_enabled_for_recording(config)),
+        realsense_device_serial=(
+            realsense_artifacts.selected_serial if realsense_artifacts else None
+        ),
+        realsense_frames_captured=(
+            realsense_artifacts.frames_captured if realsense_artifacts else 0
+        ),
+        realsense_actual_fps=(
+            round(realsense_artifacts.actual_fps, 6) if realsense_artifacts else None
+        ),
+        realsense_depth_scale_meters=(
+            realsense_artifacts.depth_scale_meters if realsense_artifacts else None
+        ),
+        realsense_timestamp_path=(
+            realsense_artifacts.timestamp_path if realsense_artifacts else None
+        ),
+        realsense_raw_depth_npy_path=(
+            realsense_artifacts.raw_depth_npy_path if realsense_artifacts else None
+        ),
+        realsense_depth_preview_video_path=(
+            realsense_artifacts.depth_preview_video_path if realsense_artifacts else None
+        ),
+        realsense_depth_preview_png_path=(
+            realsense_artifacts.depth_preview_png_path if realsense_artifacts else None
+        ),
+        realsense_color_video_path=(
+            realsense_artifacts.color_video_path if realsense_artifacts else None
+        ),
+        realsense_color_preview_png_path=(
+            realsense_artifacts.color_preview_png_path if realsense_artifacts else None
+        ),
+        realsense_metadata_json_path=(
+            realsense_artifacts.metadata_json_path if realsense_artifacts else None
+        ),
         tracked_video_path=(
             str(tracking_visualization_artifacts.tracked_video_path)
             if tracking_visualization_artifacts
@@ -2818,6 +2982,18 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Thermal metadata JSON: {summary.thermal_metadata_json_path or 'none'}",
         f"RGB+thermal side-by-side video: {summary.thermal_side_by_side_video_path or 'none'}",
         f"RGB+thermal side-by-side PNG: {summary.thermal_side_by_side_png_path or 'none'}",
+        f"RealSense enabled: {summary.realsense_enabled}",
+        f"RealSense device serial: {summary.realsense_device_serial or 'none'}",
+        f"RealSense frames captured: {summary.realsense_frames_captured}",
+        f"RealSense actual FPS: {summary.realsense_actual_fps if summary.realsense_actual_fps is not None else 'n/a'}",
+        f"RealSense depth scale (meters/unit): {summary.realsense_depth_scale_meters if summary.realsense_depth_scale_meters is not None else 'n/a'}",
+        f"RealSense timestamps: {summary.realsense_timestamp_path or 'none'}",
+        f"RealSense raw depth NPY: {summary.realsense_raw_depth_npy_path or 'none'}",
+        f"RealSense depth preview video: {summary.realsense_depth_preview_video_path or 'none'}",
+        f"RealSense depth midpoint PNG: {summary.realsense_depth_preview_png_path or 'none'}",
+        f"RealSense color video: {summary.realsense_color_video_path or 'none'}",
+        f"RealSense color midpoint PNG: {summary.realsense_color_preview_png_path or 'none'}",
+        f"RealSense metadata JSON: {summary.realsense_metadata_json_path or 'none'}",
         f"Tracked video: {summary.tracked_video_path or 'none'}",
         f"Tracked RGB+thermal side-by-side video: {summary.tracked_thermal_side_by_side_video_path or 'none'}",
         f"Tracked RGB+thermal side-by-side PNG: {summary.tracked_thermal_side_by_side_png_path or 'none'}",

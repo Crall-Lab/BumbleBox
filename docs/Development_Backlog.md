@@ -6,21 +6,22 @@ validated.
 
 ## RealSense and Multimodal Acquisition
 
-**Status:** Phase 1 implemented; Pi hardware validation required
+**Status:** Phase 2 capture implemented; USB 3 and sustained-load validation required
 
 **Goal:** Integrate D405 depth with interchangeable HQ/OwlSight RGB capture and PureThermal data without obscuring timestamp provenance or exceeding Pi resources.
 
 - [x] Add conditional hardware profiles and first-run setup wizard pages.
 - [x] Add RealSense discovery, advertised-profile reporting, exact stream probe, and serial pinning.
 - [x] Save raw depth/color snapshots with device and host timing metadata.
-- [x] Add health-check coverage and warn when `run-once` cannot yet record enabled depth.
+- [x] Add health-check coverage and explicit configured-profile diagnostics.
 - [ ] Run `realsense-check --apply` on the Raspberry Pi 5 and retain the full profile report.
 - [ ] Validate depth scale, near-field nest coverage, invalid-pixel rate, and thermal/RGB interference.
 - [ ] Benchmark OwlSight + PureThermal + D405 USB, CPU, RAM, and storage load together.
-- [ ] Build a shared acquisition coordinator with host monotonic receipt timestamps for all streams.
-- [ ] Preserve native device timestamps/frame numbers and define clock-domain mappings.
-- [ ] Write depth incrementally with explicit dropped-frame and device-loss behavior.
-- [ ] Add multimodal run summaries, timestamp tables, and frame-by-frame inspection output.
+- [x] Build a shared acquisition coordinator with host monotonic receipt timestamps for all streams.
+- [x] Preserve native RealSense device timestamps/frame numbers alongside host clocks.
+- [x] Write raw depth incrementally and report frame-number gaps/device loss as run failures.
+- [x] Add multimodal run summaries and timestamp tables.
+- [ ] Add frame-by-frame three-camera inspection output.
 - [ ] Calibrate temporal offset and multi-depth spatial registration.
 
 See `docs/RealSense_Camera.md` for the hardware validation workflow and phase boundary.
