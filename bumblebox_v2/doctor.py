@@ -208,6 +208,27 @@ def _camera_stack_check() -> CheckResult:
     )
 
 
+def _realsense_check(config: Dict[str, Any]) -> CheckResult:
+    if not bool(config.get("realsense", {}).get("enabled", False)):
+        return CheckResult("RealSense", "PASS", "Disabled by the active hardware profile.")
+    try:
+        from .realsense_camera import run_realsense_check
+
+        result = run_realsense_check(config, probe=False)
+    except Exception as exc:
+        return CheckResult("RealSense", "FAIL", str(exc))
+    if result.errors:
+        return CheckResult("RealSense", "FAIL", "; ".join(result.errors))
+    return CheckResult(
+        "RealSense",
+        "PASS",
+        (
+            f"Detected {len(result.devices)} device(s); selected serial "
+            f"{result.selected_serial or 'unknown'}. Run realsense-check for a stream probe."
+        ),
+    )
+
+
 def _ffmpeg_check(config: Dict[str, Any]) -> CheckResult:
     codec = str(config.get("camera", {}).get("codec", "mp4")).strip().lower()
     resolved = shutil.which("ffmpeg")
@@ -417,9 +438,11 @@ def run_doctor(config: Dict[str, Any]) -> List[CheckResult]:
     results.append(_picamera2_check(detected_model))
     results.append(_dependency_check("yaml", "pip3 install pyyaml"))
     results.append(_dependency_check("pandas", "pip3 install pandas"))
+    results.append(_dependency_check("PyQt5", "sudo apt install python3-pyqt5 (Pi) or pip install pyqt5"))
     results.append(_ffmpeg_check(config))
     results.append(_camera_stack_check())
     results.append(_camera_tuning_check(config))
+    results.append(_realsense_check(config))
     results.append(_data_root_check(config["system"]["data_root"]))
     results.append(_data_root_mount_check(config["system"]["data_root"]))
 

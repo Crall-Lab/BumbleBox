@@ -29,4 +29,12 @@ python3 /Users/aec/Desktop/BumbleBox/bbx.py gui-install-shortcut --desktop-dir /
 
 ## GUI path
 
-In `Run & Schedule`, click `Install GUI Desktop Icon` to do the same setup without terminal commands.
+The launcher now opens the primary PyQt GUI. Its first launch opens a conditional setup wizard; hardware pages are skipped for devices not selected in the hardware profile.
+
+During the staged migration, specialized tools that have not yet moved to Qt remain available through `Advanced -> Open Legacy Advanced Tools` or:
+
+```bash
+./bbx gui --legacy
+```
+
+Only one primary PyQt GUI instance is allowed per user. The legacy tools window is a separate migration bridge and should be closed when it is no longer needed.

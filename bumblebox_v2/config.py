@@ -22,6 +22,7 @@ from .camera_controls import (
     normalize_autofocus_range,
     normalize_autofocus_speed,
 )
+from .hardware_profiles import hardware_profile_choices, normalize_hardware_profile
 
 try:
     import yaml
@@ -51,6 +52,8 @@ VALID_CAMERA_CODECS = {"mp4", "mjpeg"}
 VALID_THERMAL_PIXEL_FORMATS = {"auto", "y16", "gray8", "rgb"}
 VALID_UI_THEME_MODES = {"dark", "light"}
 VALID_ARUCO_TAG_DICTIONARIES = {"4X4_50", "4X4_100", "4X4_250", "4X4_1000"}
+VALID_HARDWARE_PROFILES = set(hardware_profile_choices())
+VALID_REALSENSE_ALIGN_TARGETS = {"none", "color", "depth"}
 SERVICE_USER_AUTO_SENTINELS = {"", "auto", "current", "default", "pi", "root"}
 
 
@@ -129,9 +132,11 @@ def validate_config(config: Dict[str, Any]) -> None:
         config,
         [
             "system",
+            "setup",
             "local_index",
             "camera",
             "thermal",
+            "realsense",
             "pipeline",
             "capture",
             "tracking",
@@ -143,6 +148,21 @@ def validate_config(config: Dict[str, Any]) -> None:
             "fleet",
         ],
     )
+
+    setup = config.get("setup", {})
+    if not isinstance(setup, dict):
+        raise ConfigError("setup must be a mapping/object")
+    if not isinstance(setup.get("completed", False), bool):
+        raise ConfigError("setup.completed must be true or false")
+    hardware_profile = normalize_hardware_profile(setup.get("hardware_profile", "custom"))
+    if hardware_profile not in VALID_HARDWARE_PROFILES:
+        raise ConfigError(
+            f"setup.hardware_profile must be one of {sorted(VALID_HARDWARE_PROFILES)}, "
+            f"got: {hardware_profile}"
+        )
+    completed_at = setup.get("completed_at")
+    if completed_at is not None and not isinstance(completed_at, str):
+        raise ConfigError("setup.completed_at must be null or an ISO timestamp string")
 
     local_index = config.get("local_index", {})
     if not isinstance(local_index, dict):
@@ -479,6 +499,38 @@ def validate_config(config: Dict[str, Any]) -> None:
     thermal_expected_name = thermal.get("expected_name", "PureThermal")
     if thermal_expected_name is not None and not isinstance(thermal_expected_name, str):
         raise ConfigError("thermal.expected_name must be null or a string")
+
+    realsense = config.get("realsense", {})
+    if not isinstance(realsense, dict):
+        raise ConfigError("realsense must be a mapping/object")
+    if not isinstance(realsense.get("enabled", False), bool):
+        raise ConfigError("realsense.enabled must be true or false")
+    realsense_serial = realsense.get("device_serial", "auto")
+    if realsense_serial is not None and not isinstance(realsense_serial, str):
+        raise ConfigError("realsense.device_serial must be null or a string")
+    for key, default in (
+        ("depth_width", 848),
+        ("depth_height", 480),
+        ("color_width", 848),
+        ("color_height", 480),
+        ("fps", 30),
+        ("warmup_frames", 15),
+    ):
+        try:
+            value = int(realsense.get(key, default))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"realsense.{key} must be an integer") from exc
+        if value <= 0:
+            raise ConfigError(f"realsense.{key} must be > 0")
+    align_to = str(realsense.get("align_to", "none")).strip().lower()
+    if align_to not in VALID_REALSENSE_ALIGN_TARGETS:
+        raise ConfigError(
+            "realsense.align_to must be one of "
+            f"{sorted(VALID_REALSENSE_ALIGN_TARGETS)}, got: {align_to}"
+        )
+    for key in ("save_depth", "save_color"):
+        if not isinstance(realsense.get(key, True), bool):
+            raise ConfigError(f"realsense.{key} must be true or false")
 
     ram_override = config["system"].get("ram_gb_override")
     if ram_override not in (None, "", 0):

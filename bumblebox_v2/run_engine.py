@@ -2377,6 +2377,11 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     try:
         should_record = mode in {"record_only", "record_and_track"}
         should_track = mode in {"track_only", "record_and_track"}
+        if should_record and bool(config.get("realsense", {}).get("enabled", False)):
+            warnings.append(
+                "RealSense is enabled, but synchronized RealSense recording is not yet integrated "
+                "into run-once. Phase 1 supports realsense-check and realsense-snapshot only."
+            )
         _progress_message(
             "run",
             f"Session {session_name} started in {mode} mode.",

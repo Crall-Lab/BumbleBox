@@ -5,6 +5,11 @@ system:
   ram_gb_override: null
   timezone: "auto"
 
+setup:
+  completed: false
+  hardware_profile: "custom"
+  completed_at: null
+
 local_index:
   enabled: true
   path: "LocalTrackingIndex"
@@ -48,6 +53,19 @@ thermal:
   fps_target: 8.7
   pixel_format: "auto"
   expected_name: "PureThermal"
+
+realsense:
+  enabled: false
+  device_serial: "auto"
+  depth_width: 848
+  depth_height: 480
+  color_width: 848
+  color_height: 480
+  fps: 30
+  align_to: "none"
+  warmup_frames: 15
+  save_depth: true
+  save_color: true
 
 pipeline:
   mode: "record_and_track"

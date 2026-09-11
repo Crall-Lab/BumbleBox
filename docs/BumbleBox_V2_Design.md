@@ -142,6 +142,8 @@ Rationale:
 
 ## GUI Scope in V2
 
+The primary operator interface is now PyQt. A conditional first-run wizard selects a hardware profile and omits irrelevant thermal or RealSense setup pages. Existing Tk tools remain available through `bbx gui --legacy` while specialized pages are migrated without changing the underlying capture and analysis services.
+
 Current GUI covers:
 
 - Doctor checks

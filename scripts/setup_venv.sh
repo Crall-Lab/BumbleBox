@@ -13,10 +13,11 @@ Options:
   --venv-dir <path>         Main BumbleBox venv path (default: <repo>/.venv)
   --system-site-packages    Create main env with system site packages visible
   --no-system-site-packages Keep main env isolated from system site packages
-  --skip-nest-label         Skip pip install of PyQt5 + labelme in main env
+  --skip-nest-label         Skip labelme in main env (the BumbleBox PyQt GUI remains installed)
   --skip-picamera2          Skip pip install of picamera2 in main env
-  --force-pip-nest-label    Force pip install for PyQt5 + labelme in main env (Pi defaults to skip)
+  --force-pip-nest-label    Force pip install for labelme in main env (Pi defaults to skip)
   --force-pip-picamera2     Force pip install for picamera2 in main env (Pi defaults to skip)
+  --install-realsense       Attempt to install optional pyrealsense2 support
   --skip-label-env          Do not create/update dedicated labeling env
   --label-venv-dir <path>   Dedicated labeling env path (default: <repo>/.venvs/bbx-label)
   --label-python <bin>      Python interpreter for dedicated labeling env (default: --python value)
@@ -38,6 +39,7 @@ USE_SYSTEM_SITE_PACKAGES=0
 USER_SET_SYSTEM_SITE_PACKAGES=0
 INSTALL_NEST_LABEL=1
 INSTALL_PICAMERA2=1
+INSTALL_REALSENSE=0
 FORCE_PIP_NEST_LABEL=0
 FORCE_PIP_PICAMERA2=0
 SETUP_LABEL_ENV=1
@@ -326,6 +328,10 @@ while [[ $# -gt 0 ]]; do
       FORCE_PIP_PICAMERA2=1
       shift
       ;;
+    --install-realsense)
+      INSTALL_REALSENSE=1
+      shift
+      ;;
     --skip-label-env)
       SETUP_LABEL_ENV=0
       shift
@@ -400,7 +406,10 @@ if PI_MODEL="$(detect_pi_model)"; then
     SKIPPED_PIP_PICAMERA2_ON_PI=1
   fi
 
-  maybe_install_apt_packages "Pi camera + thermal stack" python3-picamera2 libcamera-apps ffmpeg v4l-utils || true
+  maybe_install_apt_packages "Pi camera + thermal + GUI stack" python3-picamera2 python3-pyqt5 libcamera-apps ffmpeg v4l-utils || true
+  if [[ "$INSTALL_REALSENSE" -eq 1 ]]; then
+    maybe_install_apt_packages "RealSense USB support" libusb-1.0-0 udev || true
+  fi
   if [[ "$SETUP_LABEL_ENV" -eq 1 ]]; then
     maybe_install_apt_packages "Pi Qt stack for nest labeling" python3-pyqt5 || true
   fi
@@ -424,9 +433,26 @@ CORE_PACKAGES=(
 echo "[BumbleBox] Installing core Python packages in main env"
 "$VENV_PY" -m pip install "${CORE_PACKAGES[@]}"
 
+if ! "$VENV_PY" -c "import PyQt5" >/dev/null 2>&1; then
+  echo "[BumbleBox] Installing PyQt5 for the primary GUI"
+  if ! "$VENV_PY" -m pip install pyqt5; then
+    echo "[BumbleBox] WARNING: PyQt5 installation failed."
+    echo "           On Raspberry Pi, install python3-pyqt5 and use --system-site-packages."
+  fi
+fi
+
+if [[ "$INSTALL_REALSENSE" -eq 1 ]]; then
+  echo "[BumbleBox] Installing optional RealSense Python support"
+  if ! "$VENV_PY" -m pip install pyrealsense2; then
+    echo "[BumbleBox] WARNING: pyrealsense2 installation failed for this Python/architecture."
+    echo "           Follow the official librealsense Raspberry Pi/source-build instructions,"
+    echo "           then make its Python bindings visible to this runtime."
+  fi
+fi
+
 if [[ "$INSTALL_NEST_LABEL" -eq 1 ]]; then
-  echo "[BumbleBox] Installing nest-label packages in main env (PyQt5, labelme)"
-  if ! "$VENV_PY" -m pip install pyqt5 labelme; then
+  echo "[BumbleBox] Installing nest-label packages in main env (labelme)"
+  if ! "$VENV_PY" -m pip install labelme; then
     echo "[BumbleBox] WARNING: main-env nest-label package install failed."
     echo "           Dedicated label env setup (below) is recommended."
   fi
@@ -462,7 +488,7 @@ import importlib
 import shutil
 import sys
 
-required = ["yaml", "numpy", "pandas", "cv2"]
+required = ["yaml", "numpy", "pandas", "cv2", "PyQt5"]
 missing = []
 for name in required:
     try:

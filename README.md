@@ -21,6 +21,9 @@ bash /Users/aec/Desktop/BumbleBox/start_bumblebox.sh
 /Users/aec/Desktop/BumbleBox/bbx thermal-check
 /Users/aec/Desktop/BumbleBox/bbx thermal-check --apply
 /Users/aec/Desktop/BumbleBox/bbx thermal-snapshot
+/Users/aec/Desktop/BumbleBox/bbx realsense-check --no-probe
+/Users/aec/Desktop/BumbleBox/bbx realsense-check --apply
+/Users/aec/Desktop/BumbleBox/bbx realsense-snapshot
 /Users/aec/Desktop/BumbleBox/bbx camera-preview --seconds 20
 /Users/aec/Desktop/BumbleBox/bbx camera-test-tracking --seconds 20
 /Users/aec/Desktop/BumbleBox/bbx roadmap
@@ -35,10 +38,10 @@ Preferred one-command setup:
 bash /Users/aec/Desktop/BumbleBox/start_bumblebox.sh
 ```
 
-This installs core V2 packages into `.venvs/bbx-runtime`.
+This installs core V2 packages, including the primary PyQt GUI, into `.venvs/bbx-runtime`.
 It also creates a dedicated nest-label environment at `/Users/aec/Desktop/BumbleBox/.venvs/bbx-label` and configures BumbleBox to auto-use it for nest-label check/launch flows.
-On non-Pi hosts it also attempts optional `picamera2`, `PyQt5`, and `labelme` installs.
-On Raspberry Pi hosts, those optional pip installs are skipped by default (preferred path is apt packages).
+On non-Pi hosts it also attempts optional `picamera2` and `labelme` installs.
+On Raspberry Pi hosts, camera and Qt dependencies use apt packages where possible.
 It installs the Desktop GUI icon and prints launch instructions.
 
 Skip flags (only if needed for debugging/non-Pi hosts):
@@ -47,6 +50,7 @@ Skip flags (only if needed for debugging/non-Pi hosts):
 bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh --skip-nest-label
 bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh --skip-picamera2
 bash /Users/aec/Desktop/BumbleBox/scripts/setup_venv.sh --skip-label-env
+bash /Users/aec/Desktop/BumbleBox/start_bumblebox.sh --install-realsense
 ```
 
 Recommended Raspberry Pi setup (more reliable than pip for camera/Qt stack):
@@ -82,6 +86,8 @@ sudo apt install python3-pyqt5 labelme
 - Pi 4/5 compatibility checks (`doctor`)
 - camera stack checks for HQ/Module3 workflows
 - USB thermal camera discovery/probe/snapshot path for PureThermal/Lepton-style devices (`thermal-check`, `thermal-snapshot`)
+- RealSense discovery, stream-profile probe, serial pinning, and raw depth/color snapshots (`realsense-check`, `realsense-snapshot`)
+- conditional hardware profiles for RGB-only, RGB+thermal, RGB+depth, and full multimodal systems
 - First-pass synchronized RGB + thermal recording when `thermal.enabled=true`
 - Automatic RGB + thermal side-by-side inspection video for synchronized thermal runs
 - camera setup tools for focus/framing and live tag-detection validation (`camera-preview`, `camera-test-tracking`)
@@ -106,9 +112,23 @@ sudo apt install python3-pyqt5 labelme
 - downstream desktop ingestion scaffold (`bbx_desktop.py`)
 - tracked-video rendering in downstream pipeline (`bbx_desktop.py analyze --with-tracked-video`, `bbx_desktop.py visualize`)
 - nest labeling launcher and dependency checks (`nest-label check|launch`)
-- operator GUI shell
+- primary PyQt operator GUI with a conditional first-run setup wizard and single-instance protection
+- legacy Tk advanced-tools bridge during the staged GUI migration
 
-## GUI Tabs
+## Primary PyQt GUI
+
+`bbx gui` opens the new PyQt interface. On first launch, a profile-based wizard collects the primary camera, optional thermal/depth hardware, data location, run mode, and recording cadence. Thermal and RealSense setup pages are skipped when those devices are not selected.
+
+The current Qt pages are:
+
+- `Overview`: profile, camera, optional-device, and storage status
+- `Run`: one-shot runs and start/stop controls for automated recordings
+- `Hardware`: only the checks relevant to the selected hardware profile
+- `Advanced`: access to the existing specialized tools while their Qt pages are migrated
+
+Only one primary Qt GUI instance is allowed per user. During migration, run `bbx gui --legacy` to open the previous Tk advanced interface.
+
+## Legacy GUI Tabs
 
 - Global header controls:
   - `View mode`: `Basic` (default) hides rarely used tuning/maintenance controls, `Advanced` shows them.
@@ -157,4 +177,5 @@ sudo apt install python3-pyqt5 labelme
 - `/Users/aec/Desktop/BumbleBox/docs/GUI_Desktop_Launcher.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Nest_Labeling_On_Debian_Pi.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Thermal_Camera.md`
+- `/Users/aec/Desktop/BumbleBox/docs/RealSense_Camera.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Legacy_Function_Review.md`

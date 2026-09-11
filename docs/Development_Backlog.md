@@ -4,6 +4,41 @@ This document tracks research and engineering work that is not part of the
 operator setup roadmap. Check off subtasks as they are implemented and
 validated.
 
+## RealSense and Multimodal Acquisition
+
+**Status:** Phase 1 implemented; Pi hardware validation required
+
+**Goal:** Integrate D405 depth with interchangeable HQ/OwlSight RGB capture and PureThermal data without obscuring timestamp provenance or exceeding Pi resources.
+
+- [x] Add conditional hardware profiles and first-run setup wizard pages.
+- [x] Add RealSense discovery, advertised-profile reporting, exact stream probe, and serial pinning.
+- [x] Save raw depth/color snapshots with device and host timing metadata.
+- [x] Add health-check coverage and warn when `run-once` cannot yet record enabled depth.
+- [ ] Run `realsense-check --apply` on the Raspberry Pi 5 and retain the full profile report.
+- [ ] Validate depth scale, near-field nest coverage, invalid-pixel rate, and thermal/RGB interference.
+- [ ] Benchmark OwlSight + PureThermal + D405 USB, CPU, RAM, and storage load together.
+- [ ] Build a shared acquisition coordinator with host monotonic receipt timestamps for all streams.
+- [ ] Preserve native device timestamps/frame numbers and define clock-domain mappings.
+- [ ] Write depth incrementally with explicit dropped-frame and device-loss behavior.
+- [ ] Add multimodal run summaries, timestamp tables, and frame-by-frame inspection output.
+- [ ] Calibrate temporal offset and multi-depth spatial registration.
+
+See `docs/RealSense_Camera.md` for the hardware validation workflow and phase boundary.
+
+## PyQt GUI Migration
+
+**Status:** Primary shell and setup wizard implemented
+
+- [x] Make PyQt the default GUI and retain `bbx gui --legacy` as a migration bridge.
+- [x] Add single-instance protection to reduce conflicting operator sessions.
+- [x] Add profile-aware setup wizard, overview, run controls, and conditional hardware checks.
+- [ ] Port storage setup and mount-status interactions from Tk.
+- [ ] Port the full config editor with Basic and Advanced sections.
+- [ ] Port calibration and thermal registration interfaces.
+- [ ] Port tracking optimization and candidate-review interfaces.
+- [ ] Port fleet management, run history, alerts, and bundle export.
+- [ ] Remove the Tk bridge only after feature parity and Pi operator testing.
+
 ## RGB and Thermal Camera Synchronization
 
 **Status:** Planned
@@ -93,4 +128,3 @@ misaligned frames even when their recorded host timestamps are close.
 - [ ] Consider the feature ready when repeated calibration recordings produce
       stable offset estimates and holdout transitions align within the expected
       uncertainty imposed by the recording frame rates.
-

@@ -84,6 +84,14 @@ from .nest_labeling import (
     launch_nest_labeling,
 )
 from .roadmap import render_roadmap
+from .realsense_camera import (
+    apply_detected_realsense_config,
+    capture_realsense_snapshot,
+    format_realsense_check_result,
+    format_realsense_snapshot_result,
+    run_realsense_check,
+    write_realsense_check_json,
+)
 from .run_bundle import (
     export_run_bundle,
     find_latest_summary_path,
@@ -977,6 +985,64 @@ def _cmd_thermal_snapshot(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_realsense_check(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    result = run_realsense_check(
+        config,
+        serial_override=args.serial,
+        probe=not args.no_probe,
+    )
+    print(format_realsense_check_result(result))
+
+    if args.apply:
+        try:
+            updated = apply_detected_realsense_config(config, result)
+            save_config(config_path, updated)
+            print(f"\nApplied detected RealSense settings to: {config_path}")
+            print("  realsense.enabled = true")
+            print(f"  realsense.device_serial = {result.selected_serial}")
+        except Exception as exc:
+            print(f"\nRealSense check completed, but apply failed: {exc}")
+            return 1
+
+    if args.json_out:
+        try:
+            path = write_realsense_check_json(result, args.json_out)
+            print(f"\nJSON report saved: {path}")
+        except Exception as exc:
+            print(f"RealSense check completed, but failed to write JSON report: {exc}")
+            return 1
+    return 1 if result.errors else 0
+
+
+def _cmd_realsense_snapshot(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    try:
+        result = capture_realsense_snapshot(
+            config,
+            serial_override=args.serial,
+            output_dir=args.output_dir,
+        )
+    except Exception as exc:
+        print(f"RealSense snapshot failed: {exc}")
+        return 1
+
+    print(format_realsense_snapshot_result(result))
+    return 0
+
+
 def _cmd_calibrate_manual(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     try:
@@ -1023,15 +1089,19 @@ def _cmd_calibrate_aruco(args: argparse.Namespace) -> int:
 
 
 def _cmd_gui(args: argparse.Namespace) -> int:
-    del args
     try:
-        from .gui_app import launch
+        if args.legacy:
+            from .gui_app import launch
+        else:
+            from .qt_gui import launch
     except Exception as exc:
         print(f"Failed to load GUI: {exc}")
         return 1
 
-    launch()
-    return 0
+    if args.legacy:
+        launch()
+        return 0
+    return int(launch(config_path=args.config))
 
 
 def _cmd_gui_install_shortcut(args: argparse.Namespace) -> int:
@@ -3909,6 +3979,40 @@ def build_parser() -> argparse.ArgumentParser:
     thermal_snapshot_parser.add_argument("--json-out", help="Optional path to save JSON report.")
     thermal_snapshot_parser.set_defaults(func=_cmd_thermal_snapshot)
 
+    realsense_parser = subparsers.add_parser(
+        "realsense-check",
+        help="Discover RealSense devices and verify the configured depth and color streams.",
+    )
+    _add_common_config_arg(realsense_parser)
+    realsense_parser.add_argument(
+        "--serial",
+        help="Optional RealSense serial override. By default, use realsense.device_serial or the first device.",
+    )
+    realsense_parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="List devices without starting the configured depth and color streams.",
+    )
+    realsense_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="After a successful probe, enable RealSense and pin the selected serial in config.",
+    )
+    realsense_parser.add_argument("--json-out", help="Optional path to save the check report as JSON.")
+    realsense_parser.set_defaults(func=_cmd_realsense_check)
+
+    realsense_snapshot_parser = subparsers.add_parser(
+        "realsense-snapshot",
+        help="Save one RealSense raw depth frame, depth previews, color frame, and metadata.",
+    )
+    _add_common_config_arg(realsense_snapshot_parser)
+    realsense_snapshot_parser.add_argument("--serial", help="Optional RealSense serial override.")
+    realsense_snapshot_parser.add_argument(
+        "--output-dir",
+        help="Optional output directory. Defaults to <system.data_root>/<date>/realsense.",
+    )
+    realsense_snapshot_parser.set_defaults(func=_cmd_realsense_snapshot)
+
     run_once_parser = subparsers.add_parser(
         "run-once",
         help="Execute one BumbleBox V2 run (record, track, or record+track).",
@@ -4503,7 +4607,13 @@ def build_parser() -> argparse.ArgumentParser:
     aruco_parser.add_argument("--dry-run", action="store_true", help="Print calibration but do not update config.")
     aruco_parser.set_defaults(func=_cmd_calibrate_aruco)
 
-    gui_parser = subparsers.add_parser("gui", help="Launch the BumbleBox V2 desktop GUI.")
+    gui_parser = subparsers.add_parser("gui", help="Launch the BumbleBox PyQt desktop GUI.")
+    _add_common_config_arg(gui_parser)
+    gui_parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Open the previous Tk GUI while specialized pages are being migrated to Qt.",
+    )
     gui_parser.set_defaults(func=_cmd_gui)
 
     gui_shortcut_parser = subparsers.add_parser(
