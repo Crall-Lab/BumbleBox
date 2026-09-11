@@ -110,10 +110,22 @@ When `realsense.enabled: true`, each recording session includes:
 
 OwlSight/HQ, thermal, and RealSense workers wait on the same host monotonic start deadline. This makes their host timestamps directly comparable, but does not imply simultaneous exposure: each camera and driver still has its own buffering and transport latency.
 
+## Hardware-Free Integration Test
+
+Run the complete recording and output path without opening any cameras:
+
+```bash
+./bbx simulate-capture
+```
+
+This writes a short RGB, thermal, and RealSense session below the operating system temporary directory and prints the exact session path. Use `--output-root PATH` to retain it elsewhere. The generated streams share one deterministic clock and one moving target: a bright RGB marker, thermal hotspot, and nearer depth patch occupy the same normalized image position. This makes the output useful for checking timestamp handling, frame pairing, output names, and visualization behavior.
+
+The default simulation is intentionally smaller than production capture. Resolution, duration, and frame-rate controls are available through `./bbx simulate-capture --help`. For lower-level tests, `run-once --mock-camera` now simulates every optional sensor enabled in the supplied config, but it retains that config's full production dimensions and duration.
+
 ## Remaining Integration Plan
 
 1. Validate the `848x480@30` profile after moving the D405 to USB 3.
 2. Measure CPU, RAM, USB bandwidth, and storage throughput with OwlSight, PureThermal, and D405 active.
 3. Add an explicit degradation policy: fail the run, continue without depth, or retry when one camera drops.
-4. Calibrate temporal offset using a shared physical cue, then estimate spatial transforms at multiple nest depths.
+4. Create a `calibration-project`, register shared-cue captures at multiple nest depths, and implement the solvers described in `docs/Multimodal_Calibration.md`.
 5. Add synchronized multimodal inspection outputs and acceptance tests before enabling production automation.

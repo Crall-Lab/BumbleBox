@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +77,14 @@ from .fleet import (
     write_queen_track_json,
 )
 from .gui_launcher import format_gui_shortcut_result, install_gui_shortcut
+from .multimodal_calibration import (
+    add_calibration_session,
+    format_calibration_project_result,
+    format_calibration_project_status,
+    format_calibration_session_result,
+    get_calibration_project_status,
+    initialize_calibration_project,
+)
 from .nest_labeling import (
     build_nest_labeling_command,
     check_nest_labeling_environment,
@@ -746,7 +755,7 @@ def _cmd_camera_check(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"Camera check completed, but failed to write JSON report: {exc}")
             return 1
-    return 0 if result.ir_compatibility_error is None else 1
+    return 0 if result.ir_compatibility_error is None and result.connection_status == "ready" else 1
 
 
 def _format_camera_reset_result(result) -> str:
@@ -1088,6 +1097,51 @@ def _cmd_calibrate_aruco(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_calibration_project_init(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+        result = initialize_calibration_project(
+            config,
+            args.project,
+            project_name=args.name,
+            force=bool(args.force),
+        )
+    except Exception as exc:
+        print(f"Could not create calibration project: {exc}")
+        return 1
+    print(format_calibration_project_result(result))
+    return 0
+
+
+def _cmd_calibration_project_add_session(args: argparse.Namespace) -> int:
+    try:
+        result = add_calibration_session(
+            args.project,
+            args.summary,
+            role=args.role,
+            depth_layer=args.depth_layer,
+            notes=args.notes,
+        )
+    except Exception as exc:
+        print(f"Could not register calibration session: {exc}")
+        return 1
+    print(format_calibration_session_result(result))
+    print("")
+    print(format_calibration_project_status(get_calibration_project_status(args.project)))
+    return 0
+
+
+def _cmd_calibration_project_status(args: argparse.Namespace) -> int:
+    try:
+        status = get_calibration_project_status(args.project)
+    except Exception as exc:
+        print(f"Could not read calibration project: {exc}")
+        return 1
+    print(format_calibration_project_status(status))
+    return 0
+
+
 def _cmd_gui(args: argparse.Namespace) -> int:
     try:
         if args.legacy:
@@ -1219,6 +1273,96 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
         print(f"Run failed to start: {exc}")
         return 1
 
+    print(format_run_summary(summary))
+    return 0 if summary.success else 1
+
+
+def _cmd_simulate_capture(args: argparse.Namespace) -> int:
+    if float(args.seconds) <= 0 or float(args.rgb_fps) <= 0 or int(args.realsense_fps) <= 0:
+        print("Simulation error: duration and frame rates must be greater than zero.")
+        return 1
+    dimensions = {
+        "RGB": (int(args.rgb_width), int(args.rgb_height)),
+        "thermal": (int(args.thermal_width), int(args.thermal_height)),
+        "RealSense": (int(args.realsense_width), int(args.realsense_height)),
+    }
+    invalid_dimensions = [
+        label
+        for label, (width, height) in dimensions.items()
+        if width <= 0 or height <= 0 or width % 2 or height % 2
+    ]
+    if invalid_dimensions:
+        print(
+            "Simulation error: positive even width/height values are required for "
+            + ", ".join(invalid_dimensions)
+            + "."
+        )
+        return 1
+
+    config_path = Path(args.config)
+    try:
+        config = _load_or_defaults(config_path)
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    output_root = (
+        Path(args.output_root).expanduser()
+        if args.output_root
+        else Path(tempfile.gettempdir()) / "bumblebox-simulation"
+    )
+    config.setdefault("system", {})["data_root"] = str(output_root)
+    config.setdefault("local_index", {})["enabled"] = False
+    config.setdefault("pipeline", {})["mode"] = "record_only"
+    config.setdefault("capture", {})["recording_seconds"] = float(args.seconds)
+    config.setdefault("runtime", {}).update(
+        {
+            "use_mock_camera": True,
+            "fps_report_on_each_recording": False,
+            "render_tracking_video": False,
+        }
+    )
+    config.setdefault("camera", {}).update(
+        {
+            "profile": "custom",
+            "model": "auto",
+            "width": int(args.rgb_width),
+            "height": int(args.rgb_height),
+            "fps_target": float(args.rgb_fps),
+            "codec": "mjpeg",
+            "infrared": False,
+        }
+    )
+    config.setdefault("thermal", {}).update(
+        {
+            "enabled": True,
+            "width": int(args.thermal_width),
+            "height": int(args.thermal_height),
+            "fps_target": float(args.rgb_fps),
+            "pixel_format": "y16",
+        }
+    )
+    config.setdefault("realsense", {}).update(
+        {
+            "enabled": True,
+            "depth_width": int(args.realsense_width),
+            "depth_height": int(args.realsense_height),
+            "color_width": int(args.realsense_width),
+            "color_height": int(args.realsense_height),
+            "fps": int(args.realsense_fps),
+            "align_to": "none",
+            "save_depth": True,
+            "save_color": True,
+        }
+    )
+
+    print("Running a hardware-free RGB + thermal + RealSense recording simulation.")
+    print(f"Simulation output root: {output_root}")
+    try:
+        summary = run_once(config=config, mode_override="record_only")
+    except Exception as exc:
+        print(f"Simulation failed to start: {exc}")
+        return 1
     print(format_run_summary(summary))
     return 0 if summary.success else 1
 
@@ -4026,7 +4170,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_once_parser.add_argument(
         "--mock-camera",
         action="store_true",
-        help="Use synthetic frames instead of picamera2 capture (for testing).",
+        help="Simulate RGB and every enabled optional sensor instead of opening hardware.",
     )
     run_once_parser.add_argument(
         "--codec",
@@ -4081,6 +4225,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_once_parser.set_defaults(visualization=None)
     run_once_parser.set_defaults(func=_cmd_run_once)
+
+    simulate_parser = subparsers.add_parser(
+        "simulate-capture",
+        help="Run a short hardware-free RGB + thermal + RealSense recording test.",
+    )
+    _add_common_config_arg(simulate_parser)
+    simulate_parser.add_argument(
+        "--output-root",
+        help="Simulation data root (default: the operating system temporary directory).",
+    )
+    simulate_parser.add_argument(
+        "--seconds",
+        type=float,
+        default=2.0,
+        help="Simulated recording duration in seconds (default: 2).",
+    )
+    simulate_parser.add_argument("--rgb-width", type=int, default=640)
+    simulate_parser.add_argument("--rgb-height", type=int, default=480)
+    simulate_parser.add_argument("--rgb-fps", type=float, default=5.0)
+    simulate_parser.add_argument("--thermal-width", type=int, default=160)
+    simulate_parser.add_argument("--thermal-height", type=int, default=120)
+    simulate_parser.add_argument("--realsense-width", type=int, default=320)
+    simulate_parser.add_argument("--realsense-height", type=int, default=240)
+    simulate_parser.add_argument("--realsense-fps", type=int, default=10)
+    simulate_parser.set_defaults(func=_cmd_simulate_capture)
 
     track_videos_parser = subparsers.add_parser(
         "track-videos",
@@ -4606,6 +4775,58 @@ def build_parser() -> argparse.ArgumentParser:
     aruco_parser.add_argument("--marker-id", type=int, help="Optional marker ID to use.")
     aruco_parser.add_argument("--dry-run", action="store_true", help="Print calibration but do not update config.")
     aruco_parser.set_defaults(func=_cmd_calibrate_aruco)
+
+    calibration_project_parser = subparsers.add_parser(
+        "calibration-project",
+        help="Create and manage an RGB, thermal, and RealSense calibration project.",
+    )
+    calibration_project_sub = calibration_project_parser.add_subparsers(
+        dest="calibration_project_command",
+        required=True,
+    )
+    calibration_project_init = calibration_project_sub.add_parser(
+        "init",
+        help="Initialize a versioned three-camera calibration project and workflow guide.",
+    )
+    _add_common_config_arg(calibration_project_init)
+    calibration_project_init.add_argument(
+        "--project",
+        required=True,
+        help="Calibration project directory to create.",
+    )
+    calibration_project_init.add_argument("--name", help="Optional project display name.")
+    calibration_project_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Refresh an existing manifest without deleting registered captures or calibration artifacts.",
+    )
+    calibration_project_init.set_defaults(func=_cmd_calibration_project_init)
+
+    calibration_project_add = calibration_project_sub.add_parser(
+        "add-session",
+        help="Register one BumbleBox run summary as a calibration or validation capture.",
+    )
+    calibration_project_add.add_argument("--project", required=True, help="Calibration project directory.")
+    calibration_project_add.add_argument("--summary", required=True, help="Run summary JSON to register.")
+    calibration_project_add.add_argument(
+        "--role",
+        choices=["calibration", "validation"],
+        default="calibration",
+        help="How this capture will be used (default: calibration).",
+    )
+    calibration_project_add.add_argument(
+        "--depth-layer",
+        help="Physical depth label, for example floor, mid, or upper.",
+    )
+    calibration_project_add.add_argument("--notes", help="Optional capture notes.")
+    calibration_project_add.set_defaults(func=_cmd_calibration_project_add_session)
+
+    calibration_project_status = calibration_project_sub.add_parser(
+        "status",
+        help="Show capture coverage, stage readiness, and next calibration actions.",
+    )
+    calibration_project_status.add_argument("--project", required=True, help="Calibration project directory.")
+    calibration_project_status.set_defaults(func=_cmd_calibration_project_status)
 
     gui_parser = subparsers.add_parser("gui", help="Launch the BumbleBox PyQt desktop GUI.")
     _add_common_config_arg(gui_parser)

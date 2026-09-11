@@ -12,8 +12,19 @@ from .qt_env import sanitize_current_qt_env
 sanitize_current_qt_env()
 
 try:
-    from PyQt5.QtCore import QLockFile, QProcess, QStandardPaths, Qt, QTimer, QUrl
-    from PyQt5.QtGui import QDesktopServices, QFont, QTextCursor
+    from PyQt5.QtCore import (
+        QObject,
+        QLockFile,
+        QProcess,
+        QRunnable,
+        QStandardPaths,
+        QThreadPool,
+        Qt,
+        QTimer,
+        QUrl,
+        pyqtSignal,
+    )
+    from PyQt5.QtGui import QDesktopServices, QFont, QFontDatabase, QTextCursor
     from PyQt5.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -33,6 +44,11 @@ try:
         QPushButton,
         QSpinBox,
         QStackedWidget,
+        QAbstractItemView,
+        QHeaderView,
+        QInputDialog,
+        QTableWidget,
+        QTableWidgetItem,
         QTextEdit,
         QVBoxLayout,
         QWidget,
@@ -48,6 +64,14 @@ except ImportError as exc:  # pragma: no cover - depends on desktop runtime
 from .camera_profiles import CAMERA_PROFILES, apply_camera_profile
 from .config import DEFAULT_USER_CONFIG_PATH, load_config, load_defaults, save_config
 from .hardware_profiles import HARDWARE_PROFILES, apply_hardware_profile
+from .multimodal_calibration import (
+    MANIFEST_NAME as CALIBRATION_MANIFEST_NAME,
+    add_calibration_session,
+    format_calibration_project_status,
+    get_calibration_project_status,
+    initialize_calibration_project,
+)
+from .status_history import list_recent_run_records, load_run_summary
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,61 +88,268 @@ PAGE_SUMMARY = 6
 
 APP_STYLE = """
 QWidget {
-    background: #f4f0e6;
-    color: #172326;
-    font-family: "Avenir Next", "DejaVu Sans", sans-serif;
+    color: #293936;
+    font-family: "Avenir Next", "Noto Sans", "DejaVu Sans", sans-serif;
     font-size: 14px;
 }
-QMainWindow, QWizard { background: #f4f0e6; }
+QMainWindow, QWizard, QWidget#AppRoot { background: #f7f6f1; }
+QWidget#ContentShell {
+    background: qlineargradient(
+        x1: 0, y1: 0, x2: 1, y2: 1,
+        stop: 0 #faf9f5,
+        stop: 0.58 #f6f7f2,
+        stop: 1 #eef5f1
+    );
+}
 QLabel { background: transparent; }
-QLabel#Title { font-size: 31px; font-weight: 700; color: #172326; }
-QLabel#Subtitle { font-size: 15px; color: #526064; }
-QLabel#SectionTitle { font-size: 23px; font-weight: 650; color: #172326; }
-QLabel#Eyebrow { color: #92721f; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
-QLabel#StatusGood { color: #25664a; font-weight: 700; }
-QLabel#StatusWarn { color: #9b5f16; font-weight: 700; }
-QFrame#Sidebar { background: #172326; border: none; }
-QFrame#Card, QGroupBox {
-    background: #fffdf7;
-    border: 1px solid #d7d0c0;
-    border-radius: 12px;
+QLabel#PageLabel {
+    color: #668078;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.4px;
+}
+QLabel#Subtitle { color: #61706c; font-size: 15px; }
+QLabel#SectionTitle { color: #243633; font-size: 27px; font-weight: 600; }
+QLabel#Eyebrow {
+    color: #657a74;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+QLabel#StatusGood {
+    background: #e4f2e9;
+    color: #27694f;
+    border-radius: 9px;
+    padding: 9px 12px;
+    font-weight: 600;
+}
+QLabel#StatusWarn {
+    background: #fff0d4;
+    color: #8b5d17;
+    border-radius: 9px;
+    padding: 9px 12px;
+    font-weight: 600;
+}
+QLabel#Brand {
+    color: #2f695d;
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+QLabel#BrandSubtitle, QLabel#PrivacyNote {
+    color: #71827c;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+}
+QLabel#ProfileBadge {
+    background: #fff0bd;
+    color: #694f13;
+    border: 1px solid #f0d987;
+    border-radius: 13px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QLabel#Hint { color: #6b7773; font-size: 13px; }
+QFrame#Sidebar {
+    background: #e7f0eb;
+    border: none;
+    border-right: 1px solid #d4e2da;
+}
+QFrame#Card {
+    background: #fffefb;
+    border: 1px solid #e3e4dc;
+    border-radius: 15px;
+}
+QFrame#Card[tone="peach"] { background: #fff0e7; border-color: #f2d9ca; }
+QFrame#Card[tone="sun"] { background: #fff6d9; border-color: #efdfaa; }
+QFrame#Card[tone="sky"] { background: #eaf4f6; border-color: #d3e5e8; }
+QFrame#Card[tone="mint"] { background: #e9f3ee; border-color: #d2e4da; }
+QFrame#Card QLabel[valueLabel="true"] {
+    color: #273a36;
+    font-size: 16px;
+    font-weight: 600;
 }
 QGroupBox {
-    margin-top: 14px;
-    padding: 18px 14px 12px 14px;
-    font-weight: 700;
+    background: rgba(255, 254, 251, 238);
+    border: 1px solid #e0e3da;
+    border-radius: 14px;
+    color: #314440;
+    font-weight: 600;
+    margin-top: 15px;
+    padding: 20px 16px 14px 16px;
 }
-QGroupBox::title { subcontrol-origin: margin; left: 15px; padding: 0 5px; }
+QGroupBox[tone="peach"] { background: #fff5ee; border-color: #f0ddd2; }
+QGroupBox[tone="sun"] { background: #fff9e8; border-color: #eee2bd; }
+QGroupBox[tone="sky"] { background: #f0f8f9; border-color: #d8e8ea; }
+QGroupBox[tone="mint"] { background: #f0f7f3; border-color: #d7e7de; }
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 16px;
+    padding: 0 7px;
+    background: transparent;
+}
 QListWidget {
-    background: #172326;
-    color: #dce4df;
+    background: transparent;
+    color: #49605a;
     border: none;
     outline: none;
-    padding: 16px 10px;
+    padding: 22px 0;
 }
-QListWidget::item { padding: 13px 14px; margin: 3px 0; border-radius: 8px; }
-QListWidget::item:selected { background: #d8a928; color: #172326; font-weight: 700; }
+QListWidget::item {
+    border: 1px solid transparent;
+    border-radius: 11px;
+    padding: 12px 14px;
+    margin: 2px 0;
+}
+QListWidget::item:hover { background: #f2f7f4; color: #315c52; }
+QListWidget::item:selected {
+    background: #fffefb;
+    color: #2c675b;
+    border: 1px solid #d5e4dc;
+    font-weight: 600;
+}
 QPushButton {
-    background: #172326;
+    background: #e4eee9;
+    color: #2d5b51;
+    border: 1px solid #d1e1d9;
+    border-radius: 10px;
+    padding: 9px 15px;
+    font-weight: 600;
+}
+QPushButton:hover { background: #d8e8e0; border-color: #bcd3c8; }
+QPushButton:pressed { background: #cde0d7; }
+QPushButton:disabled {
+    background: #edf0ec;
+    color: #a4aaa6;
+    border-color: #e2e5e1;
+}
+QPushButton#Primary {
+    background: #39786a;
+    color: #ffffff;
+    border-color: #39786a;
+}
+QPushButton#Primary:hover { background: #306b5f; border-color: #306b5f; }
+QPushButton#Accent {
+    background: #e5ad42;
+    color: #4a3811;
+    border-color: #e5ad42;
+}
+QPushButton#Accent:hover { background: #dca037; border-color: #dca037; }
+QPushButton#Quiet {
+    background: #fffefb;
+    color: #52625e;
+    border-color: #dcded7;
+}
+QPushButton#Quiet:hover { background: #f5f5ef; border-color: #cdd4cf; }
+QLineEdit, QComboBox, QSpinBox {
+    background: #ffffff;
+    border: 1px solid #ccd3ce;
+    border-radius: 9px;
+    padding: 8px 10px;
+    selection-background-color: #b9d9cf;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+    border: 2px solid #4d8b7d;
+    padding: 7px 9px;
+}
+QComboBox::drop-down { border: none; width: 24px; }
+QCheckBox { spacing: 9px; color: #40524e; }
+QCheckBox::indicator { width: 17px; height: 17px; }
+QToolTip {
+    background: #263b37;
     color: #ffffff;
     border: none;
-    border-radius: 7px;
-    padding: 9px 14px;
-    font-weight: 650;
-}
-QPushButton:hover { background: #294044; }
-QPushButton:disabled { background: #a8aca8; color: #ececec; }
-QPushButton#Accent { background: #d8a928; color: #172326; }
-QPushButton#Accent:hover { background: #e4bc4e; }
-QPushButton#Quiet { background: #e6e0d3; color: #263438; }
-QLineEdit, QComboBox, QSpinBox, QTextEdit {
-    background: #ffffff;
-    border: 1px solid #bbb5a8;
     border-radius: 6px;
-    padding: 7px;
-    selection-background-color: #d8a928;
+    padding: 6px 8px;
 }
-QTextEdit { background: #132126; color: #dcebe8; font-family: "SFMono-Regular", "DejaVu Sans Mono", monospace; }
+QTableWidget {
+    background: #fffefb;
+    alternate-background-color: #f5f8f5;
+    border: 1px solid #dde2dc;
+    border-radius: 11px;
+    gridline-color: #e9ece7;
+    selection-background-color: #fff0bd;
+    selection-color: #30433f;
+}
+QHeaderView::section {
+    background: #dfece6;
+    color: #36554d;
+    border: none;
+    border-right: 1px solid #cfded7;
+    padding: 9px 7px;
+    font-weight: 600;
+}
+QTextEdit {
+    background: #213431;
+    color: #dceae5;
+    border: 1px solid #314944;
+    border-radius: 10px;
+    padding: 8px;
+    selection-background-color: #4a7e72;
+    font-size: 12px;
+}
+QScrollBar:vertical {
+    background: transparent;
+    width: 11px;
+    margin: 2px;
+}
+QScrollBar::handle:vertical {
+    background: #c6d3cd;
+    min-height: 28px;
+    border-radius: 4px;
+}
+QScrollBar::handle:vertical:hover { background: #aebfb7; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal {
+    background: transparent;
+    height: 11px;
+    margin: 2px;
+}
+QScrollBar::handle:horizontal {
+    background: #c6d3cd;
+    min-width: 28px;
+    border-radius: 4px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QFrame#WelcomeCard {
+    background: qlineargradient(
+        x1: 0, y1: 0, x2: 1, y2: 1,
+        stop: 0 #e8f3ed,
+        stop: 0.58 #f5f5e8,
+        stop: 1 #fff0dc
+    );
+    border: 1px solid #d7e4dc;
+    border-radius: 18px;
+}
+QLabel#WelcomeHeroTitle {
+    color: #27453e;
+    font-size: 25px;
+    font-weight: 600;
+}
+QFrame#StepCard {
+    background: rgba(255, 255, 255, 180);
+    border: 1px solid rgba(255, 255, 255, 210);
+    border-radius: 11px;
+}
+QLabel#StepNumber {
+    background: #e5ad42;
+    color: #493810;
+    border-radius: 12px;
+    min-width: 24px;
+    max-width: 24px;
+    min-height: 24px;
+    max-height: 24px;
+    font-weight: 700;
+}
+QFrame#SummaryCard {
+    background: #edf6f1;
+    border: 1px solid #d3e5dc;
+    border-radius: 14px;
+}
+QWizardPage { background: #f7f6f1; }
+QWizard QPushButton { min-width: 88px; }
 QWizard QLabel { background: transparent; }
 """
 
@@ -142,6 +373,51 @@ def _page_heading(title: str, subtitle: str) -> tuple[QLabel, QLabel]:
     return heading, description
 
 
+class _RunHistorySignals(QObject):
+    finished = pyqtSignal(int, object, object)
+
+
+class _RunHistoryWorker(QRunnable):
+    def __init__(self, generation: int, data_root: str, limit: int = 60) -> None:
+        super().__init__()
+        self.generation = int(generation)
+        self.data_root = str(data_root)
+        self.limit = int(limit)
+        self.signals = _RunHistorySignals()
+
+    def _emit_finished(self, payloads: list[dict[str, Any]], error: str | None) -> None:
+        try:
+            self.signals.finished.emit(self.generation, payloads, error)
+        except RuntimeError:
+            # The application window may close while a removable-drive scan is finishing.
+            pass
+
+    def run(self) -> None:
+        payloads: list[dict[str, Any]] = []
+        try:
+            for record in list_recent_run_records(self.data_root, limit=self.limit):
+                try:
+                    payload = load_run_summary(record.summary_path)
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                payload = dict(payload)
+                payload["_summary_path"] = str(record.summary_path.resolve())
+                recorded_session_text = str(payload.get("session_dir") or "").strip()
+                recorded_session_dir = Path(recorded_session_text).expanduser()
+                payload["_session_dir_local"] = str(
+                    recorded_session_dir.resolve()
+                    if recorded_session_text and recorded_session_dir.exists()
+                    else record.summary_path.parent.resolve()
+                )
+                payloads.append(payload)
+        except Exception as exc:
+            self._emit_finished([], str(exc))
+            return
+        self._emit_finished(payloads, None)
+
+
 class WelcomePage(QWizardPage):
     def __init__(self) -> None:
         super().__init__()
@@ -150,9 +426,56 @@ class WelcomePage(QWizardPage):
             "This wizard records the hardware you are actually using and shows only the setup steps that apply."
         )
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 20, 18, 14)
+        layout.setSpacing(16)
+
+        hero = QFrame()
+        hero.setObjectName("WelcomeCard")
+        hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(24, 24, 24, 24)
+        hero_layout.setSpacing(12)
+
+        eyebrow = QLabel("QUICK, GUIDED SETUP")
+        eyebrow.setObjectName("Eyebrow")
+        hero_layout.addWidget(eyebrow)
+        hero_title = QLabel("A clear start for every BumbleBox")
+        hero_title.setObjectName("WelcomeHeroTitle")
+        hero_title.setWordWrap(True)
+        hero_layout.addWidget(hero_title)
+        hero_copy = QLabel(
+            "Choose only the devices in this setup. BumbleBox will keep the everyday workspace focused on what you use."
+        )
+        hero_copy.setObjectName("Subtitle")
+        hero_copy.setWordWrap(True)
+        hero_layout.addWidget(hero_copy)
+
+        steps = QHBoxLayout()
+        steps.setSpacing(10)
+        for number, title in (
+            ("1", "Choose hardware"),
+            ("2", "Set capture basics"),
+            ("3", "Review and save"),
+        ):
+            step = QFrame()
+            step.setObjectName("StepCard")
+            step_layout = QHBoxLayout(step)
+            step_layout.setContentsMargins(10, 10, 10, 10)
+            step_layout.setSpacing(8)
+            number_label = QLabel(number)
+            number_label.setObjectName("StepNumber")
+            number_label.setAlignment(Qt.AlignCenter)
+            title_label = QLabel(title)
+            title_label.setWordWrap(True)
+            step_layout.addWidget(number_label)
+            step_layout.addWidget(title_label, 1)
+            steps.addWidget(step, 1)
+        hero_layout.addLayout(steps)
+        layout.addWidget(hero)
+
         note = QLabel(
             "You can rerun this wizard at any time. It does not erase tracking parameters or previous data."
         )
+        note.setObjectName("Hint")
         note.setWordWrap(True)
         layout.addWidget(note)
         layout.addStretch(1)
@@ -167,7 +490,11 @@ class HardwarePage(QWizardPage):
         self.setTitle("Choose a hardware profile")
         self.setSubTitle("Optional setup pages are skipped when their device is not part of this BumbleBox.")
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 14)
+        layout.setSpacing(14)
         form = QFormLayout()
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(14)
         self.profile = QComboBox()
         for key, profile in HARDWARE_PROFILES.items():
             self.profile.addItem(profile.label, key)
@@ -176,6 +503,7 @@ class HardwarePage(QWizardPage):
         layout.addLayout(form)
 
         self.description = QLabel()
+        self.description.setObjectName("Hint")
         self.description.setWordWrap(True)
         layout.addWidget(self.description)
         self.thermal = QCheckBox("Use a PureThermal / Lepton camera")
@@ -209,7 +537,11 @@ class RgbPage(QWizardPage):
         self.setTitle("Configure the primary camera")
         self.setSubTitle("Named profiles keep HQ and OwlSight comparisons repeatable.")
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 14)
+        layout.setSpacing(14)
         form = QFormLayout()
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(14)
         self.profile = QComboBox()
         for key, profile in CAMERA_PROFILES.items():
             self.profile.addItem(profile.label, key)
@@ -217,12 +549,14 @@ class RgbPage(QWizardPage):
         form.addRow("Camera profile", self.profile)
         layout.addLayout(form)
         self.description = QLabel()
+        self.description.setObjectName("Hint")
         self.description.setWordWrap(True)
         layout.addWidget(self.description)
         visible_note = QLabel(
             "OwlSight uses visible illumination because the stock OV64A40 camera is treated as IR-cut. "
             "The HQ NoIR reference profile keeps the established infrared workflow."
         )
+        visible_note.setObjectName("Hint")
         visible_note.setWordWrap(True)
         layout.addWidget(visible_note)
         layout.addStretch(1)
@@ -248,6 +582,9 @@ class ThermalPage(QWizardPage):
         self.setTitle("Configure thermal capture")
         self.setSubTitle("Auto discovery is recommended; a successful check can later pin the stable V4L by-id path.")
         form = QFormLayout(self)
+        form.setContentsMargins(18, 18, 18, 14)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(14)
         thermal = config.get("thermal", {})
         self.device = QLineEdit(str(thermal.get("device_path", "auto") or "auto"))
         self.width = QSpinBox()
@@ -272,6 +609,9 @@ class RealSensePage(QWizardPage):
             "These are initial D405 test settings. The hardware check will confirm which exact profiles the connected camera accepts."
         )
         form = QFormLayout(self)
+        form.setContentsMargins(18, 18, 18, 14)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(14)
         depth = config.get("realsense", {})
         self.serial = QLineEdit(str(depth.get("device_serial", "auto") or "auto"))
         self.depth_width = QSpinBox()
@@ -306,6 +646,9 @@ class ExperimentPage(QWizardPage):
         self.setTitle("Set experiment basics")
         self.setSubTitle("These are the settings needed for normal recording; specialized controls remain outside the wizard.")
         form = QFormLayout(self)
+        form.setContentsMargins(18, 18, 18, 14)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(14)
         self.colony = QLineEdit(str(config.get("system", {}).get("colony_id", "01")))
         path_row = QWidget()
         path_layout = QHBoxLayout(path_row)
@@ -352,10 +695,16 @@ class SummaryPage(QWizardPage):
         self.setTitle("Review setup")
         self.setSubTitle("Finish writes these choices to the BumbleBox configuration.")
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 14)
+        card = QFrame()
+        card.setObjectName("SummaryCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(22, 20, 22, 20)
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.RichText)
-        layout.addWidget(self.summary)
+        card_layout.addWidget(self.summary)
+        layout.addWidget(card)
         layout.addStretch(1)
 
     def initializePage(self) -> None:
@@ -386,9 +735,10 @@ class BumbleBoxSetupWizard(QWizard):
         self.config_path = config_path
         self.config = config
         self.setWindowTitle("BumbleBox Setup Wizard")
+        self.setObjectName("SetupWizard")
         self.setWizardStyle(QWizard.ModernStyle)
         self.setOption(QWizard.NoBackButtonOnStartPage, True)
-        self.resize(720, 560)
+        self.resize(760, 600)
 
         self.welcome_page = WelcomePage()
         self.hardware_page = HardwarePage(config)
@@ -406,6 +756,7 @@ class BumbleBoxSetupWizard(QWizard):
         self.setPage(PAGE_SUMMARY, self.summary_page)
         self.setStartId(PAGE_WELCOME)
         self.button(QWizard.FinishButton).setText("Save setup")
+        self.button(QWizard.FinishButton).setObjectName("Primary")
 
     def uses_thermal(self) -> bool:
         return self.hardware_page.thermal.isChecked()
@@ -465,6 +816,13 @@ class BumbleBoxQtGUI(QMainWindow):
         self.config = _load_config_or_defaults(config_path)
         self.command_queue: list[list[str]] = []
         self.command_success_message: tuple[str, str] | None = None
+        self._run_history_generation = 0
+        self._run_history_loading = False
+        self._run_history_refresh_pending = False
+        self._run_history_payloads: list[dict[str, Any]] = []
+        self._selected_run_payload: dict[str, Any] | None = None
+        self._run_history_workers: dict[int, _RunHistoryWorker] = {}
+        self.thread_pool = QThreadPool.globalInstance()
         self.process = QProcess(self)
         self.process.setProcessChannelMode(QProcess.MergedChannels)
         self.process.readyReadStandardOutput.connect(self._read_process_output)
@@ -474,11 +832,13 @@ class BumbleBoxQtGUI(QMainWindow):
         self.setMinimumSize(940, 660)
         self._build_ui()
         self.refresh_from_config()
+        QTimer.singleShot(100, self.refresh_results)
         if not bool(self.config.get("setup", {}).get("completed", False)):
             QTimer.singleShot(0, self.open_setup_wizard)
 
     def _build_ui(self) -> None:
         root = QWidget()
+        root.setObjectName("AppRoot")
         self.setCentralWidget(root)
         layout = QHBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -486,42 +846,45 @@ class BumbleBoxQtGUI(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(230)
+        sidebar.setFixedWidth(224)
         side_layout = QVBoxLayout(sidebar)
-        side_layout.setContentsMargins(18, 28, 18, 18)
+        side_layout.setContentsMargins(18, 30, 18, 20)
+        side_layout.setSpacing(2)
         brand = QLabel("BUMBLEBOX")
-        brand.setStyleSheet("color:#d8a928;font-size:20px;font-weight:800;letter-spacing:2px;")
+        brand.setObjectName("Brand")
         side_layout.addWidget(brand)
         sub = QLabel("COLONY IMAGING")
-        sub.setStyleSheet("color:#8fa3a1;font-size:10px;font-weight:700;letter-spacing:1px;")
+        sub.setObjectName("BrandSubtitle")
         side_layout.addWidget(sub)
         self.navigation = QListWidget()
-        for title in ("Overview", "Run", "Hardware", "Advanced"):
+        self.navigation.setSpacing(3)
+        for title in ("Overview", "Run", "Results", "Hardware", "Advanced"):
             self.navigation.addItem(QListWidgetItem(title))
         self.navigation.currentRowChanged.connect(self._navigate)
         side_layout.addWidget(self.navigation, 1)
-        version = QLabel("Qt migration · phase 1")
-        version.setStyleSheet("color:#8fa3a1;font-size:11px;")
+        version = QLabel("LOCAL / PRIVATE / YOUR DATA")
+        version.setObjectName("PrivacyNote")
         side_layout.addWidget(version)
         layout.addWidget(sidebar)
 
         content = QWidget()
+        content.setObjectName("ContentShell")
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(34, 26, 34, 26)
+        content_layout.setContentsMargins(38, 28, 38, 30)
+        content_layout.setSpacing(14)
         header = QHBoxLayout()
-        self.page_title = QLabel("Overview")
-        self.page_title.setObjectName("Title")
+        self.page_title = QLabel("OVERVIEW")
+        self.page_title.setObjectName("PageLabel")
         header.addWidget(self.page_title)
         header.addStretch(1)
         self.profile_badge = QLabel()
-        self.profile_badge.setStyleSheet(
-            "background:#eadcae;color:#57420d;border-radius:12px;padding:6px 12px;font-weight:700;"
-        )
+        self.profile_badge.setObjectName("ProfileBadge")
         header.addWidget(self.profile_badge)
         content_layout.addLayout(header)
         self.pages = QStackedWidget()
         self.pages.addWidget(self._build_overview_page())
         self.pages.addWidget(self._build_run_page())
+        self.pages.addWidget(self._build_results_page())
         self.pages.addWidget(self._build_hardware_page())
         self.pages.addWidget(self._build_advanced_page())
         content_layout.addWidget(self.pages, 1)
@@ -531,7 +894,8 @@ class BumbleBoxQtGUI(QMainWindow):
     def _build_overview_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
         heading, subtitle = _page_heading(
             "Experiment readiness",
             "A concise view of this BumbleBox. Device-specific setup stays hidden unless the device is enabled.",
@@ -543,10 +907,11 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.addWidget(self.setup_status)
 
         cards = QGridLayout()
-        self.camera_card = self._status_card("Primary camera", "")
-        self.thermal_card = self._status_card("Thermal", "")
-        self.realsense_card = self._status_card("RealSense", "")
-        self.storage_card = self._status_card("Data storage", "")
+        cards.setHorizontalSpacing(12)
+        self.camera_card = self._status_card("Primary camera", "", tone="peach")
+        self.thermal_card = self._status_card("Thermal", "", tone="sun")
+        self.realsense_card = self._status_card("RealSense", "", tone="sky")
+        self.storage_card = self._status_card("Data storage", "", tone="mint")
         for column, card in enumerate((self.camera_card, self.thermal_card, self.realsense_card, self.storage_card)):
             cards.addWidget(card, 0, column)
         layout.addLayout(cards)
@@ -569,11 +934,14 @@ class BumbleBoxQtGUI(QMainWindow):
         return page
 
     @staticmethod
-    def _status_card(title: str, value: str) -> QFrame:
+    def _status_card(title: str, value: str, *, tone: str = "mint") -> QFrame:
         card = QFrame()
         card.setObjectName("Card")
-        card.setMinimumHeight(120)
+        card.setProperty("tone", tone)
+        card.setMinimumHeight(126)
         layout = QVBoxLayout(card)
+        layout.setContentsMargins(17, 16, 17, 15)
+        layout.setSpacing(9)
         eyebrow = QLabel(title.upper())
         eyebrow.setObjectName("Eyebrow")
         value_label = QLabel(value)
@@ -588,7 +956,8 @@ class BumbleBoxQtGUI(QMainWindow):
     def _build_run_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
         heading, subtitle = _page_heading(
             "Capture and automation",
             "Run one recording now or control the clock-aligned systemd recording schedule.",
@@ -609,6 +978,7 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.addLayout(row)
 
         automation = QGroupBox("Automated recording")
+        automation.setProperty("tone", "mint")
         automation_layout = QVBoxLayout(automation)
         note = QLabel(
             "Start writes and installs user-scope timers. Recordings continue after logout when user lingering is enabled."
@@ -617,6 +987,7 @@ class BumbleBoxQtGUI(QMainWindow):
         automation_layout.addWidget(note)
         buttons = QHBoxLayout()
         start = QPushButton("Start Automated Recording")
+        start.setObjectName("Primary")
         start.clicked.connect(self._start_automation)
         stop = QPushButton("Stop Automated Recording")
         stop.setObjectName("Quiet")
@@ -626,13 +997,126 @@ class BumbleBoxQtGUI(QMainWindow):
         buttons.addStretch(1)
         automation_layout.addLayout(buttons)
         layout.addWidget(automation)
+
+        latest = QGroupBox("Latest recording")
+        latest.setProperty("tone", "sky")
+        latest_layout = QVBoxLayout(latest)
+        self.latest_run_status = QLabel("Loading recent recording status...")
+        self.latest_run_status.setWordWrap(True)
+        latest_layout.addWidget(self.latest_run_status)
+        latest_buttons = QHBoxLayout()
+        self.latest_session_button = QPushButton("Open Session Folder")
+        self.latest_session_button.setObjectName("Quiet")
+        self.latest_session_button.setEnabled(False)
+        self.latest_session_button.clicked.connect(
+            lambda: self._open_run_artifact(self._latest_run_payload(), "_session_dir_local")
+        )
+        self.latest_depth_button = QPushButton("Open Latest Depth Preview")
+        self.latest_depth_button.setObjectName("Quiet")
+        self.latest_depth_button.setEnabled(False)
+        self.latest_depth_button.clicked.connect(
+            lambda: self._open_run_artifact(
+                self._latest_run_payload(), "realsense_depth_preview_video_path"
+            )
+        )
+        self.latest_results_button = QPushButton("View All Results")
+        self.latest_results_button.setObjectName("Primary")
+        self.latest_results_button.clicked.connect(lambda: self.navigation.setCurrentRow(2))
+        latest_buttons.addWidget(self.latest_session_button)
+        latest_buttons.addWidget(self.latest_depth_button)
+        latest_buttons.addWidget(self.latest_results_button)
+        latest_buttons.addStretch(1)
+        latest_layout.addLayout(latest_buttons)
+        layout.addWidget(latest)
         layout.addWidget(self._build_console(), 1)
+        return page
+
+    def _build_results_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
+        heading, subtitle = _page_heading(
+            "Recording results",
+            "Inspect recent multimodal runs and open RGB, thermal, and RealSense outputs without searching through folders.",
+        )
+        layout.addWidget(heading)
+        layout.addWidget(subtitle)
+
+        toolbar = QHBoxLayout()
+        self.results_status = QLabel("Recent runs have not been loaded.")
+        self.results_status.setWordWrap(True)
+        self.results_refresh_button = QPushButton("Refresh Results")
+        self.results_refresh_button.setObjectName("Quiet")
+        self.results_refresh_button.clicked.connect(self.refresh_results)
+        toolbar.addWidget(self.results_status, 1)
+        toolbar.addWidget(self.results_refresh_button)
+        layout.addLayout(toolbar)
+
+        self.results_table = QTableWidget(0, 7)
+        self.results_table.setHorizontalHeaderLabels(
+            ["Started", "Status", "Mode", "RGB", "Thermal", "Depth", "RGB FPS"]
+        )
+        self.results_table.setAlternatingRowColors(True)
+        self.results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.results_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.results_table.verticalHeader().setVisible(False)
+        results_header = self.results_table.horizontalHeader()
+        results_header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        results_header.setSectionResizeMode(0, QHeaderView.Stretch)
+        results_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.results_table.itemSelectionChanged.connect(self._result_selection_changed)
+        layout.addWidget(self.results_table, 1)
+
+        selected = QGroupBox("Selected recording")
+        selected.setProperty("tone", "sky")
+        selected_layout = QVBoxLayout(selected)
+        self.result_detail = QLabel("Select a recording to inspect its outputs.")
+        self.result_detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.result_detail.setWordWrap(True)
+        selected_layout.addWidget(self.result_detail)
+        artifact_buttons = QGridLayout()
+        button_specs = (
+            ("session", "Open Session Folder", "_session_dir_local"),
+            ("rgb", "Open RGB Video", "video_path"),
+            ("thermal", "Open RGB + Thermal", "thermal_side_by_side_video_path"),
+            ("depth", "Open Depth Preview", "realsense_depth_preview_video_path"),
+            ("depth_color", "Open RealSense Color", "realsense_color_video_path"),
+            ("depth_data", "Open Depth Data Folder", "realsense_raw_depth_npy_path"),
+            ("metadata", "Open RealSense Metadata", "realsense_metadata_json_path"),
+        )
+        self.result_artifact_buttons: dict[str, tuple[QPushButton, str]] = {}
+        for index, (key, label, payload_key) in enumerate(button_specs):
+            button = QPushButton(label)
+            button.setObjectName("Quiet" if key != "session" else "Accent")
+            button.clicked.connect(
+                lambda _checked=False, selected_key=payload_key: self._open_run_artifact(
+                    self._selected_run_payload,
+                    selected_key,
+                    open_parent=selected_key == "realsense_raw_depth_npy_path",
+                )
+            )
+            button.setEnabled(False)
+            artifact_buttons.addWidget(button, index // 3, index % 3)
+            self.result_artifact_buttons[key] = (button, payload_key)
+        self.result_add_calibration_button = QPushButton("Add to Calibration Project")
+        self.result_add_calibration_button.setObjectName("Primary")
+        self.result_add_calibration_button.setToolTip(
+            "Create or select a multimodal calibration project in Advanced, then register this run."
+        )
+        self.result_add_calibration_button.clicked.connect(self._add_selected_run_to_calibration)
+        self.result_add_calibration_button.setEnabled(False)
+        artifact_buttons.addWidget(self.result_add_calibration_button, 2, 1)
+        selected_layout.addLayout(artifact_buttons)
+        layout.addWidget(selected)
         return page
 
     def _build_hardware_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
         heading, subtitle = _page_heading(
             "Hardware checks",
             "Only devices selected in the setup profile are shown here.",
@@ -641,6 +1125,7 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.addWidget(subtitle)
 
         self.rgb_group = QGroupBox("Primary camera")
+        self.rgb_group.setProperty("tone", "peach")
         rgb_buttons = QHBoxLayout(self.rgb_group)
         camera_check = QPushButton("Check Camera")
         camera_check.clicked.connect(lambda: self.run_bbx_command(["camera-check"]))
@@ -652,6 +1137,7 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.addWidget(self.rgb_group)
 
         self.thermal_group = QGroupBox("PureThermal / Lepton")
+        self.thermal_group.setProperty("tone", "sun")
         thermal_buttons = QHBoxLayout(self.thermal_group)
         thermal_check = QPushButton("Check Thermal Camera")
         thermal_check.clicked.connect(lambda: self.run_bbx_command(["thermal-check"]))
@@ -663,6 +1149,7 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.addWidget(self.thermal_group)
 
         self.realsense_group = QGroupBox("RealSense depth")
+        self.realsense_group.setProperty("tone", "sky")
         depth_buttons = QHBoxLayout(self.realsense_group)
         depth_check = QPushButton("Check and Pin RealSense")
         depth_check.clicked.connect(lambda: self.run_bbx_command(["realsense-check", "--apply"]))
@@ -682,7 +1169,8 @@ class BumbleBoxQtGUI(QMainWindow):
     def _build_advanced_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
         heading, subtitle = _page_heading(
             "Advanced tools",
             "Specialized tracking, calibration, fleet, and storage editors remain available while their Qt pages are migrated.",
@@ -690,6 +1178,7 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.addWidget(heading)
         layout.addWidget(subtitle)
         legacy = QPushButton("Open Legacy Advanced Tools")
+        legacy.setObjectName("Quiet")
         legacy.clicked.connect(lambda: self.run_bbx_command(["gui", "--legacy"], detached=True))
         config = QPushButton("Open Config File")
         config.setObjectName("Quiet")
@@ -697,13 +1186,62 @@ class BumbleBoxQtGUI(QMainWindow):
         docs = QPushButton("Open Project Documentation")
         docs.setObjectName("Quiet")
         docs.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(REPO_ROOT / "docs"))))
-        layout.addWidget(legacy, 0, Qt.AlignLeft)
-        layout.addWidget(config, 0, Qt.AlignLeft)
-        layout.addWidget(docs, 0, Qt.AlignLeft)
+        workspace = QGroupBox("Workspace")
+        workspace.setProperty("tone", "mint")
+        workspace_layout = QHBoxLayout(workspace)
+        workspace_layout.addWidget(legacy)
+        workspace_layout.addWidget(config)
+        workspace_layout.addWidget(docs)
+        workspace_layout.addStretch(1)
+        layout.addWidget(workspace)
+
+        calibration = QGroupBox("RGB + thermal + depth calibration")
+        calibration.setProperty("tone", "peach")
+        calibration_layout = QVBoxLayout(calibration)
+        calibration_note = QLabel(
+            "Create a versioned project for shared-cue timing captures, multiple nest-depth layers, "
+            "spatial transforms, and held-out validation. Large recordings stay in their session folders."
+        )
+        calibration_note.setWordWrap(True)
+        calibration_layout.addWidget(calibration_note)
+        self.calibration_project_label = QLabel()
+        self.calibration_project_label.setWordWrap(True)
+        self.calibration_project_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        calibration_layout.addWidget(self.calibration_project_label)
+        calibration_buttons = QGridLayout()
+        create_calibration = QPushButton("Create Project")
+        create_calibration.setObjectName("Accent")
+        create_calibration.clicked.connect(self._create_calibration_project)
+        choose_calibration = QPushButton("Use Existing Project")
+        choose_calibration.setObjectName("Quiet")
+        choose_calibration.clicked.connect(self._choose_calibration_project)
+        self.open_calibration_button = QPushButton("Open Project")
+        self.open_calibration_button.setObjectName("Quiet")
+        self.open_calibration_button.clicked.connect(self._open_calibration_project)
+        self.calibration_status_button = QPushButton("Check Readiness")
+        self.calibration_status_button.clicked.connect(self._show_calibration_project_status)
+        calibration_guide = QPushButton("Open Workflow Guide")
+        calibration_guide.setObjectName("Quiet")
+        calibration_guide.clicked.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(REPO_ROOT / "docs" / "Multimodal_Calibration.md"))
+            )
+        )
+        for index, button in enumerate((
+            create_calibration,
+            choose_calibration,
+            self.open_calibration_button,
+            self.calibration_status_button,
+            calibration_guide,
+        )):
+            calibration_buttons.addWidget(button, index // 3, index % 3)
+        calibration_layout.addLayout(calibration_buttons)
+        layout.addWidget(calibration)
         migration = QLabel(
             "Migration rule: working capture and analysis services are reused; only the operator interface is being replaced. "
             "This keeps the Qt transition testable and prevents a GUI rewrite from changing scientific outputs."
         )
+        migration.setObjectName("Hint")
         migration.setWordWrap(True)
         layout.addWidget(migration)
         layout.addStretch(1)
@@ -711,19 +1249,359 @@ class BumbleBoxQtGUI(QMainWindow):
 
     def _build_console(self) -> QGroupBox:
         box = QGroupBox("Command output")
+        box.setProperty("tone", "mint")
         layout = QVBoxLayout(box)
         self.console = QTextEdit()
         self.console.setReadOnly(True)
         self.console.setMinimumHeight(210)
+        self.console.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
         layout.addWidget(self.console)
         return box
+
+    def _latest_run_payload(self) -> dict[str, Any] | None:
+        if not self._run_history_payloads:
+            return None
+        return self._run_history_payloads[0]
+
+    @staticmethod
+    def _run_artifact_path(payload: dict[str, Any] | None, key: str) -> Path | None:
+        if payload is None:
+            return None
+        raw_path = str(payload.get(key) or "").strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path).expanduser()
+        return path.resolve() if path.exists() else None
+
+    def _open_run_artifact(
+        self,
+        payload: dict[str, Any] | None,
+        key: str,
+        *,
+        open_parent: bool = False,
+    ) -> None:
+        path = self._run_artifact_path(payload, key)
+        if path is None:
+            QMessageBox.warning(
+                self,
+                "Output not available",
+                "That output was not recorded or the referenced file is no longer available.",
+            )
+            return
+        target = path.parent if open_parent and path.is_file() else path
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target))):
+            QMessageBox.warning(self, "Could not open output", str(target))
+
+    @staticmethod
+    def _format_run_timestamp(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "Unknown"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return text
+        return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S") if parsed.tzinfo else parsed.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    @staticmethod
+    def _format_optional_fps(value: Any) -> str:
+        try:
+            return f"{float(value):.3f}"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    def _format_run_detail(self, payload: dict[str, Any]) -> str:
+        warning_count = len(payload.get("warnings", []) or [])
+        error_count = len(payload.get("errors", []) or [])
+        thermal_status = "disabled"
+        if bool(payload.get("thermal_enabled", False)):
+            thermal_status = (
+                f"{int(payload.get('thermal_frames_captured', 0) or 0)} frames at "
+                f"{self._format_optional_fps(payload.get('thermal_actual_fps'))} fps"
+            )
+        depth_status = "disabled"
+        if bool(payload.get("realsense_enabled", False)):
+            depth_status = (
+                f"{int(payload.get('realsense_frames_captured', 0) or 0)} frames at "
+                f"{self._format_optional_fps(payload.get('realsense_actual_fps'))} fps; "
+                f"scale {payload.get('realsense_depth_scale_meters') or 'n/a'} m/unit"
+            )
+        return "\n".join(
+            (
+                f"Session: {payload.get('session_name') or 'unknown'}",
+                f"Started: {self._format_run_timestamp(payload.get('started_at'))}",
+                f"Result: {'Success' if bool(payload.get('success', False)) else 'Failed'} | "
+                f"Mode: {payload.get('mode') or 'unknown'}",
+                f"RGB: {int(payload.get('frames_captured', 0) or 0)} frames at "
+                f"{self._format_optional_fps(payload.get('actual_fps'))} fps",
+                f"Thermal: {thermal_status}",
+                f"RealSense: {depth_status}",
+                f"Warnings: {warning_count} | Errors: {error_count}",
+            )
+        )
+
+    def _set_result_artifact_buttons(self, payload: dict[str, Any] | None) -> None:
+        for button, payload_key in self.result_artifact_buttons.values():
+            button.setEnabled(self._run_artifact_path(payload, payload_key) is not None)
+        summary_available = self._run_artifact_path(payload, "_summary_path") is not None
+        self.result_add_calibration_button.setEnabled(
+            summary_available and self._configured_calibration_project() is not None
+        )
+
+    def _configured_calibration_project(self) -> Path | None:
+        raw_path = str(
+            self.config.get("calibration", {}).get("multimodal_project_path") or ""
+        ).strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path).expanduser()
+        if not (path / CALIBRATION_MANIFEST_NAME).is_file():
+            return None
+        return path.resolve()
+
+    def _save_calibration_project_path(self, project_dir: Path) -> None:
+        self.config.setdefault("calibration", {})["multimodal_project_path"] = str(
+            project_dir.resolve()
+        )
+        save_config(self.config_path, self.config)
+        self.refresh_from_config()
+        self._set_result_artifact_buttons(self._selected_run_payload)
+
+    def _create_calibration_project(self) -> None:
+        parent = QFileDialog.getExistingDirectory(
+            self,
+            "Choose where to create the calibration project",
+            str(Path(self.config.get("system", {}).get("data_root", Path.home())).expanduser()),
+        )
+        if not parent:
+            return
+        name, accepted = QInputDialog.getText(
+            self,
+            "Calibration project name",
+            "Project folder and display name:",
+            text="BumbleBoxCalibration",
+        )
+        if not accepted:
+            return
+        safe_name = str(name).strip().replace("/", "-").replace("\\", "-")
+        if not safe_name:
+            QMessageBox.warning(self, "Project name required", "Enter a project name.")
+            return
+        project_dir = Path(parent).expanduser().resolve() / safe_name
+        try:
+            result = initialize_calibration_project(
+                self.config,
+                project_dir,
+                project_name=str(name).strip(),
+            )
+            self._save_calibration_project_path(Path(result.project_dir))
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not create calibration project", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Calibration project created",
+            f"Project created at:\n{result.project_dir}\n\nRegister suitable runs from the Results page.",
+        )
+
+    def _choose_calibration_project(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Choose an existing calibration project",
+            str(Path.home()),
+        )
+        if not directory:
+            return
+        project_dir = Path(directory).expanduser().resolve()
+        try:
+            get_calibration_project_status(project_dir)
+            self._save_calibration_project_path(project_dir)
+        except Exception as exc:
+            QMessageBox.critical(self, "Invalid calibration project", str(exc))
+
+    def _open_calibration_project(self) -> None:
+        project_dir = self._configured_calibration_project()
+        if project_dir is None:
+            QMessageBox.warning(self, "No calibration project", "Create or select a project first.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(project_dir)))
+
+    def _show_calibration_project_status(self) -> None:
+        project_dir = self._configured_calibration_project()
+        if project_dir is None:
+            QMessageBox.warning(self, "No calibration project", "Create or select a project first.")
+            return
+        try:
+            report = format_calibration_project_status(
+                get_calibration_project_status(project_dir)
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not read calibration project", str(exc))
+            return
+        QMessageBox.information(self, "Calibration readiness", report)
+
+    def _add_selected_run_to_calibration(self) -> None:
+        project_dir = self._configured_calibration_project()
+        summary_path = self._run_artifact_path(self._selected_run_payload, "_summary_path")
+        if project_dir is None or summary_path is None:
+            QMessageBox.warning(
+                self,
+                "Calibration input unavailable",
+                "Select a run and configure a calibration project first.",
+            )
+            return
+        depth_layer, accepted = QInputDialog.getText(
+            self,
+            "Calibration depth layer",
+            "Physical depth label (for example floor, mid, or upper):",
+        )
+        if not accepted:
+            return
+        if not str(depth_layer).strip():
+            QMessageBox.warning(
+                self,
+                "Depth layer required",
+                "A depth-layer label is required so multi-depth coverage can be verified.",
+            )
+            return
+        try:
+            result = add_calibration_session(
+                project_dir,
+                summary_path,
+                depth_layer=str(depth_layer).strip(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Could not add calibration capture", str(exc))
+            return
+        state = "registered" if result.added else "was already registered"
+        QMessageBox.information(
+            self,
+            "Calibration capture",
+            f"{result.capture_id} {state}.\nAvailable streams: "
+            f"{', '.join(result.available_streams) or 'none'}\nMissing streams: "
+            f"{', '.join(result.missing_streams) or 'none'}",
+        )
+
+    def _result_selection_changed(self) -> None:
+        selected_rows = self.results_table.selectionModel().selectedRows()
+        if not selected_rows:
+            self._selected_run_payload = None
+            self.result_detail.setText("Select a recording to inspect its outputs.")
+            self._set_result_artifact_buttons(None)
+            return
+        row = selected_rows[0].row()
+        item = self.results_table.item(row, 0)
+        payload_index = item.data(Qt.UserRole) if item is not None else None
+        if not isinstance(payload_index, int) or not (0 <= payload_index < len(self._run_history_payloads)):
+            self._selected_run_payload = None
+            self._set_result_artifact_buttons(None)
+            return
+        payload = self._run_history_payloads[payload_index]
+        self._selected_run_payload = payload
+        self.result_detail.setText(self._format_run_detail(payload))
+        self._set_result_artifact_buttons(payload)
+
+    def refresh_results(self) -> None:
+        if self._run_history_loading:
+            self._run_history_refresh_pending = True
+            return
+        self._run_history_generation += 1
+        generation = self._run_history_generation
+        self._run_history_loading = True
+        self.results_refresh_button.setEnabled(False)
+        self.results_status.setText("Scanning recent recording summaries...")
+        self.latest_run_status.setText("Loading recent recording status...")
+        data_root = str(self.config.get("system", {}).get("data_root", "")).strip()
+        worker = _RunHistoryWorker(generation, data_root, limit=60)
+        worker.signals.finished.connect(self._run_history_loaded)
+        self._run_history_workers[generation] = worker
+        self.thread_pool.start(worker)
+
+    def _run_history_loaded(
+        self,
+        generation: int,
+        payloads: object,
+        error: object,
+    ) -> None:
+        self._run_history_workers.pop(generation, None)
+        if generation != self._run_history_generation:
+            return
+        self._run_history_loading = False
+        self.results_refresh_button.setEnabled(True)
+        self._selected_run_payload = None
+        self.results_table.setRowCount(0)
+
+        if error:
+            self._run_history_payloads = []
+            self.results_status.setText(f"Could not scan recording summaries: {error}")
+            self.latest_run_status.setText("Recent recording status is unavailable.")
+            self.latest_session_button.setEnabled(False)
+            self.latest_depth_button.setEnabled(False)
+            self._set_result_artifact_buttons(None)
+            if self._run_history_refresh_pending:
+                self._run_history_refresh_pending = False
+                QTimer.singleShot(0, self.refresh_results)
+            return
+
+        normalized = [dict(item) for item in payloads if isinstance(item, dict)] if isinstance(payloads, list) else []
+        self._run_history_payloads = normalized
+        data_root = str(self.config.get("system", {}).get("data_root", "Not set"))
+        self.results_status.setText(f"Showing {len(normalized)} recent recording(s) from {data_root}")
+
+        for row, payload in enumerate(normalized):
+            rgb_frames = int(payload.get("frames_captured", 0) or 0)
+            thermal_frames = int(payload.get("thermal_frames_captured", 0) or 0)
+            depth_frames = int(payload.get("realsense_frames_captured", 0) or 0)
+            values = (
+                self._format_run_timestamp(payload.get("started_at")),
+                "Success" if bool(payload.get("success", False)) else "Failed",
+                str(payload.get("mode") or "unknown"),
+                str(rgb_frames),
+                str(thermal_frames) if bool(payload.get("thermal_enabled", False)) else "Off",
+                str(depth_frames) if bool(payload.get("realsense_enabled", False)) else "Off",
+                self._format_optional_fps(payload.get("actual_fps")),
+            )
+            self.results_table.insertRow(row)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.UserRole, row)
+                self.results_table.setItem(row, column, item)
+
+        latest = self._latest_run_payload()
+        if latest is None:
+            self.latest_run_status.setText("No BumbleBox recording summaries were found.")
+            self.latest_session_button.setEnabled(False)
+            self.latest_depth_button.setEnabled(False)
+            self.result_detail.setText("No recording results are available.")
+            self._set_result_artifact_buttons(None)
+            if self._run_history_refresh_pending:
+                self._run_history_refresh_pending = False
+                QTimer.singleShot(0, self.refresh_results)
+            return
+
+        self.latest_run_status.setText(self._format_run_detail(latest))
+        self.latest_session_button.setEnabled(
+            self._run_artifact_path(latest, "_session_dir_local") is not None
+        )
+        self.latest_depth_button.setEnabled(
+            self._run_artifact_path(latest, "realsense_depth_preview_video_path") is not None
+        )
+        self.results_table.selectRow(0)
+        if self._run_history_refresh_pending:
+            self._run_history_refresh_pending = False
+            QTimer.singleShot(0, self.refresh_results)
 
     def _navigate(self, index: int) -> None:
         if index < 0:
             return
         self.pages.setCurrentIndex(index)
         item = self.navigation.item(index)
-        self.page_title.setText(item.text() if item else "BumbleBox")
+        self.page_title.setText(item.text().upper() if item else "BUMBLEBOX")
+        if index == 2 and not self._run_history_payloads:
+            self.refresh_results()
 
     def open_setup_wizard(self) -> None:
         wizard = BumbleBoxSetupWizard(self.config_path, self.config, self)
@@ -761,6 +1639,20 @@ class BumbleBoxQtGUI(QMainWindow):
         self.thermal_group.setVisible(thermal_enabled)
         self.realsense_group.setVisible(depth_enabled)
         _set_combo_data(self.run_mode, str(self.config.get("pipeline", {}).get("mode", "record_and_track")))
+        calibration_path = self._configured_calibration_project()
+        configured_path = str(
+            self.config.get("calibration", {}).get("multimodal_project_path") or ""
+        ).strip()
+        if calibration_path is not None:
+            self.calibration_project_label.setText(f"Current project: {calibration_path}")
+        elif configured_path:
+            self.calibration_project_label.setText(
+                f"Configured project is unavailable: {configured_path}"
+            )
+        else:
+            self.calibration_project_label.setText("No multimodal calibration project selected.")
+        self.open_calibration_button.setEnabled(calibration_path is not None)
+        self.calibration_status_button.setEnabled(calibration_path is not None)
 
     def _run_once(self) -> None:
         self.run_bbx_command(["run-once", "--mode", str(self.run_mode.currentData())])
@@ -838,6 +1730,7 @@ class BumbleBoxQtGUI(QMainWindow):
 
     def _process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
         self.console.append(f"\n[finished with exit code {exit_code}]")
+        self.refresh_results()
         if exit_code != 0:
             self.command_queue.clear()
             self.command_success_message = None
@@ -864,11 +1757,19 @@ def _single_instance_lock() -> QLockFile:
     return lock
 
 
+def _preferred_ui_font() -> str:
+    available = set(QFontDatabase().families())
+    for family in ("Avenir Next", "Nunito Sans", "Noto Sans", "DejaVu Sans"):
+        if family in available:
+            return family
+    return QApplication.font().family()
+
+
 def launch(*, config_path: str | Path = DEFAULT_USER_CONFIG_PATH) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("BumbleBox")
     app.setStyleSheet(APP_STYLE)
-    app.setFont(QFont("Avenir Next", 11))
+    app.setFont(QFont(_preferred_ui_font(), 11))
     lock = _single_instance_lock()
     if not lock.tryLock(100):
         QMessageBox.information(

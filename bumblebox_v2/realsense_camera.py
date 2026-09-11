@@ -9,6 +9,12 @@ from pathlib import Path
 import time
 from typing import Any, Callable, Dict, Optional
 
+from .simulated_capture import (
+    simulated_frame_times,
+    simulated_realsense_color_frame,
+    simulated_realsense_depth_frame,
+)
+
 
 @dataclass
 class RealSenseDevice:
@@ -349,6 +355,253 @@ def _frame_number_gaps(records: list[dict[str, Any]], key: str) -> int:
     return sum(max(0, current - previous - 1) for previous, current in zip(values, values[1:]))
 
 
+def _write_depth_preview_artifacts(
+    np_module: Any,
+    cv2_module: Any,
+    session_dir: Path,
+    session_name: str,
+    raw_depth_path: Path,
+    *,
+    frame_count: int,
+    fps: float,
+    min_value: int,
+    max_value: int,
+    midpoint_index: int,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> tuple[Path, Optional[Path]]:
+    depth_stack = np_module.load(raw_depth_path, mmap_mode="r")
+    height, width = int(depth_stack.shape[1]), int(depth_stack.shape[2])
+    video_path = session_dir / f"{session_name}_realsense_depth_preview.avi"
+    writer = cv2_module.VideoWriter(
+        str(video_path),
+        cv2_module.VideoWriter_fourcc(*"MJPG"),
+        float(fps if fps > 0 else 1.0),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open RealSense depth preview writer: {video_path}")
+    midpoint_colorized = None
+    denominator = max(1, int(max_value) - int(min_value))
+    try:
+        for index in range(int(frame_count)):
+            depth = depth_stack[index]
+            scaled = (
+                (depth.astype(np_module.float32) - float(min_value))
+                * (255.0 / float(denominator))
+            ).clip(0, 255).astype(np_module.uint8)
+            scaled[depth == 0] = 0
+            colorized = cv2_module.applyColorMap(scaled, cv2_module.COLORMAP_TURBO)
+            writer.write(colorized)
+            if index == midpoint_index:
+                midpoint_colorized = colorized.copy()
+            if progress_callback is not None:
+                progress_callback(index + 1, int(frame_count))
+    finally:
+        writer.release()
+        del depth_stack
+
+    midpoint_path: Optional[Path] = None
+    if midpoint_colorized is not None:
+        candidate = session_dir / f"{session_name}_realsense_depth_midframe.png"
+        if cv2_module.imwrite(str(candidate), midpoint_colorized):
+            midpoint_path = candidate
+    return video_path, midpoint_path
+
+
+def capture_simulated_realsense_recording(
+    config: Dict[str, Any],
+    *,
+    session_dir: str | Path,
+    session_name: str,
+    duration: float,
+    start_monotonic: Optional[float] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+    depth_preview_progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> RealSenseRecordingResult:
+    """Generate RealSense-compatible artifacts on a shared synthetic timeline."""
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:
+        raise RuntimeError(f"OpenCV and NumPy are required for simulated RealSense recording: {exc}") from exc
+
+    output_dir = Path(session_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    settings = _stream_settings(config)
+    section = config.get("realsense", {})
+    save_depth = bool(section.get("save_depth", True))
+    save_color = bool(section.get("save_color", True))
+    duration = float(duration)
+    fps = float(settings["fps"])
+    frame_times = simulated_frame_times(duration, fps)
+    frame_count = len(frame_times)
+    start = float(start_monotonic) if start_monotonic is not None else time.perf_counter()
+    monotonic_to_unix_offset = time.time() - time.perf_counter()
+
+    align_to = str(settings["align_to"])
+    depth_height = int(settings["color_height"] if align_to == "color" else settings["depth_height"])
+    depth_width = int(settings["color_width"] if align_to == "color" else settings["depth_width"])
+    color_height = int(settings["depth_height"] if align_to == "depth" else settings["color_height"])
+    color_width = int(settings["depth_width"] if align_to == "depth" else settings["color_width"])
+
+    raw_depth_path = output_dir / f"{session_name}_realsense_depth_raw16.npy"
+    timestamp_path = output_dir / f"{session_name}_realsense_frame_timestamps.csv"
+    metadata_path = output_dir / f"{session_name}_realsense_metadata.json"
+    color_video_path = output_dir / f"{session_name}_realsense_color.avi"
+    depth_stack = None
+    color_writer = None
+    records: list[dict[str, Any]] = []
+    min_value: Optional[int] = None
+    max_value: Optional[int] = None
+    midpoint_index = min(frame_count - 1, frame_count // 2)
+    depth_midpoint = None
+    color_midpoint = None
+
+    if status_callback is not None:
+        status_callback("Generating synchronized simulated RealSense depth and color frames.")
+    try:
+        if save_depth:
+            depth_stack = np.lib.format.open_memmap(
+                raw_depth_path,
+                mode="w+",
+                dtype=np.uint16,
+                shape=(frame_count, depth_height, depth_width),
+            )
+        if save_color:
+            color_writer = cv2.VideoWriter(
+                str(color_video_path),
+                cv2.VideoWriter_fourcc(*"MJPG"),
+                fps,
+                (color_width, color_height),
+            )
+            if not color_writer.isOpened():
+                raise RuntimeError(f"Failed to open simulated RealSense color writer: {color_video_path}")
+
+        for index, relative_time in enumerate(frame_times):
+            depth = simulated_realsense_depth_frame(
+                depth_width,
+                depth_height,
+                relative_time,
+                duration,
+            )
+            color = simulated_realsense_color_frame(
+                color_width,
+                color_height,
+                relative_time,
+                duration,
+            )
+            if depth_stack is not None:
+                depth_stack[index] = depth
+            if color_writer is not None:
+                color_writer.write(color)
+
+            frame_min = int(depth.min())
+            frame_max = int(depth.max())
+            min_value = frame_min if min_value is None else min(min_value, frame_min)
+            max_value = frame_max if max_value is None else max(max_value, frame_max)
+            if index == midpoint_index:
+                depth_midpoint = depth.copy()
+                color_midpoint = color.copy()
+
+            host_monotonic = start + relative_time
+            records.append(
+                {
+                    "time_s": relative_time,
+                    "host_receive_monotonic_seconds": host_monotonic,
+                    "host_receive_unix_seconds": host_monotonic + monotonic_to_unix_offset,
+                    "depth_device_timestamp_ms": relative_time * 1000.0,
+                    "color_device_timestamp_ms": relative_time * 1000.0 + 0.2,
+                    "depth_frame_number": index + 1,
+                    "color_frame_number": index + 1,
+                    "depth_timestamp_domain": "simulated_clock",
+                    "color_timestamp_domain": "simulated_clock",
+                }
+            )
+            if progress_callback is not None:
+                progress_callback(index + 1, frame_count)
+    finally:
+        if depth_stack is not None:
+            depth_stack.flush()
+            del depth_stack
+        if color_writer is not None:
+            color_writer.release()
+
+    _write_recording_timestamps(timestamp_path, records)
+    actual_fps = fps
+
+    depth_video_path: Optional[Path] = None
+    depth_png_path: Optional[Path] = None
+    if save_depth:
+        if status_callback is not None:
+            status_callback("Writing simulated RealSense depth preview video.")
+        depth_video_path, depth_png_path = _write_depth_preview_artifacts(
+            np,
+            cv2,
+            output_dir,
+            session_name,
+            raw_depth_path,
+            frame_count=frame_count,
+            fps=actual_fps,
+            min_value=int(min_value or 0),
+            max_value=int(max_value or 0),
+            midpoint_index=midpoint_index,
+            progress_callback=depth_preview_progress_callback,
+        )
+        if depth_midpoint is not None:
+            raw_midpoint_path = output_dir / f"{session_name}_realsense_depth_midframe_raw16.png"
+            cv2.imwrite(str(raw_midpoint_path), depth_midpoint)
+
+    color_png_path: Optional[Path] = None
+    if save_color and color_midpoint is not None:
+        candidate = output_dir / f"{session_name}_realsense_color_midframe.png"
+        if cv2.imwrite(str(candidate), color_midpoint):
+            color_png_path = candidate
+
+    result = RealSenseRecordingResult(
+        selected_serial="mock://realsense",
+        device_name="Simulated RealSense",
+        frames_captured=frame_count,
+        actual_fps=actual_fps,
+        depth_scale_meters=0.001,
+        first_host_receive_monotonic_seconds=float(records[0]["host_receive_monotonic_seconds"]),
+        last_host_receive_monotonic_seconds=float(records[-1]["host_receive_monotonic_seconds"]),
+        timestamp_path=str(timestamp_path),
+        raw_depth_npy_path=str(raw_depth_path) if save_depth else None,
+        depth_preview_video_path=str(depth_video_path) if depth_video_path else None,
+        depth_preview_png_path=str(depth_png_path) if depth_png_path else None,
+        color_video_path=str(color_video_path) if save_color else None,
+        color_preview_png_path=str(color_png_path) if color_png_path else None,
+        metadata_json_path=str(metadata_path),
+    )
+    metadata = asdict(result)
+    metadata.update(
+        {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "simulated": True,
+            "simulation_signal": "shared_normalized_moving_target",
+            "requested_duration_seconds": duration,
+            "requested_depth_profile": (
+                f"{settings['depth_width']}x{settings['depth_height']}@{settings['fps']} z16"
+            ),
+            "requested_color_profile": (
+                f"{settings['color_width']}x{settings['color_height']}@{settings['fps']} bgr8"
+            ),
+            "align_to": align_to,
+            "depth_min_nonzero_value": int(min_value or 0),
+            "depth_max_value": int(max_value or 0),
+            "depth_frame_number_gaps": 0,
+            "color_frame_number_gaps": 0,
+            "depth_timestamp_domains": ["simulated_clock"],
+            "color_timestamp_domains": ["simulated_clock"],
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    if status_callback is not None:
+        status_callback("Simulated RealSense artifacts are complete.")
+    return result
+
+
 class RealSenseRecordingSession:
     """Stream one RealSense recording to disk without retaining all frames in RAM."""
 
@@ -498,43 +751,19 @@ class RealSenseRecordingSession:
         midpoint_index: int,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> tuple[Path, Optional[Path]]:
-        depth_stack = self._np.load(raw_depth_path, mmap_mode="r")
-        height, width = int(depth_stack.shape[1]), int(depth_stack.shape[2])
-        video_path = self.session_dir / f"{self.session_name}_realsense_depth_preview.avi"
-        writer = self._cv2.VideoWriter(
-            str(video_path),
-            self._cv2.VideoWriter_fourcc(*"MJPG"),
-            float(fps if fps > 0 else 1.0),
-            (width, height),
+        return _write_depth_preview_artifacts(
+            self._np,
+            self._cv2,
+            self.session_dir,
+            self.session_name,
+            raw_depth_path,
+            frame_count=frame_count,
+            fps=fps,
+            min_value=min_value,
+            max_value=max_value,
+            midpoint_index=midpoint_index,
+            progress_callback=progress_callback,
         )
-        if not writer.isOpened():
-            raise RuntimeError(f"Failed to open RealSense depth preview writer: {video_path}")
-        midpoint_colorized = None
-        denominator = max(1, int(max_value) - int(min_value))
-        try:
-            for index in range(int(frame_count)):
-                depth = depth_stack[index]
-                scaled = (
-                    (depth.astype(self._np.float32) - float(min_value))
-                    * (255.0 / float(denominator))
-                ).clip(0, 255).astype(self._np.uint8)
-                scaled[depth == 0] = 0
-                colorized = self._cv2.applyColorMap(scaled, self._cv2.COLORMAP_TURBO)
-                writer.write(colorized)
-                if index == midpoint_index:
-                    midpoint_colorized = colorized.copy()
-                if progress_callback is not None:
-                    progress_callback(index + 1, int(frame_count))
-        finally:
-            writer.release()
-            del depth_stack
-
-        midpoint_path: Optional[Path] = None
-        if midpoint_colorized is not None:
-            candidate = self.session_dir / f"{self.session_name}_realsense_depth_midframe.png"
-            if self._cv2.imwrite(str(candidate), midpoint_colorized):
-                midpoint_path = candidate
-        return video_path, midpoint_path
 
     def capture_for(
         self,

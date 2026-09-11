@@ -21,10 +21,13 @@ validated.
 - [x] Preserve native RealSense device timestamps/frame numbers alongside host clocks.
 - [x] Write raw depth incrementally and report frame-number gaps/device loss as run failures.
 - [x] Add multimodal run summaries and timestamp tables.
+- [x] Add a hardware-free three-camera recording simulation with shared timing and visual cues.
 - [ ] Add frame-by-frame three-camera inspection output.
-- [ ] Calibrate temporal offset and multi-depth spatial registration.
+- [x] Define a versioned multimodal calibration project, capture registry, artifact contract, and readiness checks.
+- [ ] Implement the temporal offset/drift solver against registered calibration captures.
+- [ ] Implement and validate multi-depth RGB/thermal/RealSense spatial registration.
 
-See `docs/RealSense_Camera.md` for the hardware validation workflow and phase boundary.
+See `docs/RealSense_Camera.md` for hardware validation and `docs/Multimodal_Calibration.md` for the calibration protocol and file contract.
 
 ## PyQt GUI Migration
 
@@ -37,7 +40,8 @@ See `docs/RealSense_Camera.md` for the hardware validation workflow and phase bo
 - [ ] Port the full config editor with Basic and Advanced sections.
 - [ ] Port calibration and thermal registration interfaces.
 - [ ] Port tracking optimization and candidate-review interfaces.
-- [ ] Port fleet management, run history, alerts, and bundle export.
+- [x] Add asynchronous run history plus RGB, thermal, and RealSense result/artifact controls.
+- [ ] Port fleet management, alerts, and bundle export.
 - [ ] Remove the Tk bridge only after feature parity and Pi operator testing.
 
 ## RGB and Thermal Camera Synchronization

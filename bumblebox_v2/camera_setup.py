@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -108,6 +110,9 @@ class CameraCheckResult:
     opened_camera_properties: dict[str, Any]
     sensor_modes: list[dict[str, Any]]
     notes: list[str]
+    connection_status: str
+    connection_findings: list[str]
+    recommended_actions: list[str]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -159,6 +164,110 @@ def _normalize_box_preset(box_preset: Any) -> Optional[str]:
     if text in {"custom", "koppert"}:
         return text
     return None
+
+
+def interpret_camera_connection_diagnostics(
+    *,
+    expected_sensor: Optional[str],
+    detected_cameras: list[dict[str, Any]],
+    picamera2_available: bool,
+    diagnostic_text: str = "",
+) -> tuple[str, list[str], list[str]]:
+    """Convert low-level camera failures into concise operator guidance."""
+    expected = str(expected_sensor or "").strip().lower()
+    combined_detected = json.dumps(detected_cameras, sort_keys=True).lower()
+    diagnostic_lower = str(diagnostic_text).lower()
+    is_owlsight = expected == "ov64a40"
+    expected_detected = bool(expected and expected in combined_detected)
+
+    if detected_cameras and (not expected or expected_detected):
+        label = "OwlSight/OV64A40" if is_owlsight else expected_sensor or "camera"
+        return "ready", [f"{label} is visible to Picamera2/libcamera."], []
+
+    if detected_cameras and expected and not expected_detected:
+        return (
+            "mismatch",
+            [
+                f"The configured sensor '{expected_sensor}' was not found, although another camera was detected."
+            ],
+            [
+                "Confirm the selected BumbleBox camera profile matches the physically connected camera.",
+                "Run `rpicam-hello --list-cameras` and verify the reported sensor name before recording.",
+            ],
+        )
+
+    if not picamera2_available:
+        return (
+            "unavailable",
+            ["Picamera2 is unavailable, so the CSI camera connection could not be checked."],
+            ["Install the Raspberry Pi camera packages, then rerun `./bbx camera-check`."],
+        )
+
+    chip_id_failure = "failed to read chip id" in diagnostic_lower
+    remote_io_failure = any(
+        token in diagnostic_lower
+        for token in ("error -121", "-121", "remote i/o", "remote io")
+    )
+    if is_owlsight and chip_id_failure and remote_io_failure:
+        return (
+            "connection_failure",
+            [
+                "The OV64A40 driver loaded, but the OwlSight sensor did not answer its I2C chip-ID request (error -121 / remote I/O).",
+                "This points to the physical CSI connection or sensor power, not autofocus, resolution, or tuning settings.",
+            ],
+            [
+                "Shut the Raspberry Pi down completely before touching the camera cable; do not reseat CSI hardware while powered.",
+                "Reseat both ribbon-cable ends, confirm conductor orientation, and close both connector latches evenly.",
+                "Inspect the ribbon for creases or damaged contacts; if possible, test a known-good cable and the other Pi CSI connector.",
+                "Power the Pi back on, run `rpicam-hello --list-cameras`, then rerun `./bbx camera-check`.",
+            ],
+        )
+
+    findings = ["No CSI camera is currently visible to Picamera2/libcamera."]
+    if is_owlsight:
+        findings.append(
+            "The configured OwlSight/OV64A40 sensor was not enumerated; capture settings cannot fix a camera that is absent at this stage."
+        )
+    actions = [
+        "Shut the Pi down, reseat both ends of the CSI ribbon cable, verify orientation and latch closure, then reboot.",
+        "Run `rpicam-hello --list-cameras`; continue with BumbleBox only after the sensor appears there.",
+        "If it remains absent, test a known-good ribbon cable and alternate CSI connector before changing software settings.",
+    ]
+    return "missing", findings, actions
+
+
+def _camera_system_diagnostic_text() -> str:
+    outputs: list[str] = []
+    rpicam = shutil.which("rpicam-hello") or shutil.which("libcamera-hello")
+    commands: list[list[str]] = []
+    if rpicam:
+        commands.append([rpicam, "--list-cameras"])
+    dmesg = shutil.which("dmesg")
+    if dmesg:
+        commands.append([dmesg, "--color=never"])
+
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        except Exception:
+            continue
+        text = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+        relevant = [
+            line
+            for line in text.splitlines()
+            if any(
+                token in line.lower()
+                for token in ("ov64a40", "chip id", "error -121", "remote i/o", "no cameras")
+            )
+        ]
+        outputs.extend(relevant[-20:])
+    return "\n".join(outputs)
 
 
 def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
@@ -228,6 +337,21 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
                 except Exception:
                     pass
 
+    expected_sensor = model_info.sensor if model_info is not None else None
+    diagnostic_text = "\n".join(notes)
+    if expected_sensor == "ov64a40" and not detected_cameras:
+        system_diagnostics = _camera_system_diagnostic_text()
+        if system_diagnostics:
+            diagnostic_text = f"{diagnostic_text}\n{system_diagnostics}"
+    connection_status, connection_findings, recommended_actions = (
+        interpret_camera_connection_diagnostics(
+            expected_sensor=expected_sensor,
+            detected_cameras=detected_cameras,
+            picamera2_available=picamera2_available,
+            diagnostic_text=diagnostic_text,
+        )
+    )
+
     focus_settings = autofocus_settings(config)
     preflight_settings = autofocus_preflight_settings(config)
     return CameraCheckResult(
@@ -260,6 +384,9 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
         opened_camera_properties=opened_camera_properties,
         sensor_modes=sensor_modes,
         notes=notes,
+        connection_status=connection_status,
+        connection_findings=connection_findings,
+        recommended_actions=recommended_actions,
     )
 
 
@@ -295,6 +422,7 @@ def format_camera_check_result(result: CameraCheckResult) -> str:
         f"Picamera2 available: {result.picamera2_available}",
         f"Detected cameras: {len(result.detected_cameras)}",
         f"Sensor modes reported: {len(result.sensor_modes)}",
+        f"Connection status: {result.connection_status}",
     ]
     if result.ir_compatibility_error:
         lines.extend(["", "Errors", "------", f"- {result.ir_compatibility_error}"])
@@ -306,6 +434,15 @@ def format_camera_check_result(result: CameraCheckResult) -> str:
         lines.extend(["", "Sensor Modes", "------------"])
         for idx, mode in enumerate(result.sensor_modes):
             lines.append(f"- mode[{idx}]: {json.dumps(mode, sort_keys=True)}")
+    if result.connection_findings:
+        lines.extend(["", "Connection Diagnosis", "--------------------"])
+        lines.extend(f"- {finding}" for finding in result.connection_findings)
+    if result.recommended_actions:
+        lines.extend(["", "Recommended Actions", "-------------------"])
+        lines.extend(
+            f"{index}. {action}"
+            for index, action in enumerate(result.recommended_actions, start=1)
+        )
     if result.notes:
         lines.extend(["", "Notes", "-----"])
         lines.extend(f"- {note}" for note in result.notes)

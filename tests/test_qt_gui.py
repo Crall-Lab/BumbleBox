@@ -39,7 +39,7 @@ class QtGuiTests(unittest.TestCase):
             window = BumbleBoxQtGUI(config_path)
             wizard = BumbleBoxSetupWizard(config_path, config)
             try:
-                self.assertEqual(window.pages.count(), 4)
+                self.assertEqual(window.pages.count(), 5)
 
                 wizard.hardware_page.profile.setCurrentIndex(
                     wizard.hardware_page.profile.findData("rgb_only")
@@ -54,6 +54,55 @@ class QtGuiTests(unittest.TestCase):
                 self.assertTrue(wizard.uses_realsense())
             finally:
                 wizard.close()
+                window.close()
+
+    def test_results_page_reports_realsense_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.yaml"
+            config = load_defaults()
+            config["setup"]["completed"] = True
+            config["system"]["data_root"] = str(root)
+            save_config(config_path, config)
+            session_dir = root / "session-a"
+            session_dir.mkdir()
+            rgb_video = session_dir / "session-a.mp4"
+            depth_video = session_dir / "session-a_realsense_depth_preview.avi"
+            rgb_video.touch()
+            depth_video.touch()
+            payload = {
+                "session_name": "session-a",
+                "session_dir": str(session_dir),
+                "_session_dir_local": str(session_dir),
+                "started_at": "2026-09-11T12:00:00-05:00",
+                "mode": "record_only",
+                "success": True,
+                "frames_captured": 70,
+                "actual_fps": 7.0,
+                "video_path": str(rgb_video),
+                "thermal_enabled": False,
+                "thermal_frames_captured": 0,
+                "realsense_enabled": True,
+                "realsense_frames_captured": 300,
+                "realsense_actual_fps": 30.0,
+                "realsense_depth_scale_meters": 0.001,
+                "realsense_depth_preview_video_path": str(depth_video),
+                "warnings": [],
+                "errors": [],
+            }
+            window = BumbleBoxQtGUI(config_path)
+            try:
+                window._run_history_loaded(window._run_history_generation, [payload], None)
+                self.app.processEvents()
+                self.assertEqual(window.results_table.rowCount(), 1)
+                self.assertEqual(window.results_table.item(0, 4).text(), "Off")
+                self.assertEqual(window.results_table.item(0, 5).text(), "300")
+                self.assertTrue(window.latest_depth_button.isEnabled())
+                self.assertIn("RealSense: 300 frames", window.result_detail.text())
+                self.assertTrue(window.result_artifact_buttons["rgb"][0].isEnabled())
+                self.assertTrue(window.result_artifact_buttons["depth"][0].isEnabled())
+                self.assertFalse(window.result_artifact_buttons["thermal"][0].isEnabled())
+            finally:
                 window.close()
 
 

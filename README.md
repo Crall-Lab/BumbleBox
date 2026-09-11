@@ -24,6 +24,7 @@ bash /Users/aec/Desktop/BumbleBox/start_bumblebox.sh
 /Users/aec/Desktop/BumbleBox/bbx realsense-check --no-probe
 /Users/aec/Desktop/BumbleBox/bbx realsense-check --apply
 /Users/aec/Desktop/BumbleBox/bbx realsense-snapshot
+/Users/aec/Desktop/BumbleBox/bbx simulate-capture
 /Users/aec/Desktop/BumbleBox/bbx camera-preview --seconds 20
 /Users/aec/Desktop/BumbleBox/bbx camera-test-tracking --seconds 20
 /Users/aec/Desktop/BumbleBox/bbx roadmap
@@ -87,6 +88,9 @@ sudo apt install python3-pyqt5 labelme
 - camera stack checks for HQ/Module3 workflows
 - USB thermal camera discovery/probe/snapshot path for PureThermal/Lepton-style devices (`thermal-check`, `thermal-snapshot`)
 - RealSense discovery, stream-profile probe, serial pinning, raw depth/color snapshots, and synchronized incremental recording (`realsense-check`, `realsense-snapshot`, `run-once`)
+- hardware-free RGB + thermal + RealSense integration recordings with a shared moving synchronization cue (`simulate-capture`)
+- actionable OwlSight/OV64A40 connection diagnostics for chip-ID and CSI/I2C failures (`camera-check`)
+- versioned RGB + thermal + RealSense calibration projects and capture readiness checks (`calibration-project`)
 - conditional hardware profiles for RGB-only, RGB+thermal, RGB+depth, and full multimodal systems
 - First-pass synchronized RGB + thermal recording when `thermal.enabled=true`
 - Automatic RGB + thermal side-by-side inspection video for synchronized thermal runs
@@ -123,8 +127,9 @@ The current Qt pages are:
 
 - `Overview`: profile, camera, optional-device, and storage status
 - `Run`: one-shot runs and start/stop controls for automated recordings
+- `Results`: asynchronous run history with RGB, thermal, and RealSense status plus direct artifact access
 - `Hardware`: only the checks relevant to the selected hardware profile
-- `Advanced`: access to the existing specialized tools while their Qt pages are migrated
+- `Advanced`: multimodal calibration-project controls and access to existing specialized tools while their Qt pages are migrated
 
 Only one primary Qt GUI instance is allowed per user. During migration, run `bbx gui --legacy` to open the previous Tk advanced interface.
 
@@ -178,4 +183,5 @@ Only one primary Qt GUI instance is allowed per user. During migration, run `bbx
 - `/Users/aec/Desktop/BumbleBox/docs/Nest_Labeling_On_Debian_Pi.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Thermal_Camera.md`
 - `/Users/aec/Desktop/BumbleBox/docs/RealSense_Camera.md`
+- `/Users/aec/Desktop/BumbleBox/docs/Multimodal_Calibration.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Legacy_Function_Review.md`

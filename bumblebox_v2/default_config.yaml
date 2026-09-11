@@ -120,6 +120,7 @@ calibration:
   pixels_per_cm: 103.05
   method: "needs_calibration"
   last_updated: null
+  multimodal_project_path: null
 
 runtime:
   use_mock_camera: false

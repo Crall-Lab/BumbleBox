@@ -26,7 +26,16 @@ from .camera_controls import (
     start_autofocus_after_camera_start,
 )
 from .camera_profiles import apply_camera_profile, configured_profile_name, validate_camera_ir_compatibility
-from .realsense_camera import RealSenseRecordingResult, RealSenseRecordingSession
+from .realsense_camera import (
+    RealSenseRecordingResult,
+    RealSenseRecordingSession,
+    capture_simulated_realsense_recording,
+)
+from .simulated_capture import (
+    simulated_frame_times,
+    simulated_rgb_yuv420_frame,
+    simulated_thermal_frame,
+)
 from .thermal_camera import resolve_thermal_device_path, _set_v4l2_y16_format
 from .tracking_index import sync_run_summary_file
 from .tuning import resolve_camera_tuning_file
@@ -391,7 +400,8 @@ def _mock_capture_frames(
     width = int(config["camera"]["width"])
     height = int(config["camera"]["height"])
 
-    frame_count = max(1, int(round(duration * fps)))
+    scheduled_times = simulated_frame_times(duration, fps)
+    frame_count = len(scheduled_times)
     progress = (
         _FrameProgress(stage="capture", label=progress_label, total=frame_count)
         if progress_label
@@ -404,10 +414,8 @@ def _mock_capture_frames(
     timestamp_records: List[FrameTimestampRecord] = []
     start_monotonic = time.perf_counter()
     monotonic_to_unix_offset_s = time.time() - time.perf_counter()
-    for i in range(frame_count):
-        relative_s = i / fps
-        frame = np.zeros((height * 3 // 2, width), dtype=np.uint8)
-        frame[:height, :] = (i * 17) % 255
+    for i, relative_s in enumerate(scheduled_times):
+        frame = simulated_rgb_yuv420_frame(width, height, relative_s, duration)
         frames.append(frame)
         timestamps.append(relative_s)
         timestamp_records.append(
@@ -420,7 +428,7 @@ def _mock_capture_frames(
         if progress is not None:
             progress.update(i + 1)
 
-    actual_fps = frame_count / duration if duration > 0 else fps
+    actual_fps = fps
     if progress is not None:
         progress.finish(frame_count)
     return frames, timestamps, actual_fps, timestamp_records
@@ -925,10 +933,10 @@ def _mock_capture_thermal_frames(
     thermal = config.get("thermal", {})
     width = int(thermal.get("width", 160))
     height = int(thermal.get("height", 120))
+    duration = float(config.get("capture", {}).get("recording_seconds", 1.0))
     frames: List[Any] = []
-    for idx, _timestamp in enumerate(timestamps):
-        base = np.full((height, width), 29000 + (idx % 97), dtype=np.uint16)
-        frames.append(base)
+    for timestamp in timestamps:
+        frames.append(simulated_thermal_frame(width, height, timestamp, duration))
     return frames, list(timestamps), float(actual_fps), "uint16_mono16", "mock://thermal", list(timestamp_records)
 
 
@@ -962,7 +970,12 @@ def _capture_rgb_and_optional_sensors(
         return frames, timestamps, actual_fps, timestamp_records, None, None
 
     if bool(config["runtime"].get("use_mock_camera", False)):
-        sensor_label = "RGB+thermal" if thermal_enabled else "RGB"
+        active_streams = ["RGB"]
+        if thermal_enabled:
+            active_streams.append("thermal")
+        if realsense_enabled:
+            active_streams.append("RealSense")
+        sensor_label = "+".join(active_streams)
         _progress_message("capture", f"Preparing synchronized mock {sensor_label} capture.")
         frames, timestamps, actual_fps, timestamp_records = _capture_frames(
             config,
@@ -970,28 +983,88 @@ def _capture_rgb_and_optional_sensors(
             progress_label="RGB capture",
         )
         thermal_result = None
-        if not thermal_enabled:
-            return frames, timestamps, actual_fps, timestamp_records, None, None
-        thermal_frames, thermal_timestamps, thermal_actual_fps, raw16_layout, device_path, thermal_timestamp_records = _mock_capture_thermal_frames(
-            config,
-            timestamps=timestamps,
-            actual_fps=actual_fps,
-            timestamp_records=timestamp_records,
-        )
+        if thermal_enabled:
+            thermal_frames, thermal_timestamps, thermal_actual_fps, raw16_layout, device_path, thermal_timestamp_records = _mock_capture_thermal_frames(
+                config,
+                timestamps=timestamps,
+                actual_fps=actual_fps,
+                timestamp_records=timestamp_records,
+            )
+            thermal_result = {
+                "device_path": device_path,
+                "frames": thermal_frames,
+                "timestamps": thermal_timestamps,
+                "actual_fps": thermal_actual_fps,
+                "raw16_layout": raw16_layout,
+                "timestamp_records": thermal_timestamp_records,
+            }
+
+        realsense_artifacts = None
+        if realsense_enabled:
+            realsense_fps = float(config.get("realsense", {}).get("fps", 30))
+            requested_frames = len(
+                simulated_frame_times(float(config["capture"]["recording_seconds"]), realsense_fps)
+            )
+            progress = _FrameProgress(
+                stage="capture",
+                label="Simulated RealSense capture",
+                total=requested_frames,
+            )
+            progress.start(
+                detail=(
+                    f"{float(config['capture']['recording_seconds']):.1f}s at "
+                    f"{realsense_fps:.3f} FPS"
+                )
+            )
+            depth_preview_progress: Optional[_FrameProgress] = None
+
+            def update_depth_preview(completed: int, total: int) -> None:
+                nonlocal depth_preview_progress
+                if depth_preview_progress is None:
+                    depth_preview_progress = _FrameProgress(
+                        stage="output",
+                        label="Simulated RealSense depth preview video",
+                        total=total,
+                    )
+                    depth_preview_progress.start()
+                depth_preview_progress.update(completed)
+                if completed >= total:
+                    depth_preview_progress.finish(completed)
+
+            shared_start = (
+                timestamp_records[0].captured_monotonic_s
+                if timestamp_records
+                else time.perf_counter()
+            )
+            realsense_artifacts = capture_simulated_realsense_recording(
+                config,
+                session_dir=session_dir,
+                session_name=session_name,
+                duration=float(config["capture"]["recording_seconds"]),
+                start_monotonic=shared_start,
+                progress_callback=lambda completed, _total: progress.update(completed),
+                status_callback=lambda message: _progress_message("output", message),
+                depth_preview_progress_callback=update_depth_preview,
+            )
+            progress.finish(realsense_artifacts.frames_captured)
+
+        counts = [f"{len(frames)} RGB"]
+        if thermal_result is not None:
+            counts.append(f"{len(thermal_result['frames'])} thermal")
+        if realsense_artifacts is not None:
+            counts.append(f"{realsense_artifacts.frames_captured} RealSense")
         _progress_message(
             "capture",
-            "Synchronized mock acquisition finished: "
-            f"{len(frames)} RGB and {len(thermal_frames)} thermal frames.",
+            "Synchronized mock acquisition finished: " + ", ".join(counts) + " frames.",
         )
-        thermal_result = {
-            "device_path": device_path,
-            "frames": thermal_frames,
-            "timestamps": thermal_timestamps,
-            "actual_fps": thermal_actual_fps,
-            "raw16_layout": raw16_layout,
-            "timestamp_records": thermal_timestamp_records,
-        }
-        return frames, timestamps, actual_fps, timestamp_records, thermal_result, None
+        return (
+            frames,
+            timestamps,
+            actual_fps,
+            timestamp_records,
+            thermal_result,
+            realsense_artifacts,
+        )
 
     fps = float(config["camera"]["fps_target"])
     duration = float(config["capture"]["recording_seconds"])
@@ -2486,14 +2559,6 @@ def run_once(config: Dict[str, Any], mode_override: Optional[str] = None) -> Run
     try:
         should_record = mode in {"record_only", "record_and_track"}
         should_track = mode in {"track_only", "record_and_track"}
-        if (
-            should_record
-            and _realsense_enabled_for_recording(config)
-            and bool(config["runtime"].get("use_mock_camera", False))
-        ):
-            warnings.append(
-                "RealSense capture was skipped because runtime.use_mock_camera is enabled."
-            )
         _progress_message(
             "run",
             f"Session {session_name} started in {mode} mode.",

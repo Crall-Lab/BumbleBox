@@ -58,3 +58,7 @@ Open `/Users/aec/Desktop/BumbleBox/bbx_gui.py`, then use the `Camera Setup` tab:
 2. `Run Live Tracking Test`
 
 Or use `Run Full Setup Check (A then B)` for a single guided flow.
+
+## Camera Connection Diagnostics
+
+`./bbx camera-check` now compares the configured camera model with the sensor reported by Picamera2/libcamera. For an OwlSight profile, an OV64A40 chip-ID failure with Linux error `-121` is reported as a CSI/I2C connection or sensor-power problem, with shutdown and cable-reseat steps. It is not reported as an autofocus, resolution, or tuning-file problem. A different detected sensor is reported as a camera-profile mismatch.
