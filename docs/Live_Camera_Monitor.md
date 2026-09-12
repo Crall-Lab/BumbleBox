@@ -15,8 +15,11 @@ From a terminal:
 ./bbx live-monitor
 ```
 
-The default OwlSight/RGB preview is `1280x960`, and display updates are capped
-at 10 FPS. The thermal camera remains at its native configured resolution.
+The default OwlSight/RGB preview is `1920x1440`, and display updates are capped
+at 10 FPS. On the tested OwlSight this selects the full-field 4:3 binned sensor
+mode and sustains roughly 9 FPS while all cameras are active. A `1280x960`
+request caused libcamera to select a cropped `1920x1080` sensor mode and is
+therefore not the default. The thermal camera remains at its native configured resolution.
 RealSense color and depth use the configured RealSense stream profile, but the
 GUI displays at most 10 frames per second from each stream.
 
@@ -44,8 +47,11 @@ the same camera devices twice.
 - One slow or failed camera does not stop the other panels.
 - Every panel reports displayed resolution, recent display FPS, and host-side
   frame age.
+- Every complete frame is fitted with its aspect ratio preserved. Empty space
+  is letterboxed; the GUI does not crop frames to fill a panel.
 - Thermal is enlarged with nearest-neighbor display scaling so native pixels
-  remain visually explicit.
+  remain visually explicit. Its `160x120` view is the complete Lepton frame;
+  its field of view can still be narrower because of the thermal lens.
 - No monitor frames are written to disk.
 
 The monitor is local rather than an HTTP/WebRTC server. Raspberry Pi Connect

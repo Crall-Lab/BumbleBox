@@ -4173,14 +4173,14 @@ def build_parser() -> argparse.ArgumentParser:
     live_monitor_parser.add_argument(
         "--rgb-width",
         type=int,
-        default=1280,
-        help="OwlSight/RGB preview width in pixels (default: 1280).",
+        default=1920,
+        help="OwlSight/RGB preview width in pixels (default: 1920 for full OwlSight field of view).",
     )
     live_monitor_parser.add_argument(
         "--rgb-height",
         type=int,
-        default=960,
-        help="OwlSight/RGB preview height in pixels (default: 960).",
+        default=1440,
+        help="OwlSight/RGB preview height in pixels (default: 1440 for full OwlSight field of view).",
     )
     live_monitor_parser.add_argument(
         "--display-fps",

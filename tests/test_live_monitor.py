@@ -20,8 +20,8 @@ class LiveMonitorTests(unittest.TestCase):
     def test_cli_defaults_use_reasonable_owlsight_preview(self) -> None:
         args = build_parser().parse_args(["live-monitor"])
 
-        self.assertEqual(args.rgb_width, 1280)
-        self.assertEqual(args.rgb_height, 960)
+        self.assertEqual(args.rgb_width, 1920)
+        self.assertEqual(args.rgb_height, 1440)
         self.assertEqual(args.display_fps, 10.0)
 
     def test_local_sensor_assignment_excludes_remote_camera(self) -> None:
@@ -112,7 +112,7 @@ class LiveMonitorTests(unittest.TestCase):
 
     def test_options_reject_odd_yuv_dimensions(self) -> None:
         with self.assertRaisesRegex(ValueError, "even"):
-            LiveMonitorOptions(rgb_width=1279, rgb_height=960).validate()
+            LiveMonitorOptions(rgb_width=1919, rgb_height=1440).validate()
 
 
 if __name__ == "__main__":

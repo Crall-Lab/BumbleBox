@@ -13,8 +13,10 @@ from typing import Any, Callable, Optional
 
 @dataclass(frozen=True)
 class LiveMonitorOptions:
-    rgb_width: int = 1280
-    rgb_height: int = 960
+    # The OwlSight selects a cropped 16:9 sensor mode for 1280x960. This
+    # validated 4:3 request selects its full-field binned sensor mode instead.
+    rgb_width: int = 1920
+    rgb_height: int = 1440
     display_fps: float = 10.0
     duration_seconds: float = 0.0
     thermal_override: Optional[bool] = None
@@ -650,7 +652,7 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
             title.setObjectName("MonitorTitle")
             subtitle = QLabel(
                 f"OwlSight preview {options.rgb_width} x {options.rgb_height}; "
-                f"display capped at {options.display_fps:g} FPS"
+                f"full-frame fit; display capped at {options.display_fps:g} FPS"
             )
             subtitle.setObjectName("MonitorSubtitle")
             title_col.addWidget(title)
