@@ -810,7 +810,9 @@ def _list_remote_latest_recordings(
 ) -> list[tuple[float, str]]:
     data_root_q = shlex.quote(worker.data_root)
     cmd = (
-        f"find {data_root_q} -type f \\( -name '*.mp4' -o -name '*.mjpeg' \\) -printf '%T@ %p\\n' 2>/dev/null "
+        f"find {data_root_q} -type f \\( -name '*.mp4' -o -name '*.mjpeg' -o -name '*.avi' \\) "
+        "! -name '*_tracked*' ! -name '*_thermal_preview*' ! -name '*_side_by_side*' "
+        "! -name '*_realsense_*' -printf '%T@ %p\\n' 2>/dev/null "
         f"| sort -nr | head -n {int(max(1, limit))} || true"
     )
     proc = _ssh_run(
@@ -901,7 +903,7 @@ def _latest_video_path(output_root: Path, worker: FleetWorker, preferred_suffix:
     suffix = str(preferred_suffix or ".mp4").strip().lower()
     if not suffix.startswith("."):
         suffix = f".{suffix}"
-    if suffix not in {".mp4", ".mjpeg"}:
+    if suffix not in {".mp4", ".mjpeg", ".avi"}:
         suffix = ".mp4"
     return _worker_latest_dir(output_root, worker) / f"latest_video{suffix}"
 
@@ -919,6 +921,9 @@ def _resolve_latest_video_path(output_root: Path, worker: FleetWorker, latest_me
     candidate_mjpeg = _latest_video_path(output_root, worker, ".mjpeg")
     if candidate_mjpeg.exists():
         return candidate_mjpeg
+    candidate_avi = _latest_video_path(output_root, worker, ".avi")
+    if candidate_avi.exists():
+        return candidate_avi
     return candidate_mp4
 
 
@@ -1499,6 +1504,7 @@ def run_queen_pull_latest_videos(
             for stale in (
                 _latest_video_path(output_root_path, worker, ".mp4"),
                 _latest_video_path(output_root_path, worker, ".mjpeg"),
+                _latest_video_path(output_root_path, worker, ".avi"),
             ):
                 if stale != latest_video_target and stale.exists():
                     try:

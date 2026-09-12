@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable, Optional
 
 
 DEFAULT_VIDEO_EXTENSIONS = (".mp4", ".mjpeg", ".mjpe", ".avi", ".mov", ".mkv")
-DEFAULT_TRACKING_EXTENSIONS = (".mp4", ".mjpeg", ".mjpe")
+DEFAULT_TRACKING_EXTENSIONS = (".mp4", ".mjpeg", ".mjpe", ".avi")
 TRACKING_COMPLETION_SCHEMA_VERSION = 1
 PosthocProgressCallback = Callable[[str], None]
 ARUCO_PARAM_KEYS = {
@@ -30,6 +30,7 @@ GENERATED_VIDEO_STEM_MARKERS = (
     "_rgb_thermal_side_by_side",
     "_thermal_side_by_side",
     "_side_by_side",
+    "_realsense_",
 )
 DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 BUMBLEBOX_VIDEO_RE = re.compile(

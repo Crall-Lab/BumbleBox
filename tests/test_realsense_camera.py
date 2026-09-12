@@ -261,6 +261,55 @@ class RealSenseCameraTests(unittest.TestCase):
             self.assertTrue(Path(result.depth_preview_video_path).exists())
             self.assertTrue(Path(result.color_video_path).exists())
 
+    def test_finalizing_depth_stack_handles_partial_last_chunk(self) -> None:
+        config = load_defaults()
+        config["realsense"].update(
+            {
+                "depth_width": 32,
+                "depth_height": 24,
+                "color_width": 32,
+                "color_height": 24,
+                "fps": 30,
+            }
+        )
+        device = RealSenseDevice(
+            serial="1234",
+            name="Intel RealSense D405",
+            product_line="D400",
+            firmware_version="test",
+            usb_type="3.2",
+            physical_port="test-port",
+            depth_profiles=["32x24@30 format.z16"],
+            color_profiles=["32x24@30 format.bgr8"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "bumblebox_v2.realsense_camera.discover_realsense_devices",
+            return_value=(_FakeRealSense(), [device]),
+        ):
+            session = RealSenseRecordingSession(
+                config,
+                session_dir=tmp,
+                session_name="test_run",
+            )
+            partial = Path(tmp) / ".depth_partial.npy"
+            output = Path(tmp) / "depth.npy"
+            depth_memmap = np.lib.format.open_memmap(
+                partial,
+                mode="w+",
+                dtype=np.uint16,
+                shape=(64, 24, 32),
+            )
+            for index in range(48):
+                depth_memmap[index] = index
+
+            session._finalize_depth_npy(depth_memmap, 48, partial, output)
+
+            finalized = np.load(output)
+            self.assertEqual(finalized.shape, (48, 24, 32))
+            self.assertEqual(int(finalized[47, 0, 0]), 47)
+            self.assertFalse(partial.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

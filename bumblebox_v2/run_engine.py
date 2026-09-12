@@ -2035,7 +2035,7 @@ def record_live_test_clip(
         frames,
         session_dir,
         session_name,
-        fps=float(test_config["camera"]["fps_target"]),
+        fps=float(actual_fps if actual_fps > 0 else test_config["camera"]["fps_target"]),
         width=int(test_config["camera"]["width"]),
         height=int(test_config["camera"]["height"]),
         recording_codec=requested_video_codec,
@@ -2051,7 +2051,7 @@ def record_live_test_clip(
                 frames,
                 session_dir,
                 fallback_session_name,
-                fps=float(test_config["camera"]["fps_target"]),
+                fps=float(actual_fps if actual_fps > 0 else test_config["camera"]["fps_target"]),
                 width=int(test_config["camera"]["width"]),
                 height=int(test_config["camera"]["height"]),
                 recording_codec="mjpeg",
@@ -2143,7 +2143,8 @@ def _write_recording_video(
         except ImportError as exc:  # pragma: no cover - dependency/runtime
             raise RuntimeError("OpenCV is required to write MJPEG recording output.") from exc
 
-        output = session_dir / f"{session_name}.mjpeg"
+        # AVI retains the measured frame rate; a raw .mjpeg stream does not.
+        output = session_dir / f"{session_name}.avi"
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         writer = cv2.VideoWriter(str(output), fourcc, fps, (actual_width, actual_height))
         if not writer.isOpened():
@@ -2723,19 +2724,6 @@ def run_once(
                             "RGB and thermal actual FPS differed during synchronized recording "
                             f"({actual_fps:.3f} RGB vs {thermal_artifacts.actual_fps:.3f} thermal)."
                         )
-                    try:
-                        thermal_side_by_side_artifacts = _write_rgb_thermal_side_by_side_outputs(
-                            session_dir=session_dir,
-                            session_name=session_name,
-                            rgb_frames=frames,
-                            rgb_timestamps=timestamps,
-                            thermal_frames=list(thermal_capture["frames"]),
-                            thermal_timestamps=list(thermal_capture["timestamps"]),
-                            fps=float(actual_fps if actual_fps > 0 else config["camera"]["fps_target"]),
-                            monochrome_output=_camera_monochrome_output_enabled(config),
-                        )
-                    except Exception as exc:
-                        warnings.append(f"RGB+thermal side-by-side preview write failed: {exc}")
                 else:
                     thermal_artifacts = None
                     thermal_side_by_side_artifacts = None
@@ -2776,7 +2764,7 @@ def run_once(
                 frames,
                 session_dir,
                 session_name,
-                fps=float(config["camera"]["fps_target"]),
+                fps=float(actual_fps if actual_fps > 0 else config["camera"]["fps_target"]),
                 width=int(config["camera"]["width"]),
                 height=int(config["camera"]["height"]),
                 recording_codec=video_codec,
@@ -2784,6 +2772,21 @@ def run_once(
                 monochrome_output=_camera_monochrome_output_enabled(config),
             )
             _progress_message("output", f"RGB recording complete: {video_path.name}.")
+
+            if thermal_capture is not None:
+                try:
+                    thermal_side_by_side_artifacts = _write_rgb_thermal_side_by_side_outputs(
+                        session_dir=session_dir,
+                        session_name=session_name,
+                        rgb_frames=frames,
+                        rgb_timestamps=timestamps,
+                        thermal_frames=list(thermal_capture["frames"]),
+                        thermal_timestamps=list(thermal_capture["timestamps"]),
+                        fps=float(actual_fps if actual_fps > 0 else config["camera"]["fps_target"]),
+                        monochrome_output=_camera_monochrome_output_enabled(config),
+                    )
+                except Exception as exc:
+                    warnings.append(f"RGB+thermal side-by-side preview write failed: {exc}")
 
             _progress_message("output", "Writing RGB midpoint preview.")
             recording_preview_png_path = _write_midpoint_preview_png(

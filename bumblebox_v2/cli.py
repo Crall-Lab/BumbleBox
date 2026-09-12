@@ -739,6 +739,36 @@ def _cmd_camera_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_live_monitor(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    try:
+        config = apply_camera_profile(_load_or_defaults(config_path))
+    except (FileNotFoundError, ConfigError, RuntimeError, ValueError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    if not _check_camera_ir_compatibility_for_cli(config):
+        return 1
+    if bool(args.mock):
+        config.setdefault("runtime", {})["use_mock_camera"] = True
+
+    try:
+        from .live_monitor import LiveMonitorOptions, launch_live_monitor
+
+        options = LiveMonitorOptions(
+            rgb_width=int(args.rgb_width),
+            rgb_height=int(args.rgb_height),
+            display_fps=float(args.display_fps),
+            duration_seconds=float(args.seconds),
+            thermal_override=args.thermal,
+            realsense_override=args.realsense,
+        )
+        return launch_live_monitor(config, options)
+    except Exception as exc:
+        print(f"Live camera monitor failed: {exc}")
+        return 1
+
+
 def _cmd_camera_check(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     try:
@@ -4134,6 +4164,70 @@ def build_parser() -> argparse.ArgumentParser:
     )
     camera_preview_parser.set_defaults(monochrome_output=None)
     camera_preview_parser.set_defaults(func=_cmd_camera_preview)
+
+    live_monitor_parser = subparsers.add_parser(
+        "live-monitor",
+        help="Open a non-recording four-panel RGB, thermal, and RealSense monitor.",
+    )
+    _add_common_config_arg(live_monitor_parser)
+    live_monitor_parser.add_argument(
+        "--rgb-width",
+        type=int,
+        default=1280,
+        help="OwlSight/RGB preview width in pixels (default: 1280).",
+    )
+    live_monitor_parser.add_argument(
+        "--rgb-height",
+        type=int,
+        default=960,
+        help="OwlSight/RGB preview height in pixels (default: 960).",
+    )
+    live_monitor_parser.add_argument(
+        "--display-fps",
+        type=float,
+        default=10.0,
+        help="Maximum display update rate per stream (default: 10).",
+    )
+    live_monitor_parser.add_argument(
+        "--seconds",
+        type=float,
+        default=0.0,
+        help="Automatically close after this many seconds; 0 runs until closed (default: 0).",
+    )
+    thermal_monitor_group = live_monitor_parser.add_mutually_exclusive_group()
+    thermal_monitor_group.add_argument(
+        "--thermal",
+        dest="thermal",
+        action="store_true",
+        help="Try to display thermal even when thermal.enabled is false.",
+    )
+    thermal_monitor_group.add_argument(
+        "--no-thermal",
+        dest="thermal",
+        action="store_false",
+        help="Do not open the thermal camera for this monitor session.",
+    )
+    live_monitor_parser.set_defaults(thermal=None)
+    realsense_monitor_group = live_monitor_parser.add_mutually_exclusive_group()
+    realsense_monitor_group.add_argument(
+        "--realsense",
+        dest="realsense",
+        action="store_true",
+        help="Try to display RealSense color and depth even when realsense.enabled is false.",
+    )
+    realsense_monitor_group.add_argument(
+        "--no-realsense",
+        dest="realsense",
+        action="store_false",
+        help="Do not open RealSense for this monitor session.",
+    )
+    live_monitor_parser.set_defaults(realsense=None)
+    live_monitor_parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="Display synthetic streams without opening camera hardware.",
+    )
+    live_monitor_parser.set_defaults(func=_cmd_live_monitor)
 
     camera_reset_parser = subparsers.add_parser(
         "camera-reset",

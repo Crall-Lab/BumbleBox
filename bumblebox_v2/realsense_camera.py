@@ -743,7 +743,8 @@ class RealSenseRecordingSession:
         )
         chunk_size = max(1, min(32, int(count)))
         for offset in range(0, int(count), chunk_size):
-            final[offset : offset + chunk_size] = current[offset : offset + chunk_size]
+            end = min(offset + chunk_size, int(count))
+            final[offset:end] = current[offset:end]
         final.flush()
         del final
         del current

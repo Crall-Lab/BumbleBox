@@ -51,7 +51,7 @@ def _latest_recording_video(data_root: Path) -> Optional[Path]:
 
     newest_path: Optional[Path] = None
     newest_mtime = -1.0
-    for suffix in ("*.mp4", "*.mjpeg"):
+    for suffix in ("*.mp4", "*.mjpeg", "*.avi"):
         for path in data_root.rglob(suffix):
             try:
                 mtime = path.stat().st_mtime
@@ -232,7 +232,7 @@ def _recording_freshness_alert(config: Dict[str, Any]) -> RuntimeAlert:
         return RuntimeAlert(
             "WARN",
             "Recording freshness",
-            f"No recording videos (.mp4 or .mjpeg) found under {data_root} while scheduling is enabled.",
+            f"No recording videos (.mp4, .mjpeg, or .avi) found under {data_root} while scheduling is enabled.",
         )
 
     try:

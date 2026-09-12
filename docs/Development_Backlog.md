@@ -26,6 +26,8 @@ validated.
 - [ ] Validate distributed capture on two physical Pi 5 units with OwlSight, PureThermal, and D405 hardware.
 - [ ] Add a detached worker service if experiments must survive controller loss during an active capture.
 - [x] Add a hardware-free three-camera recording simulation with shared timing and visual cues.
+- [x] Add a bounded local live monitor for OwlSight/RGB, thermal, RealSense color, and RealSense depth.
+- [ ] Validate sustained live-monitor load and displayed frame rates on the Raspberry Pi 5.
 - [ ] Add frame-by-frame three-camera inspection output.
 - [x] Define a versioned multimodal calibration project, capture registry, artifact contract, and readiness checks.
 - [ ] Implement the temporal offset/drift solver against registered calibration captures.

@@ -41,6 +41,7 @@ class QtGuiTests(unittest.TestCase):
             wizard = BumbleBoxSetupWizard(config_path, config)
             try:
                 self.assertEqual(window.pages.count(), 5)
+                self.assertEqual(window.live_monitor_button.text(), "Open Live Camera Monitor")
 
                 wizard.hardware_page.profile.setCurrentIndex(
                     wizard.hardware_page.profile.findData("rgb_only")

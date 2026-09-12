@@ -5,11 +5,12 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from bumblebox_v2.config import load_defaults
-from bumblebox_v2.run_engine import run_once
+from bumblebox_v2 import run_engine
 from bumblebox_v2.simulated_capture import (
     simulated_realsense_depth_frame,
     simulated_target_center,
@@ -80,7 +81,27 @@ class SimulatedCaptureTests(unittest.TestCase):
                 }
             )
 
-            summary = run_once(config, mode_override="record_only")
+            output_order: list[str] = []
+            original_recording_writer = run_engine._write_recording_video
+            original_side_by_side_writer = run_engine._write_rgb_thermal_side_by_side_outputs
+
+            def write_recording(*args, **kwargs):
+                output_order.append("rgb_recording")
+                return original_recording_writer(*args, **kwargs)
+
+            def write_side_by_side(*args, **kwargs):
+                output_order.append("rgb_thermal_side_by_side")
+                return original_side_by_side_writer(*args, **kwargs)
+
+            with (
+                patch.object(run_engine, "_write_recording_video", side_effect=write_recording),
+                patch.object(
+                    run_engine,
+                    "_write_rgb_thermal_side_by_side_outputs",
+                    side_effect=write_side_by_side,
+                ),
+            ):
+                summary = run_engine.run_once(config, mode_override="record_only")
 
             self.assertTrue(summary.success, summary.errors)
             self.assertEqual(summary.frames_captured, 2)
@@ -88,6 +109,11 @@ class SimulatedCaptureTests(unittest.TestCase):
             self.assertEqual(summary.realsense_frames_captured, 3)
             self.assertEqual(summary.thermal_device_path, "mock://thermal")
             self.assertEqual(summary.realsense_device_serial, "mock://realsense")
+            self.assertEqual(Path(str(summary.video_path)).suffix, ".avi")
+            self.assertLess(
+                output_order.index("rgb_recording"),
+                output_order.index("rgb_thermal_side_by_side"),
+            )
 
             artifact_paths = [
                 summary.video_path,

@@ -153,7 +153,11 @@ def _expected_artifacts(
         seen.add(candidate)
         items.insert(1, ("video_mp4", candidate, False))
 
-    for fallback in (session_dir / f"{session_name}.mp4", session_dir / f"{session_name}.mjpeg"):
+    for fallback in (
+        session_dir / f"{session_name}.mp4",
+        session_dir / f"{session_name}.mjpeg",
+        session_dir / f"{session_name}.avi",
+    ):
         resolved = fallback.resolve()
         if resolved in seen:
             continue
@@ -298,7 +302,7 @@ def export_run_bundle(
             resolved = path.resolve()
             if resolved in included_sources:
                 continue
-            if (path.suffix.lower() in {".mp4", ".mjpeg"}) and not include_video:
+            if (path.suffix.lower() in {".mp4", ".mjpeg", ".avi"}) and not include_video:
                 continue
             copied = _copy_with_unique_name(path, artifacts_dir, path.name)
             included_sources.add(resolved)

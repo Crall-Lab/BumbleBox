@@ -1159,6 +1159,13 @@ class BumbleBoxQtGUI(QMainWindow):
         run.setObjectName("Accent")
         run.clicked.connect(self._run_once)
         row.addWidget(run)
+        self.live_monitor_button = QPushButton("Open Live Camera Monitor")
+        self.live_monitor_button.setObjectName("Primary")
+        self.live_monitor_button.setToolTip(
+            "Preview enabled cameras together without saving data. Close the monitor before recording."
+        )
+        self.live_monitor_button.clicked.connect(self._open_live_monitor)
+        row.addWidget(self.live_monitor_button)
         row.addStretch(1)
         layout.addLayout(row)
 
@@ -1941,9 +1948,38 @@ class BumbleBoxQtGUI(QMainWindow):
         self.calibration_status_button.setEnabled(calibration_path is not None)
 
     def _run_once(self) -> None:
+        if not self._confirm_live_monitor_closed("start a recording"):
+            return
         self.run_bbx_command(["run-once", "--mode", str(self.run_mode.currentData())])
 
+    def _open_live_monitor(self) -> None:
+        from .live_monitor import live_monitor_is_running
+
+        if live_monitor_is_running():
+            QMessageBox.information(
+                self,
+                "Live monitor is already open",
+                "Use the existing BumbleBox Live Camera Monitor window.",
+            )
+            return
+        self.run_bbx_command(["live-monitor"], detached=True)
+
+    def _confirm_live_monitor_closed(self, action: str) -> bool:
+        from .live_monitor import live_monitor_is_running
+
+        if not live_monitor_is_running():
+            return True
+        QMessageBox.warning(
+            self,
+            "Close the live monitor first",
+            f"Close the BumbleBox Live Camera Monitor before you {action}. "
+            "The monitor currently owns the camera devices.",
+        )
+        return False
+
     def _start_automation(self) -> None:
+        if not self._confirm_live_monitor_closed("start automated recording"):
+            return
         config = load_config(self.config_path)
         scheduling = config.setdefault("scheduling", {})
         scheduling["enabled"] = True
@@ -1977,7 +2013,14 @@ class BumbleBoxQtGUI(QMainWindow):
         success_message: tuple[str, str] | None = None,
     ) -> None:
         if detached:
-            QProcess.startDetached(sys.executable, [str(BBX_SCRIPT), *arguments])
+            detached_arguments = list(arguments)
+            if "--config" not in detached_arguments:
+                detached_arguments.extend(["--config", str(self.config_path)])
+            QProcess.startDetached(
+                sys.executable,
+                [str(BBX_SCRIPT), *detached_arguments],
+                str(REPO_ROOT),
+            )
             return
         self.run_bbx_commands([arguments], success_message=success_message)
 

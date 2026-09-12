@@ -26,6 +26,7 @@ bash /Users/aec/Desktop/BumbleBox/start_bumblebox.sh
 /Users/aec/Desktop/BumbleBox/bbx realsense-snapshot
 /Users/aec/Desktop/BumbleBox/bbx simulate-capture
 /Users/aec/Desktop/BumbleBox/bbx camera-preview --seconds 20
+/Users/aec/Desktop/BumbleBox/bbx live-monitor
 /Users/aec/Desktop/BumbleBox/bbx camera-test-tracking --seconds 20
 /Users/aec/Desktop/BumbleBox/bbx roadmap
 /Users/aec/Desktop/BumbleBox/bbx gui
@@ -97,6 +98,7 @@ sudo apt install python3-pyqt5 labelme
 - First-pass synchronized RGB + thermal recording when `thermal.enabled=true`
 - Automatic RGB + thermal side-by-side inspection video for synchronized thermal runs
 - camera setup tools for focus/framing and live tag-detection validation (`camera-preview`, `camera-test-tracking`)
+- bounded four-panel RGB, thermal, RealSense color, and RealSense depth preview (`live-monitor`)
 - explicit camera tuning selection: auto-resolve by camera model + IR/NoIR flag (Pi4 `vc4` / Pi5 `pisp`) with manual override via `camera.tuning_file`
 - flexible mode model (`record_only`, `track_only`, `record_and_track`, `mixed_schedule`)
 - MP4 framerate quality reporting (`fps-report`)
@@ -128,7 +130,7 @@ sudo apt install python3-pyqt5 labelme
 The current Qt pages are:
 
 - `Overview`: profile, camera, optional-device, and storage status
-- `Run`: one-shot runs, start/stop controls for automated recordings, and optional two-Pi readiness checks
+- `Run`: four-camera live monitor, one-shot runs, start/stop controls for automated recordings, and optional two-Pi readiness checks
 - `Results`: asynchronous run history with RGB, thermal, RealSense, distributed-node status, timing analysis, and direct artifact access
 - `Hardware`: only the checks relevant to the selected hardware profile and assigned capture node
 - `Advanced`: multimodal calibration-project controls and access to existing specialized tools while their Qt pages are migrated
