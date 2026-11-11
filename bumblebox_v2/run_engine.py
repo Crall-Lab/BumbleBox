@@ -36,6 +36,16 @@ from .simulated_capture import (
     simulated_rgb_yuv420_frame,
     simulated_thermal_frame,
 )
+from .stream_writer import (
+    FRAME_BUFFER_STREAM,
+    StreamedVideo,
+    StreamingVideoWriter,
+    find_ffmpeg_binary,
+    frame_buffer_mode,
+    normalize_mp4_codec,
+    resolve_mp4_preset,
+    stream_queue_bytes,
+)
 from .thermal_camera import resolve_thermal_device_path, _set_v4l2_y16_format
 from .tracking_index import sync_run_summary_file
 from .tuning import resolve_camera_tuning_file
@@ -138,6 +148,8 @@ class RunSummary:
     tracking_processing_fps: Optional[float]
     video_codec: Optional[str]
     video_path: Optional[str]
+    capture_frame_buffer: str
+    stream_encoder_stats: Optional[Dict[str, Any]]
     recording_preview_png_path: Optional[str]
     timestamp_path: Optional[str]
     thermal_enabled: bool
@@ -402,6 +414,7 @@ def _mock_capture_frames(
     config: Dict[str, Any],
     *,
     progress_label: Optional[str] = None,
+    frame_sink: Optional[StreamingVideoWriter] = None,
 ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     try:
         import numpy as np
@@ -429,7 +442,10 @@ def _mock_capture_frames(
     monotonic_to_unix_offset_s = time.time() - time.perf_counter()
     for i, relative_s in enumerate(scheduled_times):
         frame = simulated_rgb_yuv420_frame(width, height, relative_s, duration)
-        frames.append(frame)
+        if frame_sink is None:
+            frames.append(frame)
+        else:
+            frame_sink.add(frame)
         timestamps.append(relative_s)
         timestamp_records.append(
             _build_timestamp_record(
@@ -454,7 +470,14 @@ def _capture_frames_from_started_picamera(
     *,
     start_monotonic: float | None = None,
     progress_label: Optional[str] = None,
+    frame_sink: Optional[StreamingVideoWriter] = None,
 ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
+    """Capture frames for ``duration`` seconds.
+
+    Without ``frame_sink`` every frame is kept and returned (RAM mode). With
+    one, each frame is handed to it as it arrives and the returned frame list
+    is empty (stream mode); timestamps are returned either way.
+    """
     frames: List[Any] = []
     timestamps: List[float] = []
     timestamp_records: List[FrameTimestampRecord] = []
@@ -498,7 +521,10 @@ def _capture_frames_from_started_picamera(
             else:
                 yuv420 = picam2.capture_array()
             captured_monotonic_s = time.perf_counter()
-            frames.append(yuv420)
+            if frame_sink is None:
+                frames.append(yuv420)
+            else:
+                frame_sink.add(yuv420)
             record = _build_timestamp_record(
                 start_monotonic=start,
                 captured_monotonic_s=captured_monotonic_s,
@@ -511,11 +537,17 @@ def _capture_frames_from_started_picamera(
             frame_index += 1
             if progress is not None:
                 progress.update(frame_index)
+        else:
+            # Not due yet: sleep briefly instead of spinning, so this loop does
+            # not hold a CPU core (and the interpreter lock) that the encoder
+            # and the other sensor threads need.
+            time.sleep(min(0.001, max(0.0, expected - now)))
 
-    elapsed = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else duration
-    actual_fps = (len(timestamps) - 1) / elapsed if elapsed > 0 and len(timestamps) > 1 else float(len(frames)) / max(duration, 1e-6)
+    frame_count = len(timestamps)
+    elapsed = timestamps[-1] - timestamps[0] if frame_count > 1 else duration
+    actual_fps = (frame_count - 1) / elapsed if elapsed > 0 and frame_count > 1 else float(frame_count) / max(duration, 1e-6)
     if progress is not None:
-        progress.finish(len(frames))
+        progress.finish(frame_count)
     return frames, timestamps, actual_fps, timestamp_records
 
 
@@ -690,6 +722,7 @@ class _PicameraCaptureSession:
         duration: float,
         start_monotonic: float | None = None,
         progress_label: Optional[str] = None,
+        frame_sink: Optional[StreamingVideoWriter] = None,
     ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
         self.start()
         return _capture_frames_from_started_picamera(
@@ -698,6 +731,7 @@ class _PicameraCaptureSession:
             float(duration),
             start_monotonic=start_monotonic,
             progress_label=progress_label,
+            frame_sink=frame_sink,
         )
 
     def close(self) -> None:
@@ -737,6 +771,7 @@ def _capture_frames_picamera(
     *,
     diagnostics: Optional[dict[str, Any]] = None,
     progress_label: Optional[str] = None,
+    frame_sink: Optional[StreamingVideoWriter] = None,
 ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     fps = float(config["camera"]["fps_target"])
     duration = float(config["capture"]["recording_seconds"])
@@ -746,6 +781,7 @@ def _capture_frames_picamera(
             fps=fps,
             duration=duration,
             progress_label=progress_label,
+            frame_sink=frame_sink,
         )
 
 
@@ -977,6 +1013,7 @@ def _capture_rgb_and_optional_sensors(
     start_monotonic_override: Optional[float] = None,
     ready_callback: Optional[Any] = None,
     capture_node_name: Optional[str] = None,
+    frame_sink: Optional[StreamingVideoWriter] = None,
 ) -> Tuple[
     List[Any],
     List[float],
@@ -985,6 +1022,9 @@ def _capture_rgb_and_optional_sensors(
     Optional[dict[str, Any]],
     Optional[RealSenseRecordingResult],
 ]:
+    # With frame_sink set (stream mode) RGB frames go to the sink as they
+    # arrive and the returned RGB frame list is empty; count RGB frames by
+    # their timestamps.
     thermal_enabled = _thermal_enabled_for_recording(config)
     realsense_enabled = _realsense_enabled_for_recording(config)
     if (
@@ -997,10 +1037,11 @@ def _capture_rgb_and_optional_sensors(
             config,
             diagnostics=diagnostics,
             progress_label="RGB capture",
+            frame_sink=frame_sink,
         )
         _progress_message(
             "capture",
-            f"RGB acquisition finished: {len(frames)} frames at {actual_fps:.3f} FPS.",
+            f"RGB acquisition finished: {len(timestamps)} frames at {actual_fps:.3f} FPS.",
         )
         return frames, timestamps, actual_fps, timestamp_records, None, None
 
@@ -1026,6 +1067,7 @@ def _capture_rgb_and_optional_sensors(
             config,
             diagnostics=diagnostics,
             progress_label="RGB capture",
+            frame_sink=frame_sink,
         )
         thermal_result = None
         if thermal_enabled:
@@ -1094,7 +1136,7 @@ def _capture_rgb_and_optional_sensors(
             )
             progress.finish(realsense_artifacts.frames_captured)
 
-        counts = [f"{len(frames)} RGB"]
+        counts = [f"{len(timestamps)} RGB"]
         if thermal_result is not None:
             counts.append(f"{len(thermal_result['frames'])} thermal")
         if realsense_artifacts is not None:
@@ -1133,6 +1175,7 @@ def _capture_rgb_and_optional_sensors(
                 duration=duration,
                 start_monotonic=start_monotonic,
                 progress_label="RGB capture",
+                frame_sink=frame_sink,
             )
             rgb_result.update(
                 {
@@ -1257,7 +1300,7 @@ def _capture_rgb_and_optional_sensors(
 
     if errors:
         raise RuntimeError(" | ".join(errors))
-    counts = [f"{len(rgb_result['frames'])} RGB"]
+    counts = [f"{len(rgb_result['timestamps'])} RGB"]
     if thermal_enabled:
         counts.append(f"{len(thermal_result['frames'])} thermal")
     if realsense_enabled:
@@ -1463,7 +1506,7 @@ def _write_rgb_thermal_side_by_side_outputs(
     if frame_count <= 0:
         raise RuntimeError("No overlapping RGB/thermal frames were available for side-by-side output.")
 
-    first_rgb = _frame_to_bgr(rgb_frames[0], monochrome_output=monochrome_output)
+    first_rgb = _capture_frame_to_bgr(rgb_frames[0], monochrome_output=monochrome_output)
     rgb_height, rgb_width = int(first_rgb.shape[0]), int(first_rgb.shape[1])
     thermal_height, thermal_width = int(thermal_frames[0].shape[0]), int(thermal_frames[0].shape[1])
     scaled_thermal_width = max(1, int(round(float(rgb_height) * float(thermal_width) / float(max(1, thermal_height)))))
@@ -1492,7 +1535,7 @@ def _write_rgb_thermal_side_by_side_outputs(
     midpoint_idx = max(0, min(frame_count - 1, frame_count // 2))
     try:
         for pair_index, (rgb_idx, thermal_idx, rgb_time, thermal_time) in enumerate(matched_pairs):
-            rgb_bgr = _frame_to_bgr(rgb_frames[rgb_idx], monochrome_output=monochrome_output)
+            rgb_bgr = _capture_frame_to_bgr(rgb_frames[rgb_idx], monochrome_output=monochrome_output)
             thermal_raw = thermal_frames[thermal_idx]
             thermal_8 = (
                 ((thermal_raw.astype(np.float32) - float(global_min)) * (255.0 / float(range_value)))
@@ -1819,13 +1862,15 @@ def _capture_frames(
     *,
     diagnostics: Optional[dict[str, Any]] = None,
     progress_label: Optional[str] = None,
+    frame_sink: Optional[StreamingVideoWriter] = None,
 ) -> Tuple[List[Any], List[float], float, List[FrameTimestampRecord]]:
     if bool(config["runtime"].get("use_mock_camera", False)):
-        return _mock_capture_frames(config, progress_label=progress_label)
+        return _mock_capture_frames(config, progress_label=progress_label, frame_sink=frame_sink)
     return _capture_frames_picamera(
         config,
         diagnostics=diagnostics,
         progress_label=progress_label,
+        frame_sink=frame_sink,
     )
 
 
@@ -2128,6 +2173,7 @@ def _write_recording_video(
     recording_codec: str,
     mp4_codec: str,
     monochrome_output: bool = False,
+    mp4_preset: str = "auto",
 ) -> Path:
     actual_width = int(width)
     actual_height = int(height)
@@ -2174,34 +2220,16 @@ def _write_recording_video(
         height=actual_height,
         mp4_codec=mp4_codec,
         monochrome_output=monochrome_output,
+        mp4_preset=mp4_preset,
     )
 
 
 def _normalize_ffmpeg_mp4_codec(mp4_codec: str) -> str:
-    raw = str(mp4_codec or "").strip().lower()
-    aliases = {
-        "mp4v": "mpeg4",
-        "mpeg4": "mpeg4",
-        "h264": "libx264",
-        "x264": "libx264",
-        "libx264": "libx264",
-        "avc": "libx264",
-        "h265": "libx265",
-        "hevc": "libx265",
-        "x265": "libx265",
-        "libx265": "libx265",
-    }
-    return aliases.get(raw, raw or "mpeg4")
+    return normalize_mp4_codec(mp4_codec)
 
 
 def _find_ffmpeg_binary() -> Optional[str]:
-    resolved = shutil.which("ffmpeg")
-    if resolved:
-        return resolved
-    for candidate in ("/usr/bin/ffmpeg", "/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"):
-        if Path(candidate).exists():
-            return candidate
-    return None
+    return find_ffmpeg_binary()
 
 
 def _write_mp4_video_with_ffmpeg(
@@ -2212,6 +2240,7 @@ def _write_mp4_video_with_ffmpeg(
     height: int,
     mp4_codec: str,
     monochrome_output: bool = False,
+    mp4_preset: str = "auto",
 ) -> Path:
     ffmpeg_bin = _find_ffmpeg_binary()
     if not ffmpeg_bin:
@@ -2243,10 +2272,12 @@ def _write_mp4_video_with_ffmpeg(
         "-pix_fmt",
         "yuv420p",
     ]
+    # Frames are already in memory here, so "auto" keeps the slower, smaller "fast" preset.
+    preset = resolve_mp4_preset(mp4_preset, streaming=False)
     if ffmpeg_codec == "libx264":
-        cmd.extend(["-preset", "fast", "-crf", "18"])
+        cmd.extend(["-preset", preset, "-crf", "18"])
     elif ffmpeg_codec == "libx265":
-        cmd.extend(["-preset", "fast", "-crf", "20"])
+        cmd.extend(["-preset", preset, "-crf", "20"])
     elif ffmpeg_codec == "mpeg4":
         cmd.extend(["-q:v", "2"])
     cmd.extend(["-movflags", "+faststart", str(output)])
@@ -2315,6 +2346,66 @@ def _frame_to_bgr(frame: Any, monochrome_output: bool = False) -> Any:
         return bgr
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def _capture_frame_to_bgr(frame: Any, monochrome_output: bool = False) -> Any:
+    """BGR image for an RGB-camera frame.
+
+    Accepts a raw YUV420 capture frame (RAM mode) or a BGR frame that was read
+    back from the saved video (stream mode, see ``_VideoFrameSequence``).
+    """
+    if getattr(frame, "ndim", 2) == 3:
+        return frame
+    return _frame_to_bgr(frame, monochrome_output=monochrome_output)
+
+
+class _VideoFrameSequence:
+    """List-like, read-only view of a saved video's frames, decoded on demand.
+
+    Stream mode does not keep RGB frames in memory, so outputs that need them
+    after capture read them back from the recording one at a time. Access is
+    cheapest in increasing index order.
+    """
+
+    def __init__(self, video_path: Path, frame_count: int) -> None:
+        self.video_path = Path(video_path)
+        self._frame_count = max(0, int(frame_count))
+        self._capture: Any = None
+        self._next_index = 0
+
+    def __len__(self) -> int:
+        return self._frame_count
+
+    def __getitem__(self, index: int) -> Any:
+        import cv2
+
+        index = int(index)
+        if index < 0:
+            index += self._frame_count
+        if index < 0 or index >= self._frame_count:
+            raise IndexError(index)
+        if self._capture is None or index < self._next_index:
+            self.close()
+            self._capture = cv2.VideoCapture(str(self.video_path))
+            self._next_index = 0
+        frame = None
+        while self._next_index <= index:
+            ok, frame = self._capture.read()
+            if not ok or frame is None:
+                raise IndexError(
+                    f"{self.video_path.name} ended at frame {self._next_index}; frame {index} was requested."
+                )
+            self._next_index += 1
+        return frame
+
+    def close(self) -> None:
+        if self._capture is not None:
+            try:
+                self._capture.release()
+            except Exception:
+                pass
+        self._capture = None
+        self._next_index = 0
 
 
 def _video_file_is_readable(path: Path) -> bool:
@@ -2638,6 +2729,13 @@ def run_once(
     timestamps: List[float] = []
     timestamp_records: List[FrameTimestampRecord] = []
     actual_fps = 0.0
+    # Stream mode keeps no RGB frames in memory, so count frames by their
+    # timestamps rather than len(frames).
+    frame_count = 0
+    capture_frame_buffer = "ram"
+    stream_writer: Optional[StreamingVideoWriter] = None
+    streamed_video: Optional[StreamedVideo] = None
+    stream_encoder_stats: Optional[Dict[str, Any]] = None
     tracking_elapsed_seconds: Optional[float] = None
     tracking_frames_processed = 0
     tracking_processing_fps: Optional[float] = None
@@ -2663,6 +2761,30 @@ def run_once(
             "run",
             f"Session {session_name} started in {mode} mode.",
         )
+
+        if should_record and frame_buffer_mode(config) == FRAME_BUFFER_STREAM:
+            capture_frame_buffer = FRAME_BUFFER_STREAM
+            expected_frames = max(
+                1,
+                int(round(float(config["capture"]["recording_seconds"]) * float(config["camera"]["fps_target"]))),
+            )
+            stream_writer = StreamingVideoWriter(
+                output_dir=session_dir,
+                stem=session_name,
+                fps=float(config["camera"]["fps_target"]),
+                recording_codec=_normalize_recording_codec(config),
+                mp4_codec=str(config["camera"].get("mp4_codec", "libx264")),
+                mp4_preset=str(config["camera"].get("mp4_preset", "auto")),
+                monochrome_output=_camera_monochrome_output_enabled(config),
+                max_queue_bytes=stream_queue_bytes(config),
+                preview_frame_index=expected_frames // 2,
+            )
+            _progress_message(
+                "capture",
+                "Stream mode: frames are encoded to disk during capture "
+                f"({stream_writer.encoder}{' ' + stream_writer.preset if stream_writer.preset else ''}, "
+                f"up to {stream_writer.stats.queue_budget_mb:.0f} MB of frames waiting).",
+            )
 
         if should_record or should_track:
             optional_sensor_recording = (
@@ -2700,7 +2822,9 @@ def run_once(
                     start_monotonic_override=capture_start_monotonic,
                     ready_callback=capture_ready_callback,
                     capture_node_name=capture_node_name,
+                    frame_sink=stream_writer,
                 )
+                frame_count = len(timestamps)
                 if thermal_capture is not None:
                     thermal_artifacts = _write_thermal_recording_outputs(
                         session_dir=session_dir,
@@ -2713,10 +2837,10 @@ def run_once(
                         timestamp_records=list(thermal_capture.get("timestamp_records") or []),
                         node_name=capture_node_name,
                     )
-                    if thermal_artifacts.frames_captured != len(frames):
+                    if thermal_artifacts.frames_captured != frame_count:
                         warnings.append(
                             "RGB and thermal synchronized recording captured different frame counts "
-                            f"({len(frames)} RGB vs {thermal_artifacts.frames_captured} thermal). "
+                            f"({frame_count} RGB vs {thermal_artifacts.frames_captured} thermal). "
                             "Use the separate timestamp CSV files for alignment."
                         )
                     if abs(float(actual_fps) - float(thermal_artifacts.actual_fps)) > 0.25:
@@ -2733,10 +2857,12 @@ def run_once(
                     config,
                     diagnostics=capture_diagnostics,
                     progress_label="RGB capture",
+                    frame_sink=stream_writer,
                 )
+                frame_count = len(timestamps)
                 _progress_message(
                     "capture",
-                    f"RGB acquisition finished: {len(frames)} frames at {actual_fps:.3f} FPS.",
+                    f"RGB acquisition finished: {frame_count} frames at {actual_fps:.3f} FPS.",
                 )
                 if should_track and _thermal_enabled_for_recording(config) and not should_record:
                     warnings.append("thermal.enabled is set, but thermal capture runs only during recording modes.")
@@ -2756,29 +2882,53 @@ def run_once(
 
         if should_record:
             video_codec = _normalize_recording_codec(config)
-            _progress_message(
-                "output",
-                f"Encoding RGB recording as {video_codec.upper()}.",
-            )
-            video_path = _write_recording_video(
-                frames,
-                session_dir,
-                session_name,
-                fps=float(actual_fps if actual_fps > 0 else config["camera"]["fps_target"]),
-                width=int(config["camera"]["width"]),
-                height=int(config["camera"]["height"]),
-                recording_codec=video_codec,
-                mp4_codec=str(config["camera"].get("mp4_codec", "libx264")),
-                monochrome_output=_camera_monochrome_output_enabled(config),
-            )
+            if stream_writer is not None:
+                # The video was encoded during capture; wait for the encoder to
+                # finish and set the measured frame rate on the final file.
+                _progress_message(
+                    "output",
+                    f"Finishing streamed {video_codec.upper()} recording.",
+                )
+                streamed_video = stream_writer.finish(
+                    actual_fps=float(actual_fps if actual_fps > 0 else config["camera"]["fps_target"])
+                )
+                video_path = streamed_video.video_path
+                stream_encoder_stats = streamed_video.stats.to_dict()
+                warnings.extend(streamed_video.warnings)
+                if streamed_video.frame_count != frame_count:
+                    warnings.append(
+                        f"Stream recording wrote {streamed_video.frame_count} frames but "
+                        f"{frame_count} were captured."
+                    )
+            else:
+                _progress_message(
+                    "output",
+                    f"Encoding RGB recording as {video_codec.upper()}.",
+                )
+                video_path = _write_recording_video(
+                    frames,
+                    session_dir,
+                    session_name,
+                    fps=float(actual_fps if actual_fps > 0 else config["camera"]["fps_target"]),
+                    width=int(config["camera"]["width"]),
+                    height=int(config["camera"]["height"]),
+                    recording_codec=video_codec,
+                    mp4_codec=str(config["camera"].get("mp4_codec", "libx264")),
+                    monochrome_output=_camera_monochrome_output_enabled(config),
+                    mp4_preset=str(config["camera"].get("mp4_preset", "auto")),
+                )
             _progress_message("output", f"RGB recording complete: {video_path.name}.")
 
             if thermal_capture is not None:
+                # Stream mode has no RGB frames in memory: read them back from the recording.
+                side_by_side_rgb_frames: Any = (
+                    _VideoFrameSequence(video_path, frame_count) if stream_writer is not None else frames
+                )
                 try:
                     thermal_side_by_side_artifacts = _write_rgb_thermal_side_by_side_outputs(
                         session_dir=session_dir,
                         session_name=session_name,
-                        rgb_frames=frames,
+                        rgb_frames=side_by_side_rgb_frames,
                         rgb_timestamps=timestamps,
                         thermal_frames=list(thermal_capture["frames"]),
                         thermal_timestamps=list(thermal_capture["timestamps"]),
@@ -2787,10 +2937,17 @@ def run_once(
                     )
                 except Exception as exc:
                     warnings.append(f"RGB+thermal side-by-side preview write failed: {exc}")
+                finally:
+                    if isinstance(side_by_side_rgb_frames, _VideoFrameSequence):
+                        side_by_side_rgb_frames.close()
 
             _progress_message("output", "Writing RGB midpoint preview.")
+            if streamed_video is not None:
+                preview_frames = [streamed_video.preview_frame] if streamed_video.preview_frame is not None else []
+            else:
+                preview_frames = frames
             recording_preview_png_path = _write_midpoint_preview_png(
-                frames,
+                preview_frames,
                 session_dir,
                 session_name,
                 monochrome_output=_camera_monochrome_output_enabled(config),
@@ -2812,10 +2969,17 @@ def run_once(
             if not bool(config["pipeline"].get("defer_tracking_until_after_recording", True)):
                 warnings.append("Non-deferred tracking is not implemented yet; using deferred tracking.")
 
+            if stream_writer is not None and source != "video":
+                _progress_message(
+                    "tracking",
+                    "Stream mode keeps no frames in memory, so tracking reads the saved video.",
+                )
+                source = "video"
+
             tracking_started = time.perf_counter()
             _progress_message(
                 "tracking",
-                f"Starting tag tracking from {source.upper()} input for {len(frames)} captured frames.",
+                f"Starting tag tracking from {source.upper()} input for {frame_count} captured frames.",
             )
             if source == "video":
                 if video_path is None:
@@ -2826,7 +2990,7 @@ def run_once(
             else:
                 df, df2 = _track_from_ram(config, session_name, session_dir, frames)
             tracking_elapsed_seconds = time.perf_counter() - tracking_started
-            tracking_frames_processed = len(frames)
+            tracking_frames_processed = frame_count
             if tracking_elapsed_seconds > 0 and tracking_frames_processed > 0:
                 tracking_processing_fps = tracking_frames_processed / tracking_elapsed_seconds
             _progress_message(
@@ -2912,7 +3076,16 @@ def run_once(
     except Exception as exc:
         errors.append(str(exc))
         _progress_message("error", str(exc))
+        if stream_writer is not None and streamed_video is None:
+            # Capture or encoding failed part-way. Let the encoder close its
+            # file cleanly so whatever was recorded so far stays readable.
+            stream_writer.abort()
+            partial = stream_writer.capture_path
+            if partial.exists() and partial.stat().st_size > 0:
+                warnings.append(f"A partial stream recording was kept: {partial.name}")
     finally:
+        if stream_writer is not None:
+            stream_writer.abort()
         if thermal_capture is not None and "frames" in thermal_capture:
             try:
                 del thermal_capture["frames"]
@@ -2972,7 +3145,7 @@ def run_once(
         ),
         camera_autofocus_preflight_notes=autofocus_notes,
         resolved_tuning_file=resolved_tuning_file,
-        frames_captured=len(frames),
+        frames_captured=frame_count,
         actual_fps=round(actual_fps, 6),
         tracking_elapsed_seconds=round(tracking_elapsed_seconds, 6) if tracking_elapsed_seconds is not None else None,
         tracking_frames_processed=tracking_frames_processed,
@@ -2981,6 +3154,8 @@ def run_once(
         ),
         video_codec=video_codec,
         video_path=str(video_path) if video_path else None,
+        capture_frame_buffer=capture_frame_buffer,
+        stream_encoder_stats=stream_encoder_stats,
         recording_preview_png_path=str(recording_preview_png_path) if recording_preview_png_path else None,
         timestamp_path=str(timestamp_path) if timestamp_path else None,
         thermal_enabled=bool(_thermal_enabled_for_recording(config)),
@@ -3097,6 +3272,20 @@ def run_once(
     return summary
 
 
+def _format_stream_encoder_stats(stats: Optional[Dict[str, Any]]) -> str:
+    if not stats:
+        return "n/a"
+    encoder = str(stats.get("encoder", "?"))
+    if stats.get("preset"):
+        encoder += f" {stats['preset']}"
+    return (
+        f"{encoder}; most frames waiting {stats.get('peak_queue_frames', 0)} "
+        f"({float(stats.get('peak_queue_mb', 0.0)):.0f} of {float(stats.get('queue_budget_mb', 0.0)):.0f} MB); "
+        f"capture waited {float(stats.get('capture_stall_seconds', 0.0)):.2f}s in "
+        f"{stats.get('capture_stall_count', 0)} stall(s)"
+    )
+
+
 def format_run_summary(summary: RunSummary) -> str:
     lines = [
         f"Run mode: {summary.mode}",
@@ -3142,6 +3331,8 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Tracking frames processed: {summary.tracking_frames_processed}",
         f"Tracking processing FPS: {summary.tracking_processing_fps if summary.tracking_processing_fps is not None else 'n/a'}",
         f"Recording codec: {summary.video_codec or 'n/a'}",
+        f"Frame buffer: {summary.capture_frame_buffer}",
+        f"Stream encoder: {_format_stream_encoder_stats(summary.stream_encoder_stats)}",
         f"Video: {summary.video_path or 'none'}",
         f"Midpoint PNG: {summary.recording_preview_png_path or 'none'}",
         f"Timestamps: {summary.timestamp_path or 'none'}",

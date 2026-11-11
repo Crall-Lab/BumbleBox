@@ -23,6 +23,7 @@ from .camera_controls import (
     normalize_autofocus_speed,
 )
 from .hardware_profiles import hardware_profile_choices, normalize_hardware_profile
+from .stream_writer import VALID_FRAME_BUFFERS, VALID_MP4_PRESETS
 
 try:
     import yaml
@@ -384,6 +385,11 @@ def validate_config(config: Dict[str, Any]) -> None:
     mp4_codec = str(config["camera"].get("mp4_codec", "libx264")).strip()
     if not mp4_codec:
         raise ConfigError("camera.mp4_codec must be a non-empty string")
+    mp4_preset = str(config["camera"].get("mp4_preset", "auto")).strip().lower()
+    if mp4_preset not in VALID_MP4_PRESETS:
+        raise ConfigError(
+            f"camera.mp4_preset must be one of {sorted(VALID_MP4_PRESETS)}, got: {mp4_preset}"
+        )
 
     autofocus_mode = normalize_autofocus_mode(config["camera"].get("autofocus_mode", "default"))
     if autofocus_mode not in VALID_AUTOFOCUS_MODES:
@@ -686,6 +692,17 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ConfigError("capture.record_interval_minutes must be > 0")
     if track_interval <= 0:
         raise ConfigError("capture.track_interval_minutes must be > 0")
+
+    frame_buffer = str(config["capture"].get("frame_buffer", "ram")).strip().lower()
+    if frame_buffer not in VALID_FRAME_BUFFERS:
+        raise ConfigError(
+            f"capture.frame_buffer must be one of {sorted(VALID_FRAME_BUFFERS)}, got: {frame_buffer}"
+        )
+    stream_queue_mb = config["capture"].get("stream_queue_mb", 512)
+    if isinstance(stream_queue_mb, bool) or not isinstance(stream_queue_mb, (int, float)) or stream_queue_mb <= 0:
+        raise ConfigError(
+            f"capture.stream_queue_mb must be a number greater than 0, got: {stream_queue_mb!r}"
+        )
 
     digital_zoom = config["camera"].get("digital_zoom")
     if digital_zoom is not None:

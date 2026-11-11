@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .camera_profiles import get_camera_model_info
+from .stream_writer import FRAME_BUFFER_STREAM, frame_buffer_mode, stream_queue_bytes
 
 try:
     import cv2
@@ -168,6 +169,26 @@ def run_schedule_check(
     if bool(pipeline.get("parallel_tracking", False)):
         overhead_factor += 0.25
     estimated_capture_ram = frame_count * frame_bytes * overhead_factor
+    streaming = frame_buffer_mode(config) == FRAME_BUFFER_STREAM and str(pipeline.get("mode", "")).strip().lower() != "track_only"
+    if streaming:
+        # Stream mode encodes to disk during capture. At most the queue budget
+        # (plus the frame being written and the one being captured) is held in
+        # memory, however long the recording is.
+        estimated_capture_ram = min(
+            estimated_capture_ram,
+            float(stream_queue_bytes(config)) + 2.0 * frame_bytes,
+        )
+        items.append(
+            ScheduleCheckItem(
+                "Frame buffer",
+                "PASS",
+                (
+                    "capture.frame_buffer=stream: frames are encoded to disk during capture, so memory "
+                    "use does not grow with recording length. Run `bbx encode-benchmark` to confirm "
+                    "the encoder keeps up with camera.fps_target."
+                ),
+            )
+        )
     total_ram, ram_source = _resolve_total_ram_bytes(config, assume_ram_gb=assume_ram_gb)
     memory_ratio = (estimated_capture_ram / total_ram) if total_ram and total_ram > 0 else None
 
@@ -452,7 +473,11 @@ def run_schedule_check(
                 f"Reduce camera.fps_target to around {recommended_fps:.2f} or lower to reduce RAM pressure."
             )
         suggestions.append("Consider reducing resolution or recording_seconds for RAM-limited Pi models.")
-        suggestions.append("Consider tracking_source=video to lower RAM pressure during recording.")
+        if not streaming:
+            suggestions.append(
+                "Set capture.frame_buffer to 'stream' to encode to disk during capture, so memory use "
+                "no longer grows with recording length (run `bbx encode-benchmark` first)."
+            )
 
     if mode in {"record_and_track", "mixed_schedule", "track_only"}:
         min_track_interval_sec = tracking_seconds_per_recording * 1.15

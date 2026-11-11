@@ -44,6 +44,12 @@ camera:
   autofocus_preflight_timeout_seconds: 8.0
   autofocus_preflight_stable_frames: 3
   mp4_codec: "libx264"
+  # Encoder speed for libx264/libx265: ultrafast, superfast, veryfast, faster,
+  # fast, medium, or slow. Faster presets encode more frames per second but
+  # make larger files. "auto" uses "fast" for RAM recordings and "ultrafast"
+  # for stream recordings. Run `bbx encode-benchmark` to see which presets keep
+  # up with the camera on this machine.
+  mp4_preset: "auto"
 
 thermal:
   enabled: false
@@ -107,6 +113,17 @@ capture:
   track_interval_minutes: 5
   composite_images_per_day: 1
   composite_image_sample_count: 60
+  # Where frames go while a recording is being captured.
+  #   ram:    keep every frame in memory and encode the video after capture
+  #           ends. Fastest capture, but recording length is limited by RAM.
+  #   stream: encode to disk while capturing. Memory use stays small, so
+  #           recording length is limited only by disk space. Tracking then
+  #           reads the saved video instead of frames in memory.
+  frame_buffer: "ram"
+  # Stream mode only: the most memory (MB) that frames waiting for the encoder
+  # may occupy. If the encoder falls further behind than this, capture waits
+  # for it and the run summary reports the stall.
+  stream_queue_mb: 512
 
 tracking:
   tag_dictionary: "4X4_50"

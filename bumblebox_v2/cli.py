@@ -58,6 +58,12 @@ from .distributed_capture import (
     run_distributed_capture,
     setup_distributed_worker,
 )
+from .encode_benchmark import (
+    DEFAULT_BENCHMARK_FRAMES,
+    DEFAULT_ENCODERS,
+    format_encode_benchmark,
+    run_encode_benchmark,
+)
 from .fps_report import build_fps_report, format_report as format_fps_report, write_report_json
 from .fps_sweep import (
     format_fps_sweep_report,
@@ -121,6 +127,11 @@ from .run_bundle import (
 )
 from .run_engine import format_run_summary, reset_camera_runtime, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
+from .tracking_compression_check import (
+    DEFAULT_CHECK_SECONDS,
+    format_tracking_compression_check,
+    run_tracking_compression_check,
+)
 from .storage_manager import (
     build_storage_mount_sudo_command,
     build_storage_setup_sudo_command,
@@ -915,6 +926,93 @@ def _cmd_fps_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_encode_benchmark(args: argparse.Namespace) -> int:
+    try:
+        config = _load_or_defaults(Path(args.config))
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    encoders = [item.strip() for item in str(args.encoders or "").split(",") if item.strip()] or None
+    monochrome: Optional[bool] = None
+    if args.monochrome:
+        monochrome = True
+    elif args.color:
+        monochrome = False
+    print(
+        f"Encoding {args.frames} test frames with each encoder; this can take a few minutes "
+        "at full resolution on a Raspberry Pi.",
+        flush=True,
+    )
+    try:
+        report = run_encode_benchmark(
+            config,
+            frames=int(args.frames),
+            width=args.width,
+            height=args.height,
+            fps_target=args.fps,
+            encoders=encoders,
+            source_video=args.source_video,
+            monochrome_output=monochrome,
+            work_dir=args.work_dir,
+        )
+    except Exception as exc:
+        print(f"Encode benchmark failed: {exc}")
+        return 1
+
+    print(format_encode_benchmark(report))
+    if args.json_out:
+        out_path = Path(args.json_out).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report.to_dict(), indent=2))
+        print(f"\nJSON report saved: {out_path}")
+    return 0
+
+
+def _cmd_tracking_compression_check(args: argparse.Namespace) -> int:
+    try:
+        config = _load_or_defaults(Path(args.config))
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+
+    if args.mock_camera:
+        config.setdefault("runtime", {})
+        config["runtime"]["use_mock_camera"] = True
+    if not _apply_camera_profile_override(
+        config,
+        requested_profile=getattr(args, "camera_profile", None),
+        context_label="tracking-compression-check",
+    ):
+        return 1
+    if not _check_camera_ir_compatibility_for_cli(config):
+        return 1
+
+    encoders = [item.strip() for item in str(args.encoders or "").split(",") if item.strip()] or None
+    print(
+        "Tracking the same frames several ways; at full resolution on a Raspberry Pi this can "
+        "take several minutes.",
+        flush=True,
+    )
+    try:
+        report = run_tracking_compression_check(
+            config,
+            seconds=float(args.seconds),
+            encoders=encoders,
+            include_lossless=not bool(args.no_lossless),
+            keep_videos=bool(args.keep_videos),
+            output_dir=args.output_dir,
+            status=lambda message: print(f"[check] {message}", flush=True),
+        )
+    except Exception as exc:
+        print(f"Tracking compression check failed: {exc}")
+        return 1
+
+    print()
+    print(format_tracking_compression_check(report))
+    return 0
+
+
 def _cmd_fps_sweep(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     try:
@@ -1288,6 +1386,12 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
     if args.codec:
         config.setdefault("camera", {})
         config["camera"]["codec"] = str(args.codec).strip().lower()
+    if getattr(args, "frame_buffer", None):
+        config.setdefault("capture", {})
+        config["capture"]["frame_buffer"] = str(args.frame_buffer).strip().lower()
+    if getattr(args, "mp4_preset", None):
+        config.setdefault("camera", {})
+        config["camera"]["mp4_preset"] = str(args.mp4_preset).strip().lower()
     if not _apply_infrared_override(
         config,
         requested_infrared=getattr(args, "infrared", None),
@@ -4285,6 +4389,114 @@ def build_parser() -> argparse.ArgumentParser:
     fps_parser.add_argument("--json-out", help="Optional path to save JSON report.")
     fps_parser.set_defaults(func=_cmd_fps_report)
 
+    encode_benchmark_parser = subparsers.add_parser(
+        "encode-benchmark",
+        help=(
+            "Measure how fast this machine encodes video, to choose an encoder for stream "
+            "recording (capture.frame_buffer: stream). No camera is needed."
+        ),
+    )
+    _add_common_config_arg(encode_benchmark_parser)
+    encode_benchmark_parser.add_argument(
+        "--frames",
+        type=int,
+        default=DEFAULT_BENCHMARK_FRAMES,
+        help=(
+            f"Test frames per encoder (default {DEFAULT_BENCHMARK_FRAMES}). All test frames are held "
+            "in memory, about 18.5 MB each at 4056x3040."
+        ),
+    )
+    encode_benchmark_parser.add_argument("--width", type=int, help="Frame width (default camera.width).")
+    encode_benchmark_parser.add_argument("--height", type=int, help="Frame height (default camera.height).")
+    encode_benchmark_parser.add_argument(
+        "--fps",
+        type=float,
+        help="Camera frame rate the encoder must keep up with (default camera.fps_target).",
+    )
+    encode_benchmark_parser.add_argument(
+        "--encoders",
+        default=",".join(DEFAULT_ENCODERS),
+        help=(
+            "Comma-separated encoders to test: 'mjpeg', or '<mp4 codec>:<preset>' such as "
+            f"'libx264:veryfast' (default {','.join(DEFAULT_ENCODERS)})."
+        ),
+    )
+    encode_benchmark_parser.add_argument(
+        "--source-video",
+        help=(
+            "Use the first frames of one of your own recordings instead of synthetic frames. "
+            "Its frame size is used as-is."
+        ),
+    )
+    encode_benchmark_color_group = encode_benchmark_parser.add_mutually_exclusive_group()
+    encode_benchmark_color_group.add_argument(
+        "--monochrome",
+        action="store_true",
+        help="Encode grayscale output (default follows camera.monochrome_output).",
+    )
+    encode_benchmark_color_group.add_argument(
+        "--color",
+        action="store_true",
+        help="Encode colour output (default follows camera.monochrome_output).",
+    )
+    encode_benchmark_parser.add_argument(
+        "--work-dir",
+        help="Folder to write test output in (default system.data_root, so disk speed is included).",
+    )
+    encode_benchmark_parser.add_argument("--json-out", help="Optional path to save JSON report.")
+    encode_benchmark_parser.set_defaults(func=_cmd_encode_benchmark)
+
+    compression_check_parser = subparsers.add_parser(
+        "tracking-compression-check",
+        help=(
+            "Capture a short burst, then track the same frames raw and after encoding with each "
+            "encoder, to see whether stream recording changes what the tag tracker finds."
+        ),
+    )
+    _add_common_config_arg(compression_check_parser)
+    compression_check_parser.add_argument(
+        "--seconds",
+        type=float,
+        default=DEFAULT_CHECK_SECONDS,
+        help=(
+            f"Length of the burst to capture (default {DEFAULT_CHECK_SECONDS:g}). Every frame is held "
+            "in memory, about 18.5 MB each at 4056x3040."
+        ),
+    )
+    compression_check_parser.add_argument(
+        "--encoders",
+        default=",".join(DEFAULT_ENCODERS),
+        help=(
+            "Comma-separated encoders to compare: 'mjpeg', or '<mp4 codec>:<preset>' such as "
+            f"'libx264:veryfast' (default {','.join(DEFAULT_ENCODERS)})."
+        ),
+    )
+    compression_check_parser.add_argument(
+        "--no-lossless",
+        action="store_true",
+        help="Skip the lossless reference video.",
+    )
+    compression_check_parser.add_argument(
+        "--keep-videos",
+        action="store_true",
+        help="Keep the encoded test videos in the output folder for inspection.",
+    )
+    compression_check_parser.add_argument(
+        "--output-dir",
+        help="Folder for the tracking CSVs and JSON report (default: a new folder under system.data_root).",
+    )
+    compression_check_parser.add_argument(
+        "--mock-camera",
+        action="store_true",
+        help="Use simulated frames instead of opening the camera. The simulated scene has no tags.",
+    )
+    compression_check_parser.add_argument(
+        "--camera-profile",
+        choices=camera_profile_choices(),
+        help="Apply a named camera profile for this check only.",
+    )
+    compression_check_parser.set_defaults(func=_cmd_tracking_compression_check)
+
     fps_sweep_parser = subparsers.add_parser(
         "fps-sweep",
         help=(
@@ -4428,6 +4640,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--codec",
         choices=["mp4", "mjpeg"],
         help="Optional one-run recording codec override (default from camera.codec in config).",
+    )
+    run_once_parser.add_argument(
+        "--frame-buffer",
+        choices=["ram", "stream"],
+        help=(
+            "Optional one-run override of capture.frame_buffer: 'ram' holds the recording in memory and "
+            "encodes it afterwards; 'stream' encodes to disk during capture."
+        ),
+    )
+    run_once_parser.add_argument(
+        "--mp4-preset",
+        choices=["auto", "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"],
+        help="Optional one-run override of camera.mp4_preset (encoder speed for libx264/libx265).",
     )
     run_once_parser.add_argument(
         "--camera-profile",
