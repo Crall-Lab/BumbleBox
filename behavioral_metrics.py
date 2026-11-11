@@ -3,11 +3,13 @@
 import pandas as pd
 import numpy as np
 #import logging
-import setup
+# Note: the legacy `setup` settings module is imported only inside the legacy
+# entry points below (calculate_behavior_metrics and the __main__ block). It
+# lives in legacy/ and is not importable from BumbleBox V2, which calls the
+# individual metric functions directly with values from its own config.
 from datetime import datetime as dt
 from datetime import date
 import os
-from scipy import spatial
 import glob
 from data_cleaning import interpolate
 import subprocess
@@ -80,11 +82,13 @@ def compute_social_center_distance(df: pd.DataFrame, todays_folder_path: str, fi
 def pairwise_distance(df: pd.DataFrame, todays_folder_path: str, filename: str) -> pd.DataFrame:
 
     video_pd_df = 'None'
-    for frame_num, frame_df in df.groupby(['frame']): #now for the subdataframe of each frame of a video of a colony, reset the index so its not a multiindex
+    for frame_num, frame_df in df.groupby('frame'): #now for the subdataframe of each frame of a video of a colony, reset the index so its not a multiindex
+        #group by the column name, not a one-item list: with a list, newer pandas hands back frame_num as a tuple and int(frame_num) below fails
 
-        xy_array = frame_df[['centroidX','centroidY']].to_numpy() #make these two columns into an array of [x,y] for numpy to use
-        dist_matrix = spatial.distance.pdist(xy_array)
-        squareform = spatial.distance.squareform(dist_matrix) #turns the pairwise distance vector into a 2d array (which has double values but allows us to do row based operations)
+        xy_array = frame_df[['centroidX','centroidY']].to_numpy(dtype=float) #make these two columns into an array of [x,y] for numpy to use
+        #square matrix of the distance from every bee to every other bee in this frame (plain numpy, so scipy is not required)
+        offsets = xy_array[:, None, :] - xy_array[None, :, :]
+        squareform = np.sqrt((offsets ** 2).sum(axis=-1)) #2d array (which has double values but allows us to do row based operations)
         squareform[ squareform == 0 ] = np.nan
         pairwise_distance_df = pd.DataFrame(squareform, columns=frame_df['ID']) #make the squareform array into a dataframe, with the bee IDs as the columns
         bee_id_column = frame_df.loc[:,'ID'].reset_index(drop=True) #make a new bee ID column to add to the dataframe
@@ -302,7 +306,9 @@ def create_todays_folder(dirpath):
         
 
 def calculate_behavior_metrics(df, actual_frames_per_second, moving_threshold, todays_folder_path, filename): #accept a path to a file or a path to a dataframe
-    
+
+    import setup #legacy settings module (legacy/setup.py); only this legacy entry point needs it
+
     print("starting calculations")
     #not finished!
     if type(df) == str: #path to csv file
@@ -375,7 +381,9 @@ def calculate_behavior_metrics(df, actual_frames_per_second, moving_threshold, t
 
 
 if __name__ == '__main__':
-    
+
+    import setup #legacy settings module (legacy/setup.py)
+
     print(f"Run this script to calculate behavioral metrics on a set of data! Im looking for data in:\n\n{todays_folder_path}\n\nThis is todays data folder.\nDo you want to use a different folder?")   
     print("\n")
     yes_or_no = input("Enter yes or no: ")

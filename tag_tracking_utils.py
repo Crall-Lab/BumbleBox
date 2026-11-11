@@ -211,7 +211,7 @@ def trackTagsFromRAM(filename, todays_folder_path, frames_list, tag_dictionary, 
     return df, df2, frame_num
 
 
-import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
 
 def _process_frame_chunk(args):
     """Worker function for processing a chunk of frames."""
@@ -291,18 +291,33 @@ def trackTagsFromRAM_parallel(filename, todays_folder_path, frames_list, tag_dic
                 print(f"Warning: Unrecognized aruco parameter '{param_name}'")
 
     total_frames = len(frames_list)
-    n_chunks = n_chunks or mp.cpu_count()
-    chunk_size = (total_frames + n_chunks - 1) // n_chunks
+    n_chunks = max(1, int(n_chunks or os.cpu_count() or 1))
+    chunk_size = max(1, (total_frames + n_chunks - 1) // n_chunks)
 
     chunks = [
         (frames_list[i:i + chunk_size], i, filename, colony_number, now, tag_dict, parameters)
         for i in range(0, total_frames, chunk_size)
     ]
 
-    print(f"Starting multiprocessing ArUco tracking with {len(chunks)} chunks...")
+    print(f"Starting parallel ArUco tracking with {len(chunks)} chunks...")
 
-    with mp.Pool(processes=len(chunks)) as pool:
-        results = pool.map(_process_frame_chunk, chunks)
+    # Threads, not processes. OpenCV releases the GIL while it works, so the
+    # chunks still run on separate cores, and unlike a process pool nothing
+    # has to be pickled: cv2.aruco objects cannot be pickled at all, and
+    # pickling would also copy every full-resolution frame into the workers.
+    results = []
+    if chunks:
+        # One frame per core is faster than letting each detectMarkers call
+        # spread itself over every core, so turn OpenCV's own threading off
+        # while the pool runs and put it back afterwards.
+        previous_cv_threads = cv2.getNumThreads()
+        if len(chunks) > 1:
+            cv2.setNumThreads(1)
+        try:
+            with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+                results = list(pool.map(_process_frame_chunk, chunks))
+        finally:
+            cv2.setNumThreads(previous_cv_threads)
 
     # Flatten results
     all_raw = [row for chunk_raw, _ in results for row in chunk_raw]
@@ -314,5 +329,5 @@ def trackTagsFromRAM_parallel(filename, todays_folder_path, frames_list, tag_dic
     df.to_csv(f"{todays_folder_path}/{filename}_raw.csv", index=False)
     df2.to_csv(f"{todays_folder_path}/{filename}_noID.csv", index=False)
 
-    print(f"Multiprocessing tag tracking finished — {len(df)} tags, {len(df2)} no-ID detections")
+    print(f"Parallel tag tracking finished — {len(df)} tags, {len(df2)} no-ID detections")
     return df, df2, total_frames
