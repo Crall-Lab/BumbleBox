@@ -41,7 +41,41 @@ def _preferred_exec_launcher() -> Path:
     return Path(sys.executable).resolve()
 
 
-def _service_text(description: str, working_dir: Path, exec_start: str, service_user: str | None) -> str:
+MIN_RUN_TIMEOUT_SECONDS = 30 * 60
+RUN_TIMEOUT_AUTO = "auto"
+
+
+def run_timeout_seconds(config: Dict[str, Any], interval_minutes: int, *, pipeline_job: bool = True) -> int:
+    """How long a scheduled run may take before systemd stops it.
+
+    A oneshot service has no start timeout by default, so a run that hangs (a
+    stalled camera, a stuck encoder) would stay "activating" forever and block
+    every later run of the same unit. "auto" allows the recording time plus
+    the larger of 30 minutes and two schedule intervals, which is generous for
+    encoding and tracking but still lets recording resume after a hang.
+    """
+    scheduling = config.get("scheduling", {}) if isinstance(config.get("scheduling"), dict) else {}
+    configured = scheduling.get("run_timeout_minutes", RUN_TIMEOUT_AUTO)
+    if pipeline_job and not isinstance(configured, bool) and isinstance(configured, (int, float)) and configured > 0:
+        return max(60, int(round(float(configured) * 60.0)))
+
+    allowance = max(MIN_RUN_TIMEOUT_SECONDS, 2 * max(1, int(interval_minutes)) * 60)
+    recording_seconds = 0.0
+    if pipeline_job:
+        try:
+            recording_seconds = float(config.get("capture", {}).get("recording_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            recording_seconds = 0.0
+    return int(round(max(0.0, recording_seconds))) + allowance
+
+
+def _service_text(
+    description: str,
+    working_dir: Path,
+    exec_start: str,
+    service_user: str | None,
+    timeout_seconds: int | None = None,
+) -> str:
     lines = [
         "[Unit]",
         f"Description={description}",
@@ -53,6 +87,9 @@ def _service_text(description: str, working_dir: Path, exec_start: str, service_
         f"WorkingDirectory={working_dir}",
         "Environment=PYTHONUNBUFFERED=1",
     ]
+    if timeout_seconds:
+        # Stop a hung run so the next scheduled one can start (see run_timeout_seconds).
+        lines.append(f"TimeoutStartSec={int(timeout_seconds)}")
     if service_user:
         lines.append(f"User={service_user}")
     lines.extend(
@@ -106,7 +143,13 @@ def _timer_text(description: str, service_name: str, interval_minutes: int) -> s
     lines.extend(
         [
             "AccuracySec=1s",
-            "Persistent=true",
+            # No catch-up after downtime. With Persistent=true systemd starts
+            # the job immediately at boot if any slot was missed while the Pi
+            # was off. A missed recording cannot be recovered, and that extra
+            # run would be off the clock-aligned schedule and would start
+            # while the system is still booting. The timer simply resumes at
+            # its next slot.
+            "Persistent=false",
             f"Unit={service_name}",
             "",
             "[Install]",
@@ -460,6 +503,7 @@ def write_systemd_units(config: Dict[str, Any], config_path: str | Path, output_
             working_dir=_repo_root(),
             exec_start=exec_start,
             service_user=service_user,
+            timeout_seconds=run_timeout_seconds(config, interval, pipeline_job=command_args is None),
         )
         timer_content = _timer_text(
             description=f"BumbleBox V2 {label} schedule",

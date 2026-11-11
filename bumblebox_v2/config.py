@@ -23,6 +23,7 @@ from .camera_controls import (
     normalize_autofocus_speed,
 )
 from .hardware_profiles import hardware_profile_choices, normalize_hardware_profile
+from .storage_guard import normalize_require_mounted_storage
 from .stream_writer import VALID_FRAME_BUFFERS, VALID_MP4_PRESETS
 
 try:
@@ -63,6 +64,11 @@ SERVICE_USER_AUTO_SENTINELS = {"", "auto", "current", "default", "pi", "root"}
 
 class ConfigError(ValueError):
     """Raised when the BumbleBox config is malformed."""
+
+
+def _is_number(value: Any) -> bool:
+    """True for an int or float, but not for a bool (which Python also treats as an int)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _require_yaml() -> None:
@@ -677,6 +683,30 @@ def validate_config(config: Dict[str, Any]) -> None:
             raise ConfigError("system.ram_gb_override must be numeric when set") from exc
         if ram_gb <= 0:
             raise ConfigError("system.ram_gb_override must be > 0 when set")
+
+    require_mounted = normalize_require_mounted_storage(config["system"].get("require_mounted_storage", "auto"))
+    if require_mounted not in (True, False, "auto"):
+        raise ConfigError(
+            f"system.require_mounted_storage must be auto, true or false, got: {require_mounted!r}"
+        )
+    min_free_space_gb = config["system"].get("min_free_space_gb", 1.0)
+    if not _is_number(min_free_space_gb) or min_free_space_gb < 0:
+        raise ConfigError(
+            f"system.min_free_space_gb must be a number of 0 or more, got: {min_free_space_gb!r}"
+        )
+    capture_lock_wait = config["runtime"].get("capture_lock_wait_seconds", 60)
+    if not _is_number(capture_lock_wait) or capture_lock_wait < 0:
+        raise ConfigError(
+            f"runtime.capture_lock_wait_seconds must be a number of 0 or more, got: {capture_lock_wait!r}"
+        )
+    run_timeout = config["scheduling"].get("run_timeout_minutes", "auto")
+    if not (
+        (isinstance(run_timeout, str) and run_timeout.strip().lower() == "auto")
+        or (_is_number(run_timeout) and run_timeout > 0)
+    ):
+        raise ConfigError(
+            f"scheduling.run_timeout_minutes must be 'auto' or a number greater than 0, got: {run_timeout!r}"
+        )
 
     fps_target = config["camera"].get("fps_target", 0)
     if fps_target <= 0:

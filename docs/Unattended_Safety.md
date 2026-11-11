@@ -1,0 +1,126 @@
+# Protections for Unattended Recording
+
+Three checks keep a box that is recording on its own from losing data quietly.
+Each one fails loudly: the run exits with an error that shows up in the journal
+and in `bbx systemd-status`.
+
+## 1. Recording is refused when the data drive is missing
+
+If the external drive is not mounted, its mount point is still an ordinary
+folder on the SD card. Recording into it fills the system disk while everything
+looks normal. Before a run writes anything, it now checks where the data will
+go and stops if the drive is not there:
+
+```text
+Run failed to start: The data drive is not mounted: /etc/fstab lists a drive for
+/mnt/bumblebox/data, but nothing is mounted there. Recording was refused so that
+data is not written to the system disk under /mnt/bumblebox/data. ...
+```
+
+The rule is set by `system.require_mounted_storage`:
+
+| Value | A mounted drive is required when |
+|---|---|
+| `auto` (default) | `/etc/fstab` lists a drive for `data_root` or a folder above it, or `data_root` is under `/mnt` or `/media` |
+| `true` | always; `data_root` may never be on the system disk |
+| `false` | never; recording to the system disk is allowed |
+
+`bbx storage setup` writes the `/etc/fstab` entry, so a box set up that way is
+protected without further changes.
+
+A run is also refused when less than `system.min_free_space_gb` (default 1 GB)
+is free. Set it to `0` to turn that off.
+
+To see what a run would decide right now:
+
+```bash
+bbx storage status
+```
+
+The last line reads `Recording allowed: yes (...)` or `Recording allowed: NO`
+with the reason. The storage alert in the GUI uses the same check, so it now
+reports a failure when the drive is missing.
+
+If you record to the SD card on purpose with `data_root` under `/mnt` or
+`/media`, set `system.require_mounted_storage: false`.
+
+## 2. Only one run uses the camera at a time
+
+Scheduled runs can coincide. In `mixed_schedule` mode, for example, the record
+and track timers both fire on the hour. A run now takes a machine-wide lock
+while it is capturing. A second run waits up to
+`runtime.capture_lock_wait_seconds` (default 60) for the first to finish
+capturing, then starts. If the wait runs out, the second run stops with:
+
+```text
+Another BumbleBox capture is using the camera (pid 4312, since 2026-11-11T14:00:00)
+and did not finish within 60s, so this run was skipped.
+```
+
+The lock covers capture only. A later run can start capturing while an earlier
+one is still encoding or tracking, as before. The lock is released
+automatically if the process holding it exits or is killed, so it cannot be
+left behind.
+
+Runs that start in the same second also get separate session folders now. The
+later one gets a numbered suffix, for example `<host>_2026-11-11_14_00_00_2`.
+Before, they shared one folder and overwrote each other's files.
+
+If runs are skipped regularly, the schedule is too tight for the recording
+length; `bbx schedule-check` shows why.
+
+## 3. A hung run is stopped
+
+A scheduled run that hangs (a stalled camera, a stuck encoder) used to stay
+running forever, and no later run of the same timer could start. The generated
+systemd services now carry a time limit:
+
+```ini
+TimeoutStartSec=3620
+```
+
+`scheduling.run_timeout_minutes` sets it. The default, `auto`, allows the
+recording time plus the larger of 30 minutes and two schedule intervals. A
+20-second recording every 30 minutes gets 60 minutes and 20 seconds.
+
+When the limit is reached, systemd stops the run and marks it failed. The next
+scheduled run starts normally. In stream mode the video recorded so far is
+kept; tracking that was still in progress is lost and can be redone with
+`bbx track-videos`.
+
+Set a number of minutes if your runs legitimately take longer than the `auto`
+allowance, for example long recordings followed by slow tracking.
+
+**The limit is written into the service files.** After upgrading, or after
+changing the setting, write and install the timers again:
+
+```bash
+bbx systemd-write
+bbx systemd-install
+```
+
+Starting automated recording from the GUI does both.
+
+## 4. No catch-up run after downtime
+
+The generated timers used to be marked `Persistent=true`. With that setting,
+if any slot was missed while the Pi was off, systemd started the job once,
+immediately at boot (one run per timer, however long the Pi was off). A missed
+recording cannot be recovered, so that run only added an off-schedule
+recording while the system was still starting up.
+
+The timers now use `Persistent=false`. After a reboot each timer waits for its
+next clock-aligned slot and carries on. Slots missed while the Pi was off are
+skipped.
+
+Like the time limit, this is written into the unit files, so it reaches an
+existing box only after `bbx systemd-write` and `bbx systemd-install`.
+
+## What these do not cover
+
+- The live monitor and camera preview do not take the capture lock. A scheduled
+  run that starts while one of them is open can still fail to open the camera.
+- In two-Pi distributed capture, a node that records only thermal or depth
+  (no RGB camera) does not run the storage check.
+- These protections have been tested with the mock camera and simulated
+  drives, not yet on a Raspberry Pi with a real drive unplugged.

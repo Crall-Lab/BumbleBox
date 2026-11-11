@@ -36,6 +36,8 @@ from .simulated_capture import (
     simulated_rgb_yuv420_frame,
     simulated_thermal_frame,
 )
+from .capture_lock import DEFAULT_LOCK_WAIT_SECONDS, capture_lock
+from .storage_guard import ensure_storage_ready
 from .stream_writer import (
     FRAME_BUFFER_STREAM,
     StreamedVideo,
@@ -342,15 +344,27 @@ def _native_camera_probe_command() -> Optional[list[str]]:
 
 def _make_session_paths(config: Dict[str, Any]) -> Tuple[str, Path]:
     hostname = socket.gethostname()
-    dt = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
-    session_name = f"{hostname}_{dt}"
+    now = datetime.now()
+    base_name = f"{hostname}_{now.strftime('%Y-%m-%d_%H_%M_%S')}"
 
     data_root = Path(config["system"]["data_root"])
-    day_dir = data_root / datetime.now().strftime("%Y-%m-%d")
+    day_dir = data_root / now.strftime("%Y-%m-%d")
     day_dir.mkdir(parents=True, exist_ok=True)
-    session_dir = day_dir / session_name
-    session_dir.mkdir(parents=True, exist_ok=True)
-    return session_name, session_dir
+
+    # Session names are only precise to the second, and two scheduled runs can
+    # start in the same second (for example the record and track timers of a
+    # mixed schedule). Creating the folder is atomic, so claim it exclusively
+    # and add a suffix if it is taken; otherwise the runs would share a folder
+    # and overwrite each other's files.
+    for attempt in range(1, 1000):
+        session_name = base_name if attempt == 1 else f"{base_name}_{attempt}"
+        session_dir = day_dir / session_name
+        try:
+            session_dir.mkdir()
+        except FileExistsError:
+            continue
+        return session_name, session_dir
+    raise RuntimeError(f"Could not create a unique session folder under {day_dir} for {base_name}.")
 
 
 def _write_timestamps(
@@ -2693,6 +2707,10 @@ def run_once(
     if mode not in {"record_only", "track_only", "record_and_track"}:
         raise ValueError(f"Unsupported run mode: {mode}")
 
+    # Refuse to start before anything is written if the data drive is missing
+    # or nearly full, so a run can never quietly fill the system disk instead.
+    ensure_storage_ready(config, path=session_dir_override)
+
     if session_name_override is None and session_dir_override is None:
         session_name, session_dir = _make_session_paths(config)
     else:
@@ -2753,6 +2771,9 @@ def run_once(
     cleaned_csv: Optional[Path] = None
     fps_report_json: Optional[Path] = None
     config_snapshot_path: Optional[Path] = None
+    # Held only while the camera is in use, so a later run can start capturing
+    # while this one is still encoding or tracking.
+    camera_lock = ExitStack()
 
     try:
         should_record = mode in {"record_only", "record_and_track"}
@@ -2787,6 +2808,17 @@ def run_once(
             )
 
         if should_record or should_track:
+            # Only one run may use the camera at a time. Wait briefly for a
+            # run that is already capturing, then give up with a clear error.
+            camera_lock.enter_context(
+                capture_lock(
+                    float(config["runtime"].get("capture_lock_wait_seconds", DEFAULT_LOCK_WAIT_SECONDS)),
+                    on_wait=lambda holder: _progress_message(
+                        "capture",
+                        f"Waiting for another BumbleBox capture to release the camera ({holder}).",
+                    ),
+                )
+            )
             optional_sensor_recording = (
                 _thermal_enabled_for_recording(config)
                 or _realsense_enabled_for_recording(config)
@@ -2868,6 +2900,7 @@ def run_once(
                     warnings.append("thermal.enabled is set, but thermal capture runs only during recording modes.")
                 if should_track and _realsense_enabled_for_recording(config) and not should_record:
                     warnings.append("realsense.enabled is set, but RealSense capture runs only during recording modes.")
+            camera_lock.close()
 
         if bool(config["runtime"].get("save_frame_timestamps", True)) and timestamps:
             _progress_message("output", "Writing RGB frame timestamps.")
@@ -3084,6 +3117,7 @@ def run_once(
             if partial.exists() and partial.stat().st_size > 0:
                 warnings.append(f"A partial stream recording was kept: {partial.name}")
     finally:
+        camera_lock.close()
         if stream_writer is not None:
             stream_writer.abort()
         if thermal_capture is not None and "frames" in thermal_capture:

@@ -27,6 +27,16 @@ If storage is already mounted correctly, status shows:
 
 `Writing data to <device name> storage, you can find it at <mount point>`
 
+`storage status` also ends with a line saying whether a recording would be
+allowed to start right now:
+
+```text
+Recording allowed: yes (the drive listed in /etc/fstab for /mnt/bumblebox/data is mounted; 212.4 GB free)
+```
+
+A recording is refused when the data drive is missing or nearly full, so data
+is never written to the SD card by mistake. See `docs/Unattended_Safety.md`.
+
 GUI path:
 
 - Open `Doctor` tab.

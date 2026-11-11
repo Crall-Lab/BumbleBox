@@ -127,6 +127,7 @@ from .run_bundle import (
 )
 from .run_engine import format_run_summary, reset_camera_runtime, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
+from .storage_guard import check_storage_ready, format_storage_readiness
 from .tracking_compression_check import (
     DEFAULT_CHECK_SECONDS,
     format_tracking_compression_check,
@@ -557,6 +558,8 @@ def _cmd_storage_status(args: argparse.Namespace) -> int:
         mount_point=args.mount_point,
     )
     print(format_storage_status_report(report))
+    # Whether a recording would be allowed to start right now.
+    print(format_storage_readiness(check_storage_ready(config)))
     return 0 if report.mounted and report.writable else 1
 
 

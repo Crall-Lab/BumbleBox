@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .status_history import list_recent_run_records, load_run_summary
+from .storage_guard import check_storage_ready
 
 
 RECORDING_MODES = {"record_only", "record_and_track", "mixed_schedule"}
@@ -132,6 +133,13 @@ def _storage_alert(config: Dict[str, Any]) -> RuntimeAlert:
         return RuntimeAlert("FAIL", "Data root", "system.data_root is not configured.")
     data_root = Path(raw).expanduser()
 
+    # The same check a recording makes before it starts: is the expected data
+    # drive mounted, and is there room on it? If this fails, recordings are
+    # being refused.
+    readiness = check_storage_ready(config)
+    if not readiness.ready:
+        return RuntimeAlert("FAIL", "Data storage", str(readiness.problem))
+
     if not data_root.exists():
         return RuntimeAlert("FAIL", "Data root", f"Data root does not exist: {data_root}")
     if not os.access(data_root, os.W_OK):
@@ -140,6 +148,18 @@ def _storage_alert(config: Dict[str, Any]) -> RuntimeAlert:
     mount = _findmnt_target(data_root)
     if mount is not None:
         source, target = mount
+        if target == "/" and str(data_root).startswith(("/mnt/", "/media/")):
+            # findmnt reports the system disk for any plain folder, so a
+            # result alone does not mean an external drive is mounted.
+            return RuntimeAlert(
+                "WARN",
+                "Storage mount source",
+                (
+                    f"{data_root} is on the system disk ({source}); no external drive is mounted there. "
+                    "If recordings should go to an external drive, run `bbx storage setup`, or set "
+                    "system.require_mounted_storage: true so recording is refused when it is missing."
+                ),
+            )
         if source.startswith("/dev/sd"):
             return RuntimeAlert(
                 "WARN",

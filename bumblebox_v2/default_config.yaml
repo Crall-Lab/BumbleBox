@@ -4,6 +4,16 @@ system:
   pi_model: "auto"
   ram_gb_override: null
   timezone: "auto"
+  # Refuse to record when the data drive is missing, so data is never written
+  # to the system disk by mistake.
+  #   auto:  a mounted drive is required if /etc/fstab lists one for data_root
+  #          (or a folder above it), or if data_root is under /mnt or /media.
+  #          Otherwise no drive is required.
+  #   true:  data_root must be on a mounted drive, never the system disk.
+  #   false: never check; recording to the system disk is allowed.
+  require_mounted_storage: "auto"
+  # Refuse to start a recording with less free space than this (GB). 0 disables.
+  min_free_space_gb: 1.0
 
 setup:
   completed: false
@@ -175,6 +185,10 @@ runtime:
   render_tracking_video: false
   save_mp4_sidecar_fps_txt: true
   ui_theme_mode: "dark"
+  # Only one run can use the camera at a time. A run that finds the camera busy
+  # waits this many seconds for the other run to finish capturing, then stops
+  # with an error. 0 means do not wait.
+  capture_lock_wait_seconds: 60
 
 scheduling:
   backend: "systemd"
@@ -183,6 +197,11 @@ scheduling:
   service_user: "auto"
   enabled: false
   active_hours: "00:00-23:59"
+  # Longest a scheduled run may take (minutes) before systemd stops it, so one
+  # hung run cannot block every later recording. "auto" allows the recording
+  # time plus the larger of 30 minutes and two schedule intervals. Takes effect
+  # when the timers are next written and installed.
+  run_timeout_minutes: "auto"
 
 fleet:
   role: "standalone"
