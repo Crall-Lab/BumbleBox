@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from datetime import datetime
 import os
 from pathlib import Path
@@ -13,10 +14,12 @@ sanitize_current_qt_env()
 
 try:
     from PyQt5.QtCore import (
+        QEvent,
         QObject,
         QLockFile,
         QProcess,
         QRunnable,
+        QSize,
         QStandardPaths,
         QThreadPool,
         Qt,
@@ -42,6 +45,8 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
+        QScrollArea,
+        QSizePolicy,
         QSpinBox,
         QStackedWidget,
         QAbstractItemView,
@@ -61,6 +66,22 @@ except ImportError as exc:  # pragma: no cover - depends on desktop runtime
         "python3-pyqt5 on Raspberry Pi / pyqt5 in the BumbleBox environment."
     ) from exc
 
+from .box_status import (
+    LEVEL_FAIL,
+    LEVEL_OFF,
+    LEVEL_OK,
+    LEVEL_WARN,
+    BoxStatus,
+    FailureExplanation,
+    StartReview,
+    collect_box_status,
+    command_label,
+    describe_moment,
+    describe_relative,
+    explain_failure,
+    format_start_review,
+    review_schedule_start,
+)
 from .camera_profiles import CAMERA_PROFILES, apply_camera_profile
 from .config import DEFAULT_USER_CONFIG_PATH, load_config, load_defaults, save_config
 from .hardware_profiles import HARDWARE_PROFILES, apply_hardware_profile
@@ -76,6 +97,20 @@ from .status_history import list_recent_run_records, load_run_summary
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BBX_SCRIPT = REPO_ROOT / "bbx.py"
+
+STATUS_REFRESH_MS = 30_000
+_LEVEL_LABEL_NAMES = {
+    LEVEL_OK: "StatusGood",
+    LEVEL_WARN: "StatusWarn",
+    LEVEL_FAIL: "StatusFail",
+    LEVEL_OFF: "StatusNeutral",
+}
+_LEVEL_CARD_TONES = {
+    LEVEL_OK: "mint",
+    LEVEL_WARN: "warn",
+    LEVEL_FAIL: "fail",
+    LEVEL_OFF: "neutral",
+}
 
 PAGE_WELCOME = 0
 PAGE_HARDWARE = 1
@@ -131,6 +166,20 @@ QLabel#StatusWarn {
     padding: 9px 12px;
     font-weight: 600;
 }
+QLabel#StatusFail {
+    background: #fbe3df;
+    color: #8f2f24;
+    border-radius: 9px;
+    padding: 9px 12px;
+    font-weight: 600;
+}
+QLabel#StatusNeutral {
+    background: #ecefeb;
+    color: #52625e;
+    border-radius: 9px;
+    padding: 9px 12px;
+    font-weight: 600;
+}
 QLabel#Brand {
     color: #2f695d;
     font-size: 20px;
@@ -167,11 +216,16 @@ QFrame#Card[tone="peach"] { background: #fff0e7; border-color: #f2d9ca; }
 QFrame#Card[tone="sun"] { background: #fff6d9; border-color: #efdfaa; }
 QFrame#Card[tone="sky"] { background: #eaf4f6; border-color: #d3e5e8; }
 QFrame#Card[tone="mint"] { background: #e9f3ee; border-color: #d2e4da; }
+QFrame#Card[tone="fail"] { background: #fbe3df; border-color: #e9b9b1; }
+QFrame#Card[tone="warn"] { background: #fff0d4; border-color: #ecd49b; }
+QFrame#Card[tone="neutral"] { background: #f1f2ee; border-color: #dfe2dc; }
 QFrame#Card QLabel[valueLabel="true"] {
     color: #273a36;
     font-size: 16px;
     font-weight: 600;
 }
+QFrame#Card QLabel[detailLabel="true"] { color: #4f605b; font-size: 13px; }
+QFrame#Card[tone="fail"] QLabel[valueLabel="true"] { color: #8f2f24; }
 QGroupBox {
     background: rgba(255, 254, 251, 238);
     border: 1px solid #e0e3da;
@@ -244,6 +298,11 @@ QPushButton#Quiet {
     border-color: #dcded7;
 }
 QPushButton#Quiet:hover { background: #f5f5ef; border-color: #cdd4cf; }
+QPushButton#Primary:disabled, QPushButton#Accent:disabled, QPushButton#Quiet:disabled {
+    background: #edf0ec;
+    color: #a4aaa6;
+    border-color: #e2e5e1;
+}
 QLineEdit, QComboBox, QSpinBox {
     background: #ffffff;
     border: 1px solid #ccd3ce;
@@ -291,6 +350,7 @@ QTextEdit {
     selection-background-color: #4a7e72;
     font-size: 12px;
 }
+QScrollArea#PageScroll, QScrollArea#PageScroll > QWidget > QWidget { background: transparent; }
 QScrollBar:vertical {
     background: transparent;
     width: 11px;
@@ -374,6 +434,33 @@ def _page_heading(title: str, subtitle: str) -> tuple[QLabel, QLabel]:
     return heading, description
 
 
+class _FitScrollArea(QScrollArea):
+    """A scroll area that asks for the height of its content.
+
+    The stock size hint is capped at a fixed number of text lines, which would
+    make the content scroll even when the window has room for all of it.
+    """
+
+    def sizeHint(self) -> QSize:
+        content = self.widget()
+        if content is None:
+            return super().sizeHint()
+        hint = content.sizeHint()
+        height = hint.height()
+        width = self.viewport().width()
+        if width > 0 and content.hasHeightForWidth():
+            # Wrapped text needs more or fewer lines depending on the width.
+            height = content.heightForWidth(width)
+        return QSize(hint.width(), height + 2 * self.frameWidth())
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        # When the content grows or shrinks (a status text changed), ask the
+        # page to lay this area out again at its new height.
+        if watched is self.widget() and event.type() in (QEvent.LayoutRequest, QEvent.Resize):
+            self.updateGeometry()
+        return super().eventFilter(watched, event)
+
+
 class _RunHistorySignals(QObject):
     finished = pyqtSignal(int, object, object)
 
@@ -417,6 +504,35 @@ class _RunHistoryWorker(QRunnable):
             self._emit_finished([], str(exc))
             return
         self._emit_finished(payloads, None)
+
+
+class _BoxStatusSignals(QObject):
+    finished = pyqtSignal(int, object)
+
+
+class _BoxStatusWorker(QRunnable):
+    """Checks storage and the schedule off the GUI thread.
+
+    A stalled drive or a slow answer from systemd must not freeze the window.
+    """
+
+    def __init__(self, generation: int, config: dict[str, Any], config_path: Path) -> None:
+        super().__init__()
+        self.generation = int(generation)
+        self.config = config
+        self.config_path = config_path
+        self.signals = _BoxStatusSignals()
+
+    def run(self) -> None:
+        try:
+            status: object = collect_box_status(self.config, self.config_path)
+        except Exception as exc:  # pragma: no cover - collect_box_status guards its parts
+            status = str(exc)
+        try:
+            self.signals.finished.emit(self.generation, status)
+        except RuntimeError:
+            # The window may close while a check is finishing.
+            pass
 
 
 class WelcomePage(QWizardPage):
@@ -1007,17 +1123,31 @@ class BumbleBoxQtGUI(QMainWindow):
         self._run_history_payloads: list[dict[str, Any]] = []
         self._selected_run_payload: dict[str, Any] | None = None
         self._run_history_workers: dict[int, _RunHistoryWorker] = {}
+        self._run_history_error: str | None = None
+        self._box_status: BoxStatus | None = None
+        self._box_status_generation = 0
+        self._box_status_loading = False
+        self._box_status_refresh_pending = False
+        self._box_status_workers: dict[int, _BoxStatusWorker] = {}
+        self._last_scheduled_run_seen: datetime | None = None
+        self._current_command: list[str] = []
+        self._command_output: list[str] = []
         self.thread_pool = QThreadPool.globalInstance()
         self.process = QProcess(self)
         self.process.setProcessChannelMode(QProcess.MergedChannels)
         self.process.readyReadStandardOutput.connect(self._read_process_output)
         self.process.finished.connect(self._process_finished)
+        self.process.errorOccurred.connect(self._process_error)
         self.setWindowTitle("BumbleBox")
         self.resize(1180, 780)
         self.setMinimumSize(940, 660)
         self._build_ui()
         self.refresh_from_config()
         QTimer.singleShot(100, self.refresh_results)
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(STATUS_REFRESH_MS)
+        self._status_timer.timeout.connect(self.refresh_box_status)
+        self._status_timer.start()
         if not bool(self.config.get("setup", {}).get("completed", False)):
             QTimer.singleShot(0, self.open_setup_wizard)
 
@@ -1099,6 +1229,12 @@ class BumbleBoxQtGUI(QMainWindow):
         self.storage_card = self._status_card("Data storage", "", tone="mint")
         for column, card in enumerate((self.camera_card, self.thermal_card, self.realsense_card, self.storage_card)):
             cards.addWidget(card, 0, column)
+            cards.setColumnStretch(column, 1)
+        cards.setVerticalSpacing(12)
+        self.schedule_card = self._status_card("Automated recording", "Checking...", tone="neutral")
+        self.latest_card = self._status_card("Latest recording", "Loading...", tone="neutral")
+        cards.addWidget(self.schedule_card, 1, 0, 1, 2)
+        cards.addWidget(self.latest_card, 1, 2, 1, 2)
         layout.addLayout(cards)
 
         actions = QHBoxLayout()
@@ -1132,11 +1268,40 @@ class BumbleBoxQtGUI(QMainWindow):
         value_label = QLabel(value)
         value_label.setWordWrap(True)
         value_label.setProperty("valueLabel", True)
+        detail_label = QLabel("")
+        detail_label.setWordWrap(True)
+        detail_label.setProperty("detailLabel", True)
+        detail_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        detail_label.setVisible(False)
         layout.addWidget(eyebrow)
         layout.addWidget(value_label)
+        layout.addWidget(detail_label)
         layout.addStretch(1)
         card.value_label = value_label
+        card.detail_label = detail_label
         return card
+
+    @staticmethod
+    def _repolish(*widgets: QWidget) -> None:
+        for widget in widgets:
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+    def _set_card(self, card: QFrame, headline: str, detail: str = "", tone: str | None = None) -> None:
+        card.value_label.setText(headline)
+        card.detail_label.setText(detail)
+        card.detail_label.setVisible(bool(detail))
+        if tone is not None and card.property("tone") != tone:
+            card.setProperty("tone", tone)
+            self._repolish(card, card.value_label, card.detail_label)
+
+    def _set_status_label(self, label: QLabel, level: str, text: str) -> None:
+        name = _LEVEL_LABEL_NAMES.get(level, "StatusNeutral")
+        label.setText(text)
+        if label.objectName() != name:
+            label.setObjectName(name)
+            self._repolish(label)
+        label.setVisible(True)
 
     def _build_run_page(self) -> QWidget:
         page = QWidget()
@@ -1145,10 +1310,16 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.setSpacing(12)
         heading, subtitle = _page_heading(
             "Capture and automation",
-            "Run one recording now or control the clock-aligned systemd recording schedule.",
+            "Record once now, or start and stop the recording schedule.",
         )
         layout.addWidget(heading)
         layout.addWidget(subtitle)
+        # The controls scroll when the window is short, so the outcome of the
+        # last command and its output always stay in view below them.
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 6, 0)
+        controls_layout.setSpacing(12)
         row = QHBoxLayout()
         self.run_mode = QComboBox()
         for value in ("record_only", "record_and_track", "track_only"):
@@ -1167,16 +1338,21 @@ class BumbleBoxQtGUI(QMainWindow):
         self.live_monitor_button.clicked.connect(self._open_live_monitor)
         row.addWidget(self.live_monitor_button)
         row.addStretch(1)
-        layout.addLayout(row)
+        controls_layout.addLayout(row)
 
         automation = QGroupBox("Automated recording")
         automation.setProperty("tone", "mint")
         automation_layout = QVBoxLayout(automation)
-        note = QLabel(
-            "Start writes and installs user-scope timers. Recordings continue after logout when user lingering is enabled."
+        self.schedule_status_label = QLabel("Checking the schedule...")
+        self.schedule_status_label.setObjectName("StatusNeutral")
+        self.schedule_status_label.setWordWrap(True)
+        automation_layout.addWidget(self.schedule_status_label)
+        self.schedule_detail_label = QLabel(
+            "Recordings start on the clock and keep going when this window is closed."
         )
-        note.setWordWrap(True)
-        automation_layout.addWidget(note)
+        self.schedule_detail_label.setWordWrap(True)
+        self.schedule_detail_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        automation_layout.addWidget(self.schedule_detail_label)
         buttons = QHBoxLayout()
         start = QPushButton("Start Automated Recording")
         start.setObjectName("Primary")
@@ -1188,7 +1364,7 @@ class BumbleBoxQtGUI(QMainWindow):
         buttons.addWidget(stop)
         buttons.addStretch(1)
         automation_layout.addLayout(buttons)
-        layout.addWidget(automation)
+        controls_layout.addWidget(automation)
 
         self.distributed_run_group = QGroupBox("Two-Pi capture readiness")
         self.distributed_run_group.setProperty("tone", "sky")
@@ -1209,14 +1385,14 @@ class BumbleBoxQtGUI(QMainWindow):
         distributed_layout.addWidget(self.distributed_run_status, 1)
         distributed_layout.addWidget(distributed_check)
         distributed_layout.addWidget(distributed_hardware_check)
-        layout.addWidget(self.distributed_run_group)
+        controls_layout.addWidget(self.distributed_run_group)
 
         latest = QGroupBox("Latest recording")
         latest.setProperty("tone", "sky")
-        latest_layout = QVBoxLayout(latest)
+        latest_layout = QHBoxLayout(latest)
         self.latest_run_status = QLabel("Loading recent recording status...")
         self.latest_run_status.setWordWrap(True)
-        latest_layout.addWidget(self.latest_run_status)
+        latest_layout.addWidget(self.latest_run_status, 1)
         latest_buttons = QHBoxLayout()
         self.latest_session_button = QPushButton("Open Session Folder")
         self.latest_session_button.setObjectName("Quiet")
@@ -1227,6 +1403,7 @@ class BumbleBoxQtGUI(QMainWindow):
         self.latest_depth_button = QPushButton("Open Latest Depth Preview")
         self.latest_depth_button.setObjectName("Quiet")
         self.latest_depth_button.setEnabled(False)
+        self.latest_depth_button.setVisible(False)
         self.latest_depth_button.clicked.connect(
             lambda: self._open_run_artifact(
                 self._latest_run_payload(), "realsense_depth_preview_video_path"
@@ -1238,9 +1415,23 @@ class BumbleBoxQtGUI(QMainWindow):
         latest_buttons.addWidget(self.latest_session_button)
         latest_buttons.addWidget(self.latest_depth_button)
         latest_buttons.addWidget(self.latest_results_button)
-        latest_buttons.addStretch(1)
         latest_layout.addLayout(latest_buttons)
-        layout.addWidget(latest)
+        controls_layout.addWidget(latest)
+        scroll = _FitScrollArea()
+        scroll.setObjectName("PageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(controls)
+        controls.setAutoFillBackground(False)
+        scroll.viewport().setAutoFillBackground(False)
+        layout.addWidget(scroll)
+        self.command_status = QLabel("")
+        self.command_status.setObjectName("StatusNeutral")
+        self.command_status.setWordWrap(True)
+        self.command_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.command_status.setVisible(False)
+        layout.addWidget(self.command_status)
         layout.addWidget(self._build_console(), 1)
         return page
 
@@ -1488,7 +1679,10 @@ class BumbleBoxQtGUI(QMainWindow):
         layout = QVBoxLayout(box)
         self.console = QTextEdit()
         self.console.setReadOnly(True)
-        self.console.setMinimumHeight(210)
+        # The controls above get the height they ask for first; the console
+        # takes whatever is left, never less than a few lines.
+        self.console.setMinimumHeight(96)
+        self.console.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         self.console.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
         layout.addWidget(self.console)
         return box
@@ -1790,12 +1984,13 @@ class BumbleBoxQtGUI(QMainWindow):
         self._selected_run_payload = None
         self.results_table.setRowCount(0)
 
+        self._run_history_error = str(error) if error else None
         if error:
             self._run_history_payloads = []
+            self._update_latest_card()
             self.results_status.setText(f"Could not scan recording summaries: {error}")
-            self.latest_run_status.setText("Recent recording status is unavailable.")
             self.latest_session_button.setEnabled(False)
-            self.latest_depth_button.setEnabled(False)
+            self._set_latest_depth_available(False)
             self._set_result_artifact_buttons(None)
             if self._run_history_refresh_pending:
                 self._run_history_refresh_pending = False
@@ -1804,6 +1999,7 @@ class BumbleBoxQtGUI(QMainWindow):
 
         normalized = [dict(item) for item in payloads if isinstance(item, dict)] if isinstance(payloads, list) else []
         self._run_history_payloads = normalized
+        self._update_latest_card()
         data_root = str(self.config.get("system", {}).get("data_root", "Not set"))
         self.results_status.setText(f"Showing {len(normalized)} recent recording(s) from {data_root}")
 
@@ -1829,9 +2025,8 @@ class BumbleBoxQtGUI(QMainWindow):
 
         latest = self._latest_run_payload()
         if latest is None:
-            self.latest_run_status.setText("No BumbleBox recording summaries were found.")
             self.latest_session_button.setEnabled(False)
-            self.latest_depth_button.setEnabled(False)
+            self._set_latest_depth_available(False)
             self.result_detail.setText("No recording results are available.")
             self._set_result_artifact_buttons(None)
             if self._run_history_refresh_pending:
@@ -1839,17 +2034,22 @@ class BumbleBoxQtGUI(QMainWindow):
                 QTimer.singleShot(0, self.refresh_results)
             return
 
-        self.latest_run_status.setText(self._format_run_detail(latest))
         self.latest_session_button.setEnabled(
             self._run_artifact_path(latest, "_session_dir_local") is not None
         )
-        self.latest_depth_button.setEnabled(
+        self._set_latest_depth_available(
             self._run_artifact_path(latest, "realsense_depth_preview_video_path") is not None
         )
         self.results_table.selectRow(0)
         if self._run_history_refresh_pending:
             self._run_history_refresh_pending = False
             QTimer.singleShot(0, self.refresh_results)
+
+    def _set_latest_depth_available(self, available: bool) -> None:
+        # Shown only when there is a depth preview to open, so a box without a
+        # depth camera does not carry a permanently disabled button.
+        self.latest_depth_button.setEnabled(available)
+        self.latest_depth_button.setVisible(available)
 
     def _navigate(self, index: int) -> None:
         if index < 0:
@@ -1912,7 +2112,13 @@ class BumbleBoxQtGUI(QMainWindow):
             else "Enabled on second Pi" if depth_enabled
             else "Not used"
         )
-        self.storage_card.value_label.setText(str(self.config.get("system", {}).get("data_root", "Not set")))
+        if self._box_status is None:
+            self._set_card(
+                self.storage_card,
+                "Checking...",
+                str(self.config.get("system", {}).get("data_root", "Not set")),
+                "neutral",
+            )
         self.rgb_group.setVisible(not distributed_enabled or "rgb" in local_sensors)
         self.thermal_group.setVisible(thermal_enabled and (not distributed_enabled or "thermal" in local_sensors))
         self.realsense_group.setVisible(depth_enabled and (not distributed_enabled or "realsense" in local_sensors))
@@ -1946,6 +2152,113 @@ class BumbleBoxQtGUI(QMainWindow):
             self.calibration_project_label.setText("No multimodal calibration project selected.")
         self.open_calibration_button.setEnabled(calibration_path is not None)
         self.calibration_status_button.setEnabled(calibration_path is not None)
+        self.refresh_box_status()
+
+    def closeEvent(self, event: Any) -> None:
+        self._status_timer.stop()
+        super().closeEvent(event)
+
+    # -- Box status: storage, schedule, latest recording ---------------------
+
+    def refresh_box_status(self) -> None:
+        if self._box_status_loading:
+            self._box_status_refresh_pending = True
+            return
+        self._box_status_generation += 1
+        self._box_status_loading = True
+        worker = _BoxStatusWorker(self._box_status_generation, copy.deepcopy(self.config), self.config_path)
+        worker.signals.finished.connect(self._box_status_loaded)
+        self._box_status_workers[worker.generation] = worker
+        self.thread_pool.start(worker)
+
+    def _box_status_loaded(self, generation: int, status: object) -> None:
+        self._box_status_workers.pop(generation, None)
+        if generation != self._box_status_generation:
+            return
+        self._box_status_loading = False
+        if isinstance(status, BoxStatus):
+            self._apply_box_status(status)
+        if self._box_status_refresh_pending:
+            self._box_status_refresh_pending = False
+            QTimer.singleShot(0, self.refresh_box_status)
+
+    def _apply_box_status(self, status: BoxStatus) -> None:
+        self._box_status = status
+        storage, schedule = status.storage, status.schedule
+        self._set_card(
+            self.storage_card, storage.headline, storage.detail, _LEVEL_CARD_TONES.get(storage.level, "neutral")
+        )
+        self._set_card(
+            self.schedule_card, schedule.headline, schedule.detail, _LEVEL_CARD_TONES.get(schedule.level, "neutral")
+        )
+        self._set_status_label(self.schedule_status_label, schedule.level, f"Automated recording: {schedule.headline}")
+        self.schedule_detail_label.setText(schedule.detail)
+        self._update_latest_card()
+
+        # A scheduled run that finished while this window was open produced a
+        # new recording; rescan the data folder only then, not on every tick.
+        finished = [
+            timer.last_started
+            for timer in schedule.timers
+            if timer.last_started is not None and not timer.running
+        ]
+        newest = max(finished) if finished else None
+        if newest is not None and newest != self._last_scheduled_run_seen:
+            first_look = self._last_scheduled_run_seen is None
+            self._last_scheduled_run_seen = newest
+            if not first_look:
+                self.refresh_results()
+
+    @staticmethod
+    def _parse_run_start(value: Any) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
+
+    def _update_latest_card(self) -> None:
+        if self._run_history_loading and not self._run_history_payloads:
+            return
+        headline, detail, tone = self._latest_recording_summary()
+        self._set_card(self.latest_card, headline, detail, tone)
+        self.latest_run_status.setText(f"{headline}\n{detail}" if detail else headline)
+
+    def _latest_recording_summary(self) -> tuple[str, str, str]:
+        """Headline, detail and card tone for the newest recording in the data folder."""
+        if self._run_history_error:
+            return (
+                "Unavailable",
+                f"The data folder could not be read: {self._run_history_error}",
+                "warn",
+            )
+        latest = self._latest_run_payload()
+        if latest is None:
+            return "No recordings yet", "", "neutral"
+        now = datetime.now()
+        started = self._parse_run_start(latest.get("started_at"))
+        when = (
+            f"{describe_moment(started, now)} ({describe_relative(started, now)})"
+            if started is not None
+            else "Unknown time"
+        )
+        if bool(latest.get("success", False)):
+            frames = int(latest.get("frames_captured", 0) or 0)
+            try:
+                fps = f"{float(latest.get('actual_fps')):.1f} fps"
+            except (TypeError, ValueError):
+                fps = "unknown fps"
+            mode = str(latest.get("mode") or "unknown mode").replace("_", " ")
+            return f"{when} · Success", f"{frames} frames at {fps}, {mode}", "mint"
+        errors = [str(item).strip() for item in (latest.get("errors") or []) if str(item).strip()]
+        return (
+            f"{when} · FAILED",
+            errors[0] if errors else "No reason was recorded; see Results for this session.",
+            "fail",
+        )
 
     def _run_once(self) -> None:
         if not self._confirm_live_monitor_closed("start a recording"):
@@ -1985,6 +2298,9 @@ class BumbleBoxQtGUI(QMainWindow):
         scheduling["enabled"] = True
         scheduling["backend"] = "systemd"
         scheduling["scope"] = "user"
+        review = review_schedule_start(config)
+        if not review.ok and not self._confirm_start_despite_problems(review):
+            return
         save_config(self.config_path, config)
         self.config = config
         self.run_bbx_commands(
@@ -1994,6 +2310,24 @@ class BumbleBoxQtGUI(QMainWindow):
                 "The clock-aligned recording schedule is active and will continue after logout.",
             ),
         )
+
+    def _confirm_start_despite_problems(self, review: StartReview) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Check before starting")
+        box.setText(
+            "Automated recording has not been started. The current settings are unlikely to work:"
+        )
+        box.setInformativeText(
+            format_start_review(review)
+            + "\n\nThe memory and timing figures are estimates. Start anyway?"
+        )
+        start_anyway = box.addButton("Start Anyway", QMessageBox.DestructiveRole)
+        cancel = box.addButton("Don't Start", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec_()
+        return box.clickedButton() is start_anyway
 
     def _stop_automation(self) -> None:
         config = load_config(self.config_path)
@@ -2043,6 +2377,13 @@ class BumbleBoxQtGUI(QMainWindow):
         if not self.command_queue:
             return
         arguments = self.command_queue.pop(0)
+        self._current_command = list(arguments)
+        self._command_output = []
+        self._set_status_label(
+            self.command_status,
+            LEVEL_OFF,
+            f"{command_label(arguments)}: running since {datetime.now():%H:%M:%S}. Output appears below.",
+        )
         if "--config" not in arguments:
             arguments.extend(["--config", str(self.config_path)])
         command_text = " ".join([str(BBX_SCRIPT), *arguments])
@@ -2051,29 +2392,82 @@ class BumbleBoxQtGUI(QMainWindow):
         self.process.start(sys.executable, [str(BBX_SCRIPT), *arguments])
 
     def _read_process_output(self) -> None:
+        if not self.process.isOpen():
+            return
         data = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
         if data:
+            self._command_output.append(data)
             self.console.moveCursor(QTextCursor.End)
             self.console.insertPlainText(data)
             self.console.ensureCursorVisible()
 
-    def _process_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+    def _process_finished(self, exit_code: int, status: QProcess.ExitStatus) -> None:
+        self._read_process_output()
         self.console.append(f"\n[finished with exit code {exit_code}]")
         self.refresh_results()
-        if exit_code != 0:
+        crashed = status == QProcess.CrashExit
+        if exit_code != 0 or crashed:
             self.command_queue.clear()
             self.command_success_message = None
+            self.refresh_box_status()
+            label = command_label(self._current_command)
+            if crashed:
+                explanation = FailureExplanation(
+                    f"{label} stopped unexpectedly",
+                    "The program crashed or was killed before it finished. "
+                    "Anything it printed is in the command output.",
+                )
+            else:
+                explanation = explain_failure(
+                    "".join(self._command_output),
+                    exit_code=exit_code,
+                    command=self._current_command,
+                )
+            self._report_command_failure(explanation)
             return
         if self.command_queue:
             self._start_next_command()
             return
+        success_title = self.command_success_message[0] if self.command_success_message else None
+        self._set_status_label(
+            self.command_status,
+            LEVEL_OK,
+            success_title or f"{command_label(self._current_command)} finished.",
+        )
         if self.config_path.exists():
             self.config = load_config(self.config_path)
             self.refresh_from_config()
+        else:
+            self.refresh_box_status()
         if self.command_success_message is not None:
             title, message = self.command_success_message
             self.command_success_message = None
             QMessageBox.information(self, title, message)
+
+    def _process_error(self, error: QProcess.ProcessError) -> None:
+        # A crash also emits finished(); a failure to start does not, and
+        # would otherwise leave the window showing nothing at all.
+        if error != QProcess.FailedToStart:
+            return
+        self.command_queue.clear()
+        self.command_success_message = None
+        self._report_command_failure(
+            FailureExplanation(
+                f"{command_label(self._current_command)} could not be started",
+                f"BumbleBox could not launch its own command: {self.process.errorString()}",
+            )
+        )
+
+    def _report_command_failure(self, explanation: FailureExplanation) -> None:
+        self._set_status_label(self.command_status, LEVEL_FAIL, f"{explanation.title}\n{explanation.reason}")
+        self._show_failure_dialog(explanation)
+
+    def _show_failure_dialog(self, explanation: FailureExplanation) -> None:
+        QMessageBox.warning(
+            self,
+            explanation.title,
+            f"{explanation.reason}\n\nThe full output is under Command output on the Run page.",
+        )
 
 
 def _single_instance_lock() -> QLockFile:

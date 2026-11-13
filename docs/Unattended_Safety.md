@@ -116,6 +116,36 @@ skipped.
 Like the time limit, this is written into the unit files, so it reaches an
 existing box only after `bbx systemd-write` and `bbx systemd-install`.
 
+## What the GUI shows
+
+The Overview page of `bbx gui` reports these checks without running a command.
+It refreshes every 30 seconds.
+
+| Card | What it tells you |
+|---|---|
+| Data storage | Whether the drive is mounted and how much space is free, or that recording will be refused and why |
+| Automated recording | Whether the schedule is on, when the next recording is, and whether the last scheduled run worked. A failed run shows its reason, for example the missing drive |
+| Latest recording | When the newest recording in the data folder was made and whether it succeeded |
+
+The Automated recording card also warns when:
+
+- the settings have changed since the schedule was started, so the installed
+  timers are out of date (press **Start Automated Recording** to apply them);
+- the schedule would stop when the user logs out, because lingering is off;
+- the schedule is running now but would not come back after a restart.
+
+**Start Automated Recording** checks the drive and the memory and timing
+estimates from `bbx schedule-check` first. If it finds problems it lists them
+and asks before starting. The estimates are approximate, so you can still
+choose to start.
+
+A command that fails in the GUI shows its reason in a message and in a red
+line above the command output, instead of only an exit code.
+
+The result of the last scheduled run comes from systemd, which forgets it at
+reboot. After a restart the card reads "No scheduled run has happened yet"
+until the next slot.
+
 ## What these do not cover
 
 - The live monitor and camera preview do not take the capture lock. A scheduled
