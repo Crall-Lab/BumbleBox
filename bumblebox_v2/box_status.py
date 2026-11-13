@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 import getpass
+import json
+import math
 import os
 from pathlib import Path
 import re
@@ -25,8 +27,15 @@ import subprocess
 import tempfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from .encode_benchmark import HEADROOM_FOR_YES
 from .schedule_check import run_schedule_check
-from .storage_guard import StorageReadiness, check_storage_ready, containing_mount_point
+from .storage_guard import (
+    DEFAULT_MIN_FREE_SPACE_GB,
+    StorageReadiness,
+    check_storage_ready,
+    containing_mount_point,
+)
+from .stream_writer import FRAME_BUFFER_STREAM, frame_buffer_mode, normalize_mp4_codec, resolve_mp4_preset
 from .systemd_units import _job_specs, write_systemd_units
 
 
@@ -53,6 +62,7 @@ class StatusLine:
     level: str
     headline: str
     detail: str = ""
+    free_gb: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +155,9 @@ def storage_status(
                 LEVEL_FAIL,
                 f"Drive nearly full · {_format_gb(free_gb)} free",
                 f"{path}. Recording is refused below {readiness.min_free_gb:g} GB free.",
+                free_gb=free_gb,
             )
-        return StatusLine(LEVEL_FAIL, "Recording is refused", readiness.problem or path)
+        return StatusLine(LEVEL_FAIL, "Recording is refused", readiness.problem or path, free_gb=free_gb)
 
     on_separate_drive = readiness.requirement != "not_required"
     if not on_separate_drive:
@@ -157,10 +168,302 @@ def storage_status(
     where = "Drive mounted" if on_separate_drive else "On the system disk"
     headline = f"{where} · {_format_gb(free_gb)} free" if free_gb is not None else where
     if readiness.notes:
-        return StatusLine(LEVEL_WARN, headline, f"{path}. {readiness.notes[0]}")
+        return StatusLine(LEVEL_WARN, headline, f"{path}. {readiness.notes[0]}", free_gb=free_gb)
     if free_gb is not None and free_gb < LOW_FREE_SPACE_WARNING_GB:
-        return StatusLine(LEVEL_WARN, headline, f"{path}. Space is getting low.")
-    return StatusLine(LEVEL_OK, headline, path)
+        return StatusLine(LEVEL_WARN, headline, f"{path}. Space is getting low.", free_gb=free_gb)
+    return StatusLine(LEVEL_OK, headline, path, free_gb=free_gb)
+
+
+# ---------------------------------------------------------------------------
+# Storage use per day
+# ---------------------------------------------------------------------------
+
+RECORDING_MODES = {"record_only", "record_and_track", "mixed_schedule"}
+RECORDING_RUN_MODES = {"record_only", "record_and_track"}
+ESTIMATE_SAMPLE_RUNS = 10
+SPACE_RUNNING_LOW_DAYS = 7.0
+SESSION_SIZE_MAX_FILES = 20_000
+
+
+def format_bytes(value: float) -> str:
+    """Decimal units, as drives are sold: 1 GB = 1e9 bytes."""
+    value = max(0.0, float(value))
+    for unit, size in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if value >= size:
+            scaled = value / size
+            return f"{scaled:.0f} {unit}" if scaled >= 10 else f"{scaled:.1f} {unit}"
+    return f"{value:.0f} B"
+
+
+def describe_days(days: float) -> str:
+    if days >= 365 * 2:
+        return f"about {days / 365:.0f} years"
+    if days >= 60:
+        return f"about {days / 30.4:.0f} months"
+    if days >= 2:
+        return f"about {days:.0f} days"
+    hours = days * 24
+    if hours >= 2:
+        return f"about {hours:.0f} hours"
+    return "less than 2 hours"
+
+
+def session_size_bytes(session_dir: str | Path, *, max_files: int = SESSION_SIZE_MAX_FILES) -> Optional[int]:
+    """Total size of the files in a session folder, or ``None`` if it cannot be read."""
+    root = Path(session_dir)
+    if not root.is_dir():
+        return None
+    total = 0
+    seen = 0
+    stack = [root]
+    try:
+        while stack:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                        seen += 1
+                        if seen > max_files:
+                            return None
+    except OSError:
+        return None
+    return total
+
+
+def recording_signature(config: Dict[str, Any]) -> Tuple[str, str, bool, int, int]:
+    """The settings that decide how many bytes a recorded frame takes on disk.
+
+    Two recordings with the same signature can be compared per frame; the
+    recording length, frame rate and interval then scale the total.
+    """
+    camera = config.get("camera", {}) if isinstance(config.get("camera"), dict) else {}
+    codec = str(camera.get("codec", "mp4")).strip().lower()
+    streaming = frame_buffer_mode(config) == FRAME_BUFFER_STREAM
+    preset = resolve_mp4_preset(camera.get("mp4_preset"), streaming=streaming) if codec == "mp4" else "-"
+
+    def _int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    return (
+        codec,
+        preset,
+        bool(camera.get("monochrome_output", False)),
+        _int(camera.get("width")),
+        _int(camera.get("height")),
+    )
+
+
+def describe_signature(signature: Sequence[Any]) -> str:
+    codec, preset, mono, width, height = signature
+    video = "MJPEG" if codec == "mjpeg" else f"MP4 ({preset})"
+    colour = "grayscale" if mono else "colour"
+    return f"{width} × {height}, {video}, {colour}"
+
+
+def signature_from_snapshot(snapshot_path: Any) -> Optional[Tuple[str, str, bool, int, int]]:
+    """Read the recording signature from a run's saved config snapshot."""
+    text = str(snapshot_path or "").strip()
+    if not text:
+        return None
+    try:
+        snapshot = json.loads(Path(text).read_text())
+    except (OSError, ValueError):
+        return None
+    return recording_signature(snapshot) if isinstance(snapshot, dict) else None
+
+
+def recordings_per_day(config: Dict[str, Any]) -> int:
+    """How many recordings the schedule starts in 24 hours (0 for track-only)."""
+    mode = str((config.get("pipeline") or {}).get("mode", "record_and_track"))
+    if mode not in RECORDING_MODES:
+        return 0
+    try:
+        interval = max(1, int((config.get("capture") or {}).get("record_interval_minutes", 30)))
+    except (TypeError, ValueError):
+        return 0
+    # Timers fire at minute 0, interval, 2 x interval, ... of each day.
+    return math.ceil(24 * 60 / interval)
+
+
+def frames_per_recording(config: Dict[str, Any]) -> float:
+    capture = config.get("capture", {}) if isinstance(config.get("capture"), dict) else {}
+    camera = config.get("camera", {}) if isinstance(config.get("camera"), dict) else {}
+    try:
+        return max(0.0, float(capture.get("recording_seconds", 0)) * float(camera.get("fps_target", 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Saved encode benchmark results
+# ---------------------------------------------------------------------------
+
+def load_benchmark(path: str | Path) -> Optional[Dict[str, Any]]:
+    """Read a report saved by ``bbx encode-benchmark --json-out``."""
+    try:
+        report = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    return report if isinstance(report, dict) and isinstance(report.get("results"), list) else None
+
+
+def benchmark_used_real_video(benchmark: Dict[str, Any]) -> bool:
+    """Synthetic frames compress differently from a nest, so only real footage gives file sizes."""
+    return str(benchmark.get("source", "")).startswith("video:")
+
+
+def benchmark_matches_camera(config: Dict[str, Any], benchmark: Dict[str, Any]) -> bool:
+    _, _, mono, width, height = recording_signature(config)
+    try:
+        same_size = int(benchmark.get("width", 0)) == width and int(benchmark.get("height", 0)) == height
+    except (TypeError, ValueError):
+        return False
+    return same_size and bool(benchmark.get("monochrome_output", False)) == mono
+
+
+def benchmark_result_for(config: Dict[str, Any], benchmark: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The benchmark result for the encoder ``config`` would use, if it was measured."""
+    if not isinstance(benchmark, dict) or not benchmark_matches_camera(config, benchmark):
+        return None
+    camera = config.get("camera", {}) if isinstance(config.get("camera"), dict) else {}
+    codec, preset, _, _, _ = recording_signature(config)
+    wanted_mp4_codec = normalize_mp4_codec(camera.get("mp4_codec", "libx264"))
+    for result in benchmark.get("results") or []:
+        if not isinstance(result, dict) or result.get("error"):
+            continue
+        if codec == "mjpeg" and result.get("codec") == "mjpeg":
+            return result
+        if (
+            codec == "mp4"
+            and result.get("codec") == "mp4"
+            and str(result.get("mp4_preset")) == preset
+            and normalize_mp4_codec(result.get("mp4_codec")) == wanted_mp4_codec
+        ):
+            return result
+    return None
+
+
+def keeps_up(frames_per_second: Any, fps_target: Any) -> str:
+    """'yes', 'marginal' or 'no', by the same rule as the encode benchmark."""
+    try:
+        measured, target = float(frames_per_second), float(fps_target)
+    except (TypeError, ValueError):
+        return "n/a"
+    if target <= 0:
+        return "n/a"
+    if measured >= HEADROOM_FOR_YES * target:
+        return "yes"
+    if measured >= target:
+        return "marginal"
+    return "no"
+
+
+@dataclass
+class StorageEstimate:
+    level: str
+    headline: str
+    detail: str = ""
+    bytes_per_recording: Optional[float] = None
+    bytes_per_day: Optional[float] = None
+    days_left: Optional[float] = None
+    sample_runs: int = 0
+
+
+def estimate_storage(
+    config: Dict[str, Any],
+    recordings: Sequence[Dict[str, Any]],
+    *,
+    free_gb: Optional[float] = None,
+    benchmark: Optional[Dict[str, Any]] = None,
+) -> StorageEstimate:
+    """Estimate storage per day and days of space left from past recordings.
+
+    ``recordings`` are run summaries, newest first, with two extra keys added
+    by the caller: ``_session_bytes`` (size of the session folder) and
+    ``_recording_signature`` (from the run's config snapshot). Only
+    successful recordings made with the same video settings as ``config``
+    are used, because the size of a frame depends on them. The whole session
+    folder is counted, so tracking outputs saved next to the video are
+    included.
+
+    When no such recording exists yet, a saved encode benchmark that was run
+    on real footage at the same resolution is used instead; that measures the
+    video file only.
+    """
+    per_day = recordings_per_day(config)
+    if per_day == 0:
+        return StorageEstimate(LEVEL_OFF, "No new video", "Track-only mode does not record.")
+
+    wanted = recording_signature(config)
+    samples = []
+    for run in recordings:
+        if not bool(run.get("success", False)) or str(run.get("mode")) not in RECORDING_RUN_MODES:
+            continue
+        frames = int(run.get("frames_captured", 0) or 0)
+        size = run.get("_session_bytes")
+        if frames <= 0 or not isinstance(size, (int, float)) or size <= 0:
+            continue
+        signature = run.get("_recording_signature")
+        if signature is None or tuple(signature) != wanted:
+            continue
+        samples.append((float(size), frames))
+        if len(samples) >= ESTIMATE_SAMPLE_RUNS:
+            break
+
+    benchmark_result = (
+        benchmark_result_for(config, benchmark)
+        if not samples and isinstance(benchmark, dict) and benchmark_used_real_video(benchmark)
+        else None
+    )
+    if samples:
+        bytes_per_frame = sum(size for size, _ in samples) / sum(frames for _, frames in samples)
+        basis = (
+            "Measured from the last recording with these video settings."
+            if len(samples) == 1
+            else f"Measured from the last {len(samples)} recordings with these video settings."
+        )
+    elif benchmark_result is not None and float(benchmark_result.get("megabytes_per_frame") or 0) > 0:
+        bytes_per_frame = float(benchmark_result["megabytes_per_frame"]) * 1e6
+        basis = (
+            "Video only, from the encode benchmark on one of your recordings; "
+            "tracking files add to this."
+        )
+    else:
+        return StorageEstimate(
+            LEVEL_OFF,
+            "Storage per day not known yet",
+            f"Make one recording with the current video settings ({describe_signature(wanted)}) to measure it.",
+        )
+
+    per_recording = bytes_per_frame * frames_per_recording(config)
+    bytes_per_day = per_recording * per_day
+    estimate = StorageEstimate(
+        LEVEL_OK,
+        f"About {format_bytes(bytes_per_day)} per day",
+        f"{format_bytes(per_recording)} per recording, {per_day} recordings a day. {basis}",
+        bytes_per_recording=per_recording,
+        bytes_per_day=bytes_per_day,
+        sample_runs=len(samples),
+    )
+    if free_gb is None or bytes_per_day <= 0:
+        return estimate
+
+    system = config.get("system", {}) if isinstance(config.get("system"), dict) else {}
+    try:
+        reserve_gb = max(0.0, float(system.get("min_free_space_gb", DEFAULT_MIN_FREE_SPACE_GB)))
+    except (TypeError, ValueError):
+        reserve_gb = DEFAULT_MIN_FREE_SPACE_GB
+    usable = max(0.0, (float(free_gb) - reserve_gb) * 1e9)
+    estimate.days_left = usable / bytes_per_day
+    estimate.headline += f" · {describe_days(estimate.days_left)} of space left"
+    if estimate.days_left < SPACE_RUNNING_LOW_DAYS:
+        estimate.level = LEVEL_WARN
+    return estimate
 
 
 # ---------------------------------------------------------------------------

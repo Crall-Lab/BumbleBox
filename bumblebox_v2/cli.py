@@ -6,6 +6,7 @@ import json
 import re
 import shlex
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -6001,6 +6002,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # Ctrl+C, and Cancel in the GUI (which sends SIGINT), must interrupt a
+    # command even when it was started from a launcher that ignores SIGINT;
+    # a process started that way inherits the ignore.
+    try:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    except (ValueError, OSError):  # not on the main thread
+        pass
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

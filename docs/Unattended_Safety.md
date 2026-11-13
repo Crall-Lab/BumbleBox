@@ -123,7 +123,7 @@ It refreshes every 30 seconds.
 
 | Card | What it tells you |
 |---|---|
-| Data storage | Whether the drive is mounted and how much space is free, or that recording will be refused and why |
+| Data storage | Whether the drive is mounted and how much space is free, or that recording will be refused and why. Once a recording exists, also the storage used per day and how many days of space are left (see below) |
 | Automated recording | Whether the schedule is on, when the next recording is, and whether the last scheduled run worked. A failed run shows its reason, for example the missing drive |
 | Latest recording | When the newest recording in the data folder was made and whether it succeeded |
 
@@ -141,6 +141,34 @@ choose to start.
 
 A command that fails in the GUI shows its reason in a message and in a red
 line above the command output, instead of only an exit code.
+
+**Cancel** appears beside that line while a command runs. It asks the command to
+stop the way Ctrl+C does, so a recording writes its summary (marked "Cancelled
+before it finished") and an encode-while-recording run keeps the video recorded
+so far. Frames still held in memory are lost. A recording asks for confirmation
+first. If a command does not stop within 15 seconds it is terminated, and after
+5 more seconds killed. Cancel has not been tested with two-Pi capture, where
+the other Pi may keep recording.
+
+**Stop Automated Recording** asks before stopping, and says when the next
+recording was due. A recording already in progress finishes normally; only
+later ones are not started.
+
+### Storage per day
+
+The estimate uses the size of the newest session folders (video, tracking files
+and everything else), divided by their frame count, times the frames per
+recording and recordings per day the current settings would make. Only
+successful recordings with the same resolution, video format, encoder speed and
+colour setting count, because those decide how big a frame is. "Days of space
+left" counts down to `system.min_free_space_gb`, where recording is refused.
+
+When the video settings change, there is no matching recording yet. The
+estimate then falls back to an encode benchmark run on one of your recordings
+(the Settings page does this), which measures the video file alone. Otherwise
+it reads "Storage per day not known yet" until one recording has been made.
+
+The card turns amber when less than a week of space is left.
 
 The result of the last scheduled run comes from systemd, which forgets it at
 reboot. After a restart the card reads "No scheduled run has happened yet"

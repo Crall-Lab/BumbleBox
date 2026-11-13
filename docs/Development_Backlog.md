@@ -49,6 +49,105 @@ See `docs/RealSense_Camera.md` for hardware validation and `docs/Multimodal_Cali
 - [x] Add asynchronous run history plus RGB, thermal, and RealSense result/artifact controls.
 - [ ] Port fleet management, alerts, and bundle export.
 - [ ] Remove the Tk bridge only after feature parity and Pi operator testing.
+- [x] Show data drive, schedule, and latest-recording status on Overview; explain
+      failed commands in plain words; review the schedule before starting it.
+      See `docs/Unattended_Safety.md`.
+- [ ] Validate the status cards against real BumbleBox timers on a Raspberry Pi,
+      including a failed scheduled run whose reason is read from the system log.
+- [x] Add a way to cancel a running command from the GUI. A cancelled recording
+      writes a summary and keeps any video already on disk.
+- [x] Ask for confirmation before Stop Automated Recording.
+- [x] Hide thermal, depth, and two-Pi result buttons, table columns, and detail
+      lines on boxes without that hardware (older recordings that used it keep them).
+- [x] Add a recording settings page: run mode, length, interval, frame rate,
+      grayscale, in-memory or encode-while-recording, format, encoder speed, and
+      the free-space limit, with an encode benchmark button. See
+      `docs/Streaming_Capture.md`.
+- [ ] Decide the default frame handling and encoder speed from
+      `bbx encode-benchmark` results on a Raspberry Pi 5. The defaults are
+      unchanged (`ram`, `auto`).
+- [x] State what the settings imply: storage used per day and days until the
+      drive is full, on the Overview storage card and the Settings page.
+- [ ] Check the storage estimate against a week of real recordings on a Pi.
+- [ ] Test Cancel during two-Pi capture; the other Pi may keep recording.
+
+## View-Only Status Page (Optional Add-On)
+
+**Status:** Not started; deferred on 2026-11-12
+
+**Goal:** Let an operator check a box from a laptop or phone browser, without a
+monitor, remote desktop, or the GUI being open.
+
+**Decision:** The PyQt GUI stays the main interface so that a box works with no
+network at all. A status page would be an add-on that is off unless enabled,
+and it would only show information.
+
+### What It Would Show
+
+- The same checks as the Overview cards in the GUI: data drive, recording
+  schedule, and the last scheduled run with its failure reason.
+- The most recent recordings and whether each succeeded.
+- The midpoint frame of the newest recording, which every run already saves, so
+  the operator can see that the nest is in frame and lit.
+
+### What It Would Not Do
+
+It would have no control that changes anything. Starting and stopping the
+schedule, setup, and the live camera monitor stay in the PyQt GUI. A page that
+can stop a recording needs a login. A view-only page does not, although anyone
+on the same network could open it.
+
+### How It Would Work
+
+- [ ] Add a small always-on command (for example `bbx status-serve`) that serves
+      one page and reloads it every 30 seconds.
+- [ ] Reuse `bumblebox_v2/box_status.py`, which has no GUI code, so the page and
+      the Overview cards cannot disagree.
+- [ ] Use Python's built-in web server so that no new package is installed on
+      the Pi.
+- [ ] Run it as its own systemd service, separate from the recording timers, so
+      a fault in the page cannot affect recording.
+- [ ] Serve the same status as JSON at a second address, so one page can later
+      list several boxes.
+- [ ] Keep it off unless enabled in the config.
+
+### To Solve First
+
+- [ ] Make the recent-recordings scan cheap. `status_history.list_recent_run_records`
+      reads every `*_run_summary.json` under the data folder, which is too slow
+      to repeat every 30 seconds on a full drive.
+- [ ] Confirm the page stays light while a recording is in progress. It should
+      read small files only and never serve video.
+- [ ] Decide whether the nest frame may be visible to anyone on the network.
+
+### Network Requirements
+
+The Pi and the viewing device must be on the same network, and that network
+must let devices talk to each other. Nothing is installed on the viewing device.
+
+| Network | Expected to work |
+|---|---|
+| Home router, or a router owned by the lab | Yes |
+| University Wi-Fi such as eduroam, or a guest network | Often not; these commonly block device-to-device traffic, and joining a Pi can need IT's help |
+| Wired Ethernet to a lab switch | Usually, though some networks require each device to be registered |
+
+Quick test: if SSH or remote desktop from the laptop to the Pi already works,
+the page will work on that network.
+
+The page would be opened at `http://<pi-name>.local:<port>`. Raspberry Pi OS
+announces that name by default. Macs, iPhones, Windows, and Linux resolve it;
+some Android phones do not, and the Pi's IP address is the fallback.
+
+If the network blocks device-to-device traffic:
+
+- Use a small dedicated router for the boxes. Keep an internet uplink, because
+  the Pis set their clocks from the network and recording times depend on that.
+- Run the Pi as its own Wi-Fi hotspot and join it when standing near the box.
+  This reaches one box at a time.
+- Use a private network service such as Tailscale. It also works off site, but
+  needs an account and an install on every device.
+
+None of this has been built or tested.
 
 ## RGB and Thermal Camera Synchronization
 

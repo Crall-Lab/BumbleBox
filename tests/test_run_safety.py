@@ -379,3 +379,74 @@ class RunSafetyConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CancelTests(unittest.TestCase):
+    """Cancel in the GUI sends SIGINT, which Python raises as KeyboardInterrupt."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        lock = patch.dict(os.environ, {"BUMBLEBOX_CAPTURE_LOCK": str(Path(self._tmp.name) / "capture.lock")})
+        lock.start()
+        self.addCleanup(lock.stop)
+
+    def _mock_config(self, frame_buffer: str) -> dict:
+        config = _config(str(Path(self._tmp.name) / "data"))
+        config["local_index"]["enabled"] = False
+        config["pipeline"]["mode"] = "record_only"
+        config["camera"].update({"width": 64, "height": 48, "codec": "mp4"})
+        config["capture"].update({"recording_seconds": 4, "frame_buffer": frame_buffer})
+        config["runtime"].update({"use_mock_camera": True, "fps_report_on_each_recording": False})
+        return config
+
+    def _interrupt_after(self, frames: int):
+        original = run_engine.simulated_rgb_yuv420_frame
+        calls = {"count": 0}
+
+        def frame(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] > frames:
+                raise KeyboardInterrupt
+            return original(*args, **kwargs)
+
+        return patch.object(run_engine, "simulated_rgb_yuv420_frame", frame)
+
+    def test_cancelled_stream_recording_keeps_its_partial_file_and_writes_a_summary(self) -> None:
+        with self._interrupt_after(5):
+            summary = run_engine.run_once(config=self._mock_config("stream"))
+        self.assertFalse(summary.success)
+        self.assertIn("Cancelled before it finished", " ".join(summary.errors))
+        session = Path(summary.session_dir)
+        self.assertTrue((session / f"{summary.session_name}_run_summary.json").is_file())
+        partial = session / f"{summary.session_name}.capture.mkv"
+        self.assertTrue(partial.is_file() and partial.stat().st_size > 0)
+        self.assertIn("partial stream recording was kept", " ".join(summary.warnings))
+        with capture_lock(0, lock_path=Path(os.environ["BUMBLEBOX_CAPTURE_LOCK"])):
+            pass  # the cancelled run released the camera
+
+    def test_cancelled_ram_recording_is_recorded_as_failed(self) -> None:
+        with self._interrupt_after(5):
+            summary = run_engine.run_once(config=self._mock_config("ram"))
+        self.assertFalse(summary.success)
+        self.assertIn("Cancelled before it finished", " ".join(summary.errors))
+        self.assertIsNone(summary.video_path)
+        self.assertTrue((Path(summary.session_dir) / f"{summary.session_name}_run_summary.json").is_file())
+
+    def test_bbx_honours_ctrl_c_even_when_started_with_it_ignored(self) -> None:
+        import argparse
+        import signal
+
+        seen = {}
+
+        class FakeParser:
+            def parse_args(self, _argv):
+                return argparse.Namespace(func=lambda _args: seen.setdefault("handler", signal.getsignal(signal.SIGINT)) and 0)
+
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            with patch.object(cli, "build_parser", return_value=FakeParser()):
+                cli.main([])
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        self.assertIs(seen["handler"], signal.default_int_handler)

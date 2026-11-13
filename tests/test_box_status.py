@@ -467,6 +467,186 @@ class StartReviewTests(unittest.TestCase):
         self.assertIn("could not be checked", review.problems[0])
 
 
+def benchmark_report(*, width=4056, height=3040, mono=False, source="video: /data/a.mp4", results=None):
+    return {
+        "width": width,
+        "height": height,
+        "frames": 24,
+        "fps_target": 5.0,
+        "monochrome_output": mono,
+        "source": source,
+        "work_dir": "/tmp",
+        "results": results
+        if results is not None
+        else [
+            {"label": "mjpeg", "codec": "mjpeg", "mp4_codec": None, "mp4_preset": None,
+             "frames_per_second": 9.8, "megabytes_per_frame": 2.9, "error": None},
+            {"label": "libx264:ultrafast", "codec": "mp4", "mp4_codec": "libx264", "mp4_preset": "ultrafast",
+             "frames_per_second": 7.1, "megabytes_per_frame": 1.9, "error": None},
+            {"label": "libx264:fast", "codec": "mp4", "mp4_codec": "libx264", "mp4_preset": "fast",
+             "frames_per_second": 1.4, "megabytes_per_frame": 1.1, "error": None},
+        ],
+    }
+
+
+class StorageEstimateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = load_defaults()  # 20 s at 5 fps every 30 min: 100 frames, 48 recordings a day
+        self.signature = box_status.recording_signature(self.config)
+
+    def run_record(self, *, size=150e6, frames=100, success=True, mode="record_and_track", signature=None):
+        return {
+            "success": success,
+            "mode": mode,
+            "frames_captured": frames,
+            "_session_bytes": size,
+            "_recording_signature": signature if signature is not None else self.signature,
+        }
+
+    def test_recordings_per_day_follows_the_timer_slots(self) -> None:
+        self.assertEqual(box_status.recordings_per_day(self.config), 48)
+        self.config["capture"]["record_interval_minutes"] = 7  # 0, 7, ..., 1435: 206 slots
+        self.assertEqual(box_status.recordings_per_day(self.config), 206)
+        self.config["pipeline"]["mode"] = "track_only"
+        self.assertEqual(box_status.recordings_per_day(self.config), 0)
+
+    def test_estimate_from_matching_recordings(self) -> None:
+        estimate = box_status.estimate_storage(self.config, [self.run_record(), self.run_record(size=250e6)], free_gb=212)
+        # 2 MB per frame x 100 frames x 48 recordings = 9.6 GB a day; (212 - 1) GB / 9.6 GB = 22 days
+        self.assertAlmostEqual(estimate.bytes_per_day, 9.6e9)
+        self.assertAlmostEqual(estimate.days_left, 211 / 9.6)
+        self.assertEqual(estimate.level, LEVEL_OK)
+        self.assertEqual(estimate.headline, "About 9.6 GB per day · about 22 days of space left")
+        self.assertIn("200 MB per recording, 48 recordings a day", estimate.detail)
+        self.assertIn("last 2 recordings", estimate.detail)
+
+    def test_length_and_rate_scale_the_estimate(self) -> None:
+        self.config["capture"]["recording_seconds"] = 40
+        self.config["camera"]["fps_target"] = 10.0
+        estimate = box_status.estimate_storage(self.config, [self.run_record()])
+        self.assertAlmostEqual(estimate.bytes_per_recording, 1.5e6 * 400)
+        self.assertIsNone(estimate.days_left)
+
+    def test_recordings_with_other_video_settings_failures_and_tracking_runs_are_ignored(self) -> None:
+        other = ("mjpeg", "-", False, 4056, 3040)
+        runs = [
+            self.run_record(signature=other),
+            self.run_record(success=False),
+            self.run_record(mode="track_only"),
+            self.run_record(frames=0),
+            {"success": True, "mode": "record_only", "frames_captured": 100},
+        ]
+        estimate = box_status.estimate_storage(self.config, runs, free_gb=212)
+        self.assertEqual((estimate.level, estimate.headline), (LEVEL_OFF, "Storage per day not known yet"))
+        self.assertIn("4056 × 3040, MP4 (fast), colour", estimate.detail)
+
+    def test_little_space_left_is_a_warning(self) -> None:
+        estimate = box_status.estimate_storage(self.config, [self.run_record()], free_gb=30)
+        self.assertEqual(estimate.level, LEVEL_WARN)
+        self.assertIn("about 4 days of space left", estimate.headline)
+
+    def test_reserve_is_subtracted_from_free_space(self) -> None:
+        self.config["system"]["min_free_space_gb"] = 50
+        estimate = box_status.estimate_storage(self.config, [self.run_record()], free_gb=40)
+        self.assertEqual(estimate.days_left, 0)
+        self.assertIn("less than 2 hours", estimate.headline)
+
+    def test_track_only_records_nothing(self) -> None:
+        self.config["pipeline"]["mode"] = "track_only"
+        estimate = box_status.estimate_storage(self.config, [self.run_record()], free_gb=212)
+        self.assertEqual((estimate.level, estimate.headline), (LEVEL_OFF, "No new video"))
+
+    def test_benchmark_on_real_footage_fills_in_when_no_recording_matches(self) -> None:
+        self.config["capture"]["frame_buffer"] = "stream"  # auto preset becomes ultrafast
+        estimate = box_status.estimate_storage(self.config, [self.run_record()], free_gb=212, benchmark=benchmark_report())
+        self.assertAlmostEqual(estimate.bytes_per_recording, 1.9e6 * 100)
+        self.assertIn("Video only, from the encode benchmark", estimate.detail)
+
+        synthetic = benchmark_report(source="synthetic nest-like frames")
+        unknown = box_status.estimate_storage(self.config, [], benchmark=synthetic)
+        self.assertEqual(unknown.headline, "Storage per day not known yet")
+
+        other_size = benchmark_report(width=2028, height=1520)
+        self.assertEqual(box_status.estimate_storage(self.config, [], benchmark=other_size).level, LEVEL_OFF)
+
+    def test_matching_recordings_win_over_the_benchmark(self) -> None:
+        estimate = box_status.estimate_storage(self.config, [self.run_record()], benchmark=benchmark_report())
+        self.assertIn("Measured from the last recording", estimate.detail)
+
+    def test_text_helpers(self) -> None:
+        self.assertEqual(box_status.format_bytes(7.25e9), "7.2 GB")
+        self.assertEqual(box_status.format_bytes(274e9), "274 GB")
+        self.assertEqual(box_status.format_bytes(512), "512 B")
+        self.assertEqual(box_status.describe_days(0.8), "about 19 hours")
+        self.assertEqual(box_status.describe_days(29.4), "about 29 days")
+        self.assertEqual(box_status.describe_days(120), "about 4 months")
+        self.assertEqual(box_status.describe_days(1000), "about 3 years")
+
+
+class BenchmarkTests(unittest.TestCase):
+    def test_selected_encoder_is_found_in_the_report(self) -> None:
+        config = load_defaults()
+        self.assertEqual(box_status.benchmark_result_for(config, benchmark_report())["mp4_preset"], "fast")
+        config["camera"]["codec"] = "mjpeg"
+        self.assertEqual(box_status.benchmark_result_for(config, benchmark_report())["codec"], "mjpeg")
+        config["camera"]["codec"] = "mp4"
+        config["camera"]["mp4_preset"] = "veryfast"
+        self.assertIsNone(box_status.benchmark_result_for(config, benchmark_report()))
+        config["camera"]["mp4_preset"] = "auto"
+        config["camera"]["monochrome_output"] = True
+        self.assertIsNone(box_status.benchmark_result_for(config, benchmark_report()))
+
+    def test_failed_encoders_are_skipped(self) -> None:
+        report = benchmark_report(results=[
+            {"label": "libx264:fast", "codec": "mp4", "mp4_codec": "libx264", "mp4_preset": "fast",
+             "frames_per_second": 0, "megabytes_per_frame": 0, "error": "ffmpeg not found"},
+        ])
+        self.assertIsNone(box_status.benchmark_result_for(load_defaults(), report))
+
+    def test_keeps_up_uses_the_benchmark_headroom(self) -> None:
+        self.assertEqual(box_status.keeps_up(7.5, 5), "yes")
+        self.assertEqual(box_status.keeps_up(7.1, 5), "marginal")
+        self.assertEqual(box_status.keeps_up(4.9, 5), "no")
+        self.assertEqual(box_status.keeps_up(None, 5), "n/a")
+
+    def test_saved_report_round_trip(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bench.json"
+            self.assertIsNone(box_status.load_benchmark(path))
+            path.write_text("not json")
+            self.assertIsNone(box_status.load_benchmark(path))
+            path.write_text(json.dumps(benchmark_report()))
+            self.assertEqual(box_status.load_benchmark(path)["width"], 4056)
+
+
+class SessionFilesTests(unittest.TestCase):
+    def test_session_size_counts_nested_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a.mp4").write_bytes(b"x" * 1000)
+            (root / "depth").mkdir()
+            (root / "depth" / "b.npy").write_bytes(b"x" * 500)
+            self.assertEqual(box_status.session_size_bytes(root), 1500)
+            self.assertIsNone(box_status.session_size_bytes(root / "missing"))
+            self.assertIsNone(box_status.session_size_bytes(root, max_files=1))
+
+    def test_signature_is_read_from_the_config_snapshot(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "snap.json"
+            config = load_defaults()
+            config["camera"]["monochrome_output"] = True
+            snapshot.write_text(json.dumps(config))
+            self.assertEqual(
+                box_status.signature_from_snapshot(snapshot), ("mp4", "fast", True, 4056, 3040)
+            )
+            self.assertIsNone(box_status.signature_from_snapshot(Path(directory) / "missing.json"))
+            self.assertIsNone(box_status.signature_from_snapshot(""))
+
+
 class CollectTests(unittest.TestCase):
     def test_collect_never_raises(self) -> None:
         status = box_status.collect_box_status({})

@@ -38,6 +38,32 @@ Useful options:
 The benchmark measures the encoder alone. The camera pipeline also uses CPU
 during a real recording, so treat a "marginal" result as too slow.
 
+## Choosing in the GUI
+
+The **Settings** page of `bbx gui` sets the frame handling (in memory or encode
+while recording), video format, encoder speed, frame rate, recording length and
+interval. Below the fields it shows what the settings mean: recordings per day,
+memory per recording, storage per day and days of space left, and any problem
+the schedule check finds. Nothing is saved until **Save Settings**.
+
+**Run Encode Benchmark** on that page runs `bbx encode-benchmark` with the
+frame rate and colour setting on the page, using your newest recording at the
+camera's resolution when there is one. The result is kept (in
+`~/.local/share/BumbleBox/`), and the page then
+says whether the selected encoder keeps up with the camera. In stream mode an
+encoder that was slower than the camera is listed as a problem, and a marginal
+one as a warning. The benchmark is also used to estimate storage for video
+settings that have not been recorded with yet.
+
+Frame rate, format and grayscale are locked when a named camera profile (for
+example "HQ Reference") is selected, because saving the config re-applies the
+profile. **Use Custom Camera Settings** switches the box to the Custom profile,
+keeping the current values, so they can be changed.
+
+If the recording schedule is running and the change affects its timers (run
+mode, interval or recording length), saving offers to restart the schedule with
+the new settings. Other changes are used by the next recording without that.
+
 ## Turning it on
 
 ```yaml

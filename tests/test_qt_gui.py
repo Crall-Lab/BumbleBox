@@ -45,7 +45,7 @@ class QtGuiTests(unittest.TestCase):
             window = BumbleBoxQtGUI(config_path)
             wizard = BumbleBoxSetupWizard(config_path, config)
             try:
-                self.assertEqual(window.pages.count(), 5)
+                self.assertEqual(window.pages.count(), 6)
                 self.assertEqual(window.live_monitor_button.text(), "Open Live Camera Monitor")
 
                 wizard.hardware_page.profile.setCurrentIndex(

@@ -3106,9 +3106,17 @@ def run_once(
             "Recording and analysis outputs are complete; finalizing the run summary.",
         )
 
-    except Exception as exc:
-        errors.append(str(exc))
-        _progress_message("error", str(exc))
+    except (Exception, KeyboardInterrupt) as exc:
+        # KeyboardInterrupt is Ctrl+C, or Cancel in the GUI (which sends
+        # SIGINT). Record it like a failure so the run still gets a summary
+        # and a partial stream recording is closed cleanly.
+        message = (
+            "Cancelled before it finished (interrupted by the user)."
+            if isinstance(exc, KeyboardInterrupt)
+            else str(exc)
+        )
+        errors.append(message)
+        _progress_message("error", message)
         if stream_writer is not None and streamed_video is None:
             # Capture or encoding failed part-way. Let the encoder close its
             # file cleanly so whatever was recorded so far stays readable.

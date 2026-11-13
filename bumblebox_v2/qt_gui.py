@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime
 import os
+import signal
 from pathlib import Path
 import sys
 import tempfile
@@ -32,6 +33,7 @@ try:
         QApplication,
         QCheckBox,
         QComboBox,
+        QDoubleSpinBox,
         QFileDialog,
         QFormLayout,
         QFrame,
@@ -71,19 +73,36 @@ from .box_status import (
     LEVEL_OFF,
     LEVEL_OK,
     LEVEL_WARN,
+    RECORDING_RUN_MODES,
+    SCHEDULE_OFF,
+    SCHEDULE_ON,
+    SCHEDULE_PARTIAL,
     BoxStatus,
     FailureExplanation,
+    StorageEstimate,
     StartReview,
     collect_box_status,
     command_label,
     describe_moment,
     describe_relative,
+    benchmark_matches_camera,
+    benchmark_result_for,
+    describe_days,
+    estimate_storage,
     explain_failure,
+    format_bytes,
+    installed_units_are_current,
+    keeps_up,
+    load_benchmark,
+    recording_signature,
+    recordings_per_day,
     format_start_review,
     review_schedule_start,
+    session_size_bytes,
+    signature_from_snapshot,
 )
 from .camera_profiles import CAMERA_PROFILES, apply_camera_profile
-from .config import DEFAULT_USER_CONFIG_PATH, load_config, load_defaults, save_config
+from .config import DEFAULT_USER_CONFIG_PATH, load_config, load_defaults, save_config, validate_config
 from .hardware_profiles import HARDWARE_PROFILES, apply_hardware_profile
 from .multimodal_calibration import (
     MANIFEST_NAME as CALIBRATION_MANIFEST_NAME,
@@ -92,13 +111,69 @@ from .multimodal_calibration import (
     get_calibration_project_status,
     initialize_calibration_project,
 )
+from .schedule_check import run_schedule_check
 from .status_history import list_recent_run_records, load_run_summary
+from .stream_writer import FRAME_BUFFER_STREAM, frame_buffer_mode
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BBX_SCRIPT = REPO_ROOT / "bbx.py"
 
+NAV_TITLES = ("Overview", "Run", "Results", "Hardware", "Settings", "Advanced")
+PAGE_INDEX_OVERVIEW = 0
+PAGE_INDEX_RUN = 1
+PAGE_INDEX_RESULTS = 2
+PAGE_INDEX_HARDWARE = 3
+PAGE_INDEX_SETTINGS = 4
+PAGE_INDEX_ADVANCED = 5
+
 STATUS_REFRESH_MS = 30_000
+SETTINGS_PREVIEW_DELAY_MS = 250
+DEFAULT_BENCHMARK_ENCODERS = ("mjpeg", "libx264:ultrafast", "libx264:veryfast", "libx264:fast")
+MP4_PRESET_CHOICES = (
+    ("auto", "Automatic (ultrafast while recording, fast afterwards)"),
+    ("ultrafast", "Ultrafast (largest files, least CPU)"),
+    ("superfast", "Superfast"),
+    ("veryfast", "Very fast"),
+    ("faster", "Faster"),
+    ("fast", "Fast"),
+    ("medium", "Medium"),
+    ("slow", "Slow (smallest files, most CPU)"),
+)
+FRAME_BUFFER_HINTS = {
+    "ram": (
+        "Every frame is kept in memory until the recording ends, then encoded. Gives the "
+        "highest frame rate, but memory use grows with recording length."
+    ),
+    "stream": (
+        "Frames are encoded to disk during the recording, so memory use stays small and "
+        "recordings can be long. The encoder must keep up with the camera."
+    ),
+}
+# Settings fixed by a named camera profile are shown but cannot be edited here.
+PROFILE_CONTROLLED_SETTINGS = {
+    "camera.fps_target": "fps_target",
+    "camera.codec": "codec",
+    "camera.monochrome_output": "monochrome_output",
+}
+# Cancel asks the command to stop (SIGINT, like Ctrl+C) so it can close files
+# and write its summary, then insists if it does not stop.
+CANCEL_INTERRUPT_GRACE_MS = 15_000
+CANCEL_TERMINATE_GRACE_MS = 5_000
+# Session folders measured for the storage-per-day estimate.
+STORAGE_ESTIMATE_SCAN_RUNS = 25
+
+# Result buttons that only make sense with a given piece of hardware.
+RESULT_BUTTON_HARDWARE = {
+    "thermal": "thermal",
+    "depth": "realsense",
+    "depth_color": "realsense",
+    "depth_data": "realsense",
+    "metadata": "realsense",
+    "manifest": "distributed",
+    "calibration": "multimodal",
+    "sync": "multimodal",
+}
 _LEVEL_LABEL_NAMES = {
     LEVEL_OK: "StatusGood",
     LEVEL_WARN: "StatusWarn",
@@ -303,19 +378,26 @@ QPushButton#Primary:disabled, QPushButton#Accent:disabled, QPushButton#Quiet:dis
     color: #a4aaa6;
     border-color: #e2e5e1;
 }
-QLineEdit, QComboBox, QSpinBox {
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     background: #ffffff;
     border: 1px solid #ccd3ce;
     border-radius: 9px;
     padding: 8px 10px;
     selection-background-color: #b9d9cf;
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
     border: 2px solid #4d8b7d;
     padding: 7px 9px;
 }
+QSpinBox, QDoubleSpinBox { min-width: 96px; }
+QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled { background: #f1f3f0; color: #8d9692; }
+/* The styled step buttons have no arrow images and render as blank bars, so
+   they are hidden; values are typed, or changed with the arrow keys. */
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; border: none; }
 QComboBox::drop-down { border: none; width: 24px; }
 QCheckBox { spacing: 9px; color: #40524e; }
+QCheckBox:disabled { color: #9aa39f; }
 QCheckBox::indicator { width: 17px; height: 17px; }
 QToolTip {
     background: #263b37;
@@ -415,6 +497,24 @@ QWizard QLabel { background: transparent; }
 """
 
 
+def _encode_benchmark_path() -> Path:
+    """Where the settings page keeps the last encode benchmark run on this computer."""
+    base = QStandardPaths.writableLocation(QStandardPaths.GenericDataLocation)
+    root = Path(base) if base else Path.home() / ".local" / "share"
+    return root / "BumbleBox" / "encode_benchmark_latest.json"
+
+
+def _set_nested(config: dict[str, Any], dotted_key: str, value: Any) -> None:
+    section, _, key = dotted_key.partition(".")
+    config.setdefault(section, {})[key] = value
+
+
+def _get_nested(config: dict[str, Any], dotted_key: str, default: Any = None) -> Any:
+    section, _, key = dotted_key.partition(".")
+    values = config.get(section)
+    return values.get(key, default) if isinstance(values, dict) else default
+
+
 def _load_config_or_defaults(path: Path) -> dict[str, Any]:
     return load_config(path) if path.exists() else load_defaults()
 
@@ -432,6 +532,20 @@ def _page_heading(title: str, subtitle: str) -> tuple[QLabel, QLabel]:
     description.setObjectName("Subtitle")
     description.setWordWrap(True)
     return heading, description
+
+
+class _WheelOnlyWhenFocused(QObject):
+    """Stops the mouse wheel from changing a field the pointer merely passes over.
+
+    On a scrolling page, a spin box or drop-down under the pointer would
+    otherwise take the wheel and change its value instead of scrolling.
+    """
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Wheel and isinstance(watched, QWidget) and not watched.hasFocus():
+            event.ignore()
+            return True
+        return super().eventFilter(watched, event)
 
 
 class _FitScrollArea(QScrollArea):
@@ -465,6 +579,10 @@ class _RunHistorySignals(QObject):
     finished = pyqtSignal(int, object, object)
 
 
+def _is_finished_recording(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("success", False)) and str(payload.get("mode")) in RECORDING_RUN_MODES
+
+
 class _RunHistoryWorker(QRunnable):
     def __init__(self, generation: int, data_root: str, limit: int = 60) -> None:
         super().__init__()
@@ -482,6 +600,7 @@ class _RunHistoryWorker(QRunnable):
 
     def run(self) -> None:
         payloads: list[dict[str, Any]] = []
+        measured = 0
         try:
             for record in list_recent_run_records(self.data_root, limit=self.limit):
                 try:
@@ -499,6 +618,10 @@ class _RunHistoryWorker(QRunnable):
                     if recorded_session_text and recorded_session_dir.exists()
                     else record.summary_path.parent.resolve()
                 )
+                if measured < STORAGE_ESTIMATE_SCAN_RUNS and _is_finished_recording(payload):
+                    measured += 1
+                    payload["_session_bytes"] = session_size_bytes(payload["_session_dir_local"])
+                    payload["_recording_signature"] = signature_from_snapshot(payload.get("config_snapshot_path"))
                 payloads.append(payload)
         except Exception as exc:
             self._emit_finished([], str(exc))
@@ -1132,12 +1255,26 @@ class BumbleBoxQtGUI(QMainWindow):
         self._last_scheduled_run_seen: datetime | None = None
         self._current_command: list[str] = []
         self._command_output: list[str] = []
+        self._cancel_requested = False
+        self._cancelled_steps = 0
+        self._cancel_stage = 0
+        self._storage_estimate: StorageEstimate | None = None
+        self.encode_benchmark_path = _encode_benchmark_path()
+        self._settings_loading = False
+        self._settings_saved_values: dict[str, Any] | None = None
+        self._settings_profile_override: str | None = None
         self.thread_pool = QThreadPool.globalInstance()
         self.process = QProcess(self)
         self.process.setProcessChannelMode(QProcess.MergedChannels)
         self.process.readyReadStandardOutput.connect(self._read_process_output)
         self.process.finished.connect(self._process_finished)
         self.process.errorOccurred.connect(self._process_error)
+        self._cancel_timer = QTimer(self)
+        self._cancel_timer.setSingleShot(True)
+        self._cancel_timer.timeout.connect(self._escalate_cancel)
+        self._settings_preview_timer = QTimer(self)
+        self._settings_preview_timer.setSingleShot(True)
+        self._settings_preview_timer.timeout.connect(self._refresh_settings_preview)
         self.setWindowTitle("BumbleBox")
         self.resize(1180, 780)
         self.setMinimumSize(940, 660)
@@ -1173,7 +1310,7 @@ class BumbleBoxQtGUI(QMainWindow):
         side_layout.addWidget(sub)
         self.navigation = QListWidget()
         self.navigation.setSpacing(3)
-        for title in ("Overview", "Run", "Results", "Hardware", "Advanced"):
+        for title in NAV_TITLES:
             self.navigation.addItem(QListWidgetItem(title))
         self.navigation.currentRowChanged.connect(self._navigate)
         side_layout.addWidget(self.navigation, 1)
@@ -1201,6 +1338,7 @@ class BumbleBoxQtGUI(QMainWindow):
         self.pages.addWidget(self._build_run_page())
         self.pages.addWidget(self._build_results_page())
         self.pages.addWidget(self._build_hardware_page())
+        self.pages.addWidget(self._build_settings_page())
         self.pages.addWidget(self._build_advanced_page())
         content_layout.addWidget(self.pages, 1)
         layout.addWidget(content, 1)
@@ -1411,7 +1549,7 @@ class BumbleBoxQtGUI(QMainWindow):
         )
         self.latest_results_button = QPushButton("View All Results")
         self.latest_results_button.setObjectName("Primary")
-        self.latest_results_button.clicked.connect(lambda: self.navigation.setCurrentRow(2))
+        self.latest_results_button.clicked.connect(lambda: self.navigation.setCurrentRow(PAGE_INDEX_RESULTS))
         latest_buttons.addWidget(self.latest_session_button)
         latest_buttons.addWidget(self.latest_depth_button)
         latest_buttons.addWidget(self.latest_results_button)
@@ -1426,12 +1564,21 @@ class BumbleBoxQtGUI(QMainWindow):
         controls.setAutoFillBackground(False)
         scroll.viewport().setAutoFillBackground(False)
         layout.addWidget(scroll)
+        command_row = QHBoxLayout()
+        command_row.setSpacing(10)
         self.command_status = QLabel("")
         self.command_status.setObjectName("StatusNeutral")
         self.command_status.setWordWrap(True)
         self.command_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.command_status.setVisible(False)
-        layout.addWidget(self.command_status)
+        command_row.addWidget(self.command_status, 1)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setObjectName("Quiet")
+        self.cancel_button.setToolTip("Stop the command that is running now.")
+        self.cancel_button.setVisible(False)
+        self.cancel_button.clicked.connect(self._cancel_command)
+        command_row.addWidget(self.cancel_button, 0, Qt.AlignVCenter)
+        layout.addLayout(command_row)
         layout.addWidget(self._build_console(), 1)
         return page
 
@@ -1442,7 +1589,7 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.setSpacing(12)
         heading, subtitle = _page_heading(
             "Recording results",
-            "Inspect recent multimodal runs and open RGB, thermal, and RealSense outputs without searching through folders.",
+            "Recent recordings and their files. Select one to open its video or folder.",
         )
         layout.addWidget(heading)
         layout.addWidget(subtitle)
@@ -1481,6 +1628,7 @@ class BumbleBoxQtGUI(QMainWindow):
         self.result_detail.setWordWrap(True)
         selected_layout.addWidget(self.result_detail)
         artifact_buttons = QGridLayout()
+        self.result_button_grid = artifact_buttons
         button_specs = (
             ("session", "Open Session Folder", "_session_dir_local"),
             ("rgb", "Open RGB Video", "video_path"),
@@ -1503,7 +1651,6 @@ class BumbleBoxQtGUI(QMainWindow):
                 )
             )
             button.setEnabled(False)
-            artifact_buttons.addWidget(button, index // 3, index % 3)
             self.result_artifact_buttons[key] = (button, payload_key)
         self.result_add_calibration_button = QPushButton("Add to Calibration Project")
         self.result_add_calibration_button.setObjectName("Primary")
@@ -1512,7 +1659,6 @@ class BumbleBoxQtGUI(QMainWindow):
         )
         self.result_add_calibration_button.clicked.connect(self._add_selected_run_to_calibration)
         self.result_add_calibration_button.setEnabled(False)
-        artifact_buttons.addWidget(self.result_add_calibration_button, 2, 2)
         self.result_sync_analysis_button = QPushButton("Analyze Shared Timing Cue")
         self.result_sync_analysis_button.setObjectName("Quiet")
         self.result_sync_analysis_button.setToolTip(
@@ -1520,7 +1666,14 @@ class BumbleBoxQtGUI(QMainWindow):
         )
         self.result_sync_analysis_button.clicked.connect(self._analyze_selected_run_sync)
         self.result_sync_analysis_button.setEnabled(False)
-        artifact_buttons.addWidget(self.result_sync_analysis_button, 3, 0)
+        # Laid out by _layout_result_buttons(), which leaves out buttons for
+        # hardware this box does not have.
+        self.result_button_order: list[tuple[str, QPushButton]] = [
+            *((key, button) for key, (button, _) in self.result_artifact_buttons.items()),
+            ("calibration", self.result_add_calibration_button),
+            ("sync", self.result_sync_analysis_button),
+        ]
+        self._visible_result_buttons: tuple[str, ...] = ()
         selected_layout.addLayout(artifact_buttons)
         layout.addWidget(selected)
         return page
@@ -1591,6 +1744,571 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.addWidget(change, 0, Qt.AlignLeft)
         layout.addStretch(1)
         return page
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
+        heading, subtitle = _page_heading(
+            "Recording settings",
+            "What each recording captures and how it is saved. Changes apply from the next recording.",
+        )
+        layout.addWidget(heading)
+        layout.addWidget(subtitle)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 8, 0)
+        content_layout.setSpacing(12)
+
+        def form_box(title: str, tone: str) -> tuple[QGroupBox, QFormLayout]:
+            box = QGroupBox(title)
+            box.setProperty("tone", tone)
+            form = QFormLayout(box)
+            form.setHorizontalSpacing(18)
+            form.setVerticalSpacing(10)
+            form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+            return box, form
+
+        def hint(text: str = "") -> QLabel:
+            label = QLabel(text)
+            label.setObjectName("Hint")
+            label.setWordWrap(True)
+            # Without Expanding, a form keeps a wrapped label at its natural
+            # width and can cut off its last line.
+            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            return label
+
+        def row_label(text: str = "") -> QLabel:
+            # One label width for every group, so the fields line up down the page.
+            label = QLabel(text)
+            label.setFixedWidth(176)
+            return label
+
+        schedule_box, schedule_form = form_box("Schedule", "mint")
+        self.settings_mode = QComboBox()
+        for value, label in (
+            ("record_and_track", "Record, then track"),
+            ("record_only", "Record only"),
+            ("mixed_schedule", "Record and track on separate schedules"),
+            ("track_only", "Track existing videos only"),
+        ):
+            self.settings_mode.addItem(label, value)
+        self.settings_recording_seconds = QSpinBox()
+        self.settings_recording_seconds.setRange(1, 86400)
+        self.settings_recording_seconds.setSuffix(" s")
+        self.settings_record_interval = QSpinBox()
+        self.settings_record_interval.setRange(1, 1440)
+        self.settings_record_interval.setSuffix(" min")
+        self.settings_track_interval = QSpinBox()
+        self.settings_track_interval.setRange(1, 1440)
+        self.settings_track_interval.setSuffix(" min")
+        self._settings_track_interval_label = row_label("Track every")
+        schedule_form.addRow(row_label("Run mode"), self.settings_mode)
+        schedule_form.addRow(row_label("Record for"), self.settings_recording_seconds)
+        schedule_form.addRow(row_label("Record every"), self.settings_record_interval)
+        schedule_form.addRow(self._settings_track_interval_label, self.settings_track_interval)
+        content_layout.addWidget(schedule_box)
+
+        camera_box, camera_form = form_box("Camera", "peach")
+        self.settings_fps = QDoubleSpinBox()
+        self.settings_fps.setRange(0.1, 120.0)
+        self.settings_fps.setDecimals(2)
+        self.settings_fps.setSingleStep(0.5)
+        self.settings_fps.setSuffix(" fps")
+        self.settings_resolution = QLabel()
+        self.settings_resolution.setWordWrap(True)
+        self.settings_resolution.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.settings_monochrome = QCheckBox("Save grayscale video (smaller files)")
+        self.settings_profile_note = hint()
+        self.settings_custom_camera_button = QPushButton("Use Custom Camera Settings")
+        self.settings_custom_camera_button.setObjectName("Quiet")
+        self.settings_custom_camera_button.setToolTip(
+            "Keeps the profile's current values and lets you change them here. Applied when you save."
+        )
+        self.settings_custom_camera_button.clicked.connect(self._use_custom_camera_settings)
+        self._settings_profile_row = QWidget()
+        profile_row = QHBoxLayout(self._settings_profile_row)
+        profile_row.setContentsMargins(0, 0, 0, 0)
+        profile_row.addWidget(self.settings_profile_note, 1)
+        profile_row.addWidget(self.settings_custom_camera_button, 0, Qt.AlignVCenter)
+        self._settings_profile_row_label = row_label()
+        camera_form.addRow(row_label("Frame rate"), self.settings_fps)
+        camera_form.addRow(row_label("Resolution"), self.settings_resolution)
+        camera_form.addRow(row_label(), self.settings_monochrome)
+        camera_form.addRow(self._settings_profile_row_label, self._settings_profile_row)
+        content_layout.addWidget(camera_box)
+
+        video_box, video_form = form_box("Video", "sky")
+        self.settings_frame_buffer = QComboBox()
+        self.settings_frame_buffer.addItem("Hold frames in memory, encode afterwards", "ram")
+        self.settings_frame_buffer.addItem("Encode while recording", "stream")
+        self.settings_frame_buffer_hint = hint()
+        self.settings_codec = QComboBox()
+        self.settings_codec.addItem("MP4 (H.264)", "mp4")
+        self.settings_codec.addItem("MJPEG (AVI, much larger files)", "mjpeg")
+        self.settings_preset = QComboBox()
+        for value, label in MP4_PRESET_CHOICES:
+            self.settings_preset.addItem(label, value)
+        self._settings_preset_label = row_label("MP4 encoder speed")
+        self.settings_benchmark_label = hint()
+        self.settings_benchmark_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.settings_benchmark_button = QPushButton("Run Encode Benchmark")
+        self.settings_benchmark_button.setObjectName("Quiet")
+        self.settings_benchmark_button.setToolTip(
+            "Times each encoder at this resolution on this computer, using your latest recording "
+            "when there is one. Takes a minute or two; output appears on the Run page."
+        )
+        self.settings_benchmark_button.clicked.connect(self._run_encode_benchmark)
+        benchmark_row = QVBoxLayout()
+        benchmark_row.setSpacing(8)
+        benchmark_row.addWidget(self.settings_benchmark_label)
+        benchmark_row.addWidget(self.settings_benchmark_button, 0, Qt.AlignLeft)
+        video_form.addRow(row_label("Frame handling"), self.settings_frame_buffer)
+        video_form.addRow(row_label(), self.settings_frame_buffer_hint)
+        video_form.addRow(row_label("Format"), self.settings_codec)
+        video_form.addRow(self._settings_preset_label, self.settings_preset)
+        video_form.addRow(row_label("Encode benchmark"), benchmark_row)
+        content_layout.addWidget(video_box)
+
+        storage_box, storage_form = form_box("Storage", "sun")
+        self.settings_min_free = QDoubleSpinBox()
+        self.settings_min_free.setRange(0.0, 10000.0)
+        self.settings_min_free.setDecimals(1)
+        self.settings_min_free.setSuffix(" GB free")
+        storage_form.addRow(row_label("Refuse to record below"), self.settings_min_free)
+        content_layout.addWidget(storage_box)
+
+        effects = QGroupBox("What these settings mean")
+        effects_layout = QVBoxLayout(effects)
+        self.settings_check_status = QLabel("")
+        self.settings_check_status.setObjectName("StatusNeutral")
+        self.settings_check_status.setWordWrap(True)
+        self.settings_issues_label = QLabel("")
+        self.settings_issues_label.setWordWrap(True)
+        self.settings_issues_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.settings_effects_label = QLabel("")
+        self.settings_effects_label.setWordWrap(True)
+        self.settings_effects_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        effects_layout.addWidget(self.settings_check_status)
+        effects_layout.addWidget(self.settings_issues_label)
+        effects_layout.addWidget(self.settings_effects_label)
+        content_layout.addWidget(effects)
+        content_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("PageScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        scroll.viewport().setAutoFillBackground(False)
+        layout.addWidget(scroll, 1)
+
+        bar = QHBoxLayout()
+        self.settings_summary_label = QLabel("")
+        self.settings_summary_label.setWordWrap(True)
+        self.settings_discard_button = QPushButton("Discard Changes")
+        self.settings_discard_button.setObjectName("Quiet")
+        self.settings_discard_button.clicked.connect(self._discard_settings)
+        self.settings_save_button = QPushButton("Save Settings")
+        self.settings_save_button.setObjectName("Primary")
+        self.settings_save_button.clicked.connect(lambda: self._save_settings(offer_apply=True))
+        bar.addWidget(self.settings_summary_label, 1)
+        bar.addWidget(self.settings_discard_button)
+        bar.addWidget(self.settings_save_button)
+        layout.addLayout(bar)
+
+        self._wheel_guard = _WheelOnlyWhenFocused(self)
+        for spin in (
+            self.settings_recording_seconds,
+            self.settings_record_interval,
+            self.settings_track_interval,
+            self.settings_fps,
+            self.settings_min_free,
+        ):
+            spin.valueChanged.connect(lambda *_: self._settings_changed())
+            spin.setFocusPolicy(Qt.StrongFocus)
+            spin.installEventFilter(self._wheel_guard)
+        for combo in (self.settings_mode, self.settings_frame_buffer, self.settings_codec, self.settings_preset):
+            combo.currentIndexChanged.connect(lambda *_: self._settings_changed())
+            # Shrink with the window instead of forcing the page wider than it is.
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(18)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            combo.setMaximumWidth(460)
+            combo.setFocusPolicy(Qt.StrongFocus)
+            combo.installEventFilter(self._wheel_guard)
+        self.settings_monochrome.toggled.connect(lambda *_: self._settings_changed())
+        return page
+
+    # -- Settings page ---------------------------------------------------------
+
+    def _settings_profile_key(self) -> str:
+        if self._settings_profile_override:
+            return self._settings_profile_override
+        return str(_get_nested(self.config, "camera.profile", "custom") or "custom")
+
+    def _settings_profile_fixed(self) -> set[str]:
+        """Settings keys that the camera profile overwrites whenever the config is saved."""
+        profile = CAMERA_PROFILES.get(self._settings_profile_key())
+        if profile is None:
+            return set()
+        values = set(profile.camera_values)
+        return {key for key, camera_key in PROFILE_CONTROLLED_SETTINGS.items() if camera_key in values}
+
+    def _settings_values(self) -> dict[str, Any]:
+        return {
+            "pipeline.mode": self.settings_mode.currentData(),
+            "capture.recording_seconds": int(self.settings_recording_seconds.value()),
+            "capture.record_interval_minutes": int(self.settings_record_interval.value()),
+            "capture.track_interval_minutes": int(self.settings_track_interval.value()),
+            "camera.fps_target": round(float(self.settings_fps.value()), 2),
+            "camera.monochrome_output": bool(self.settings_monochrome.isChecked()),
+            "camera.codec": self.settings_codec.currentData(),
+            "camera.mp4_preset": self.settings_preset.currentData(),
+            "capture.frame_buffer": self.settings_frame_buffer.currentData(),
+            "system.min_free_space_gb": round(float(self.settings_min_free.value()), 1),
+            "camera.profile": self._settings_profile_key(),
+        }
+
+    def _settings_dirty(self) -> bool:
+        return self._settings_saved_values is not None and self._settings_values() != self._settings_saved_values
+
+    def _apply_settings_to(self, config: dict[str, Any]) -> dict[str, Any]:
+        fixed = self._settings_profile_fixed()
+        for key, value in self._settings_values().items():
+            if key not in fixed:
+                _set_nested(config, key, value)
+        return config
+
+    def _settings_candidate(self) -> dict[str, Any]:
+        """The config as it would be saved, with the camera profile applied."""
+        return apply_camera_profile(self._apply_settings_to(copy.deepcopy(self.config)))
+
+    def _load_settings_form(self) -> None:
+        config = self.config
+        self._settings_loading = True
+        try:
+            self._settings_profile_override = None
+            _set_combo_data(self.settings_mode, str(_get_nested(config, "pipeline.mode", "record_and_track")))
+            self.settings_recording_seconds.setValue(int(_get_nested(config, "capture.recording_seconds", 20) or 20))
+            self.settings_record_interval.setValue(int(_get_nested(config, "capture.record_interval_minutes", 30) or 30))
+            self.settings_track_interval.setValue(int(_get_nested(config, "capture.track_interval_minutes", 5) or 5))
+            self.settings_fps.setValue(float(_get_nested(config, "camera.fps_target", 5.0) or 5.0))
+            self.settings_monochrome.setChecked(bool(_get_nested(config, "camera.monochrome_output", False)))
+            _set_combo_data(self.settings_codec, str(_get_nested(config, "camera.codec", "mp4")).lower())
+            _set_combo_data(self.settings_preset, str(_get_nested(config, "camera.mp4_preset", "auto")).lower())
+            _set_combo_data(self.settings_frame_buffer, frame_buffer_mode(config))
+            self.settings_min_free.setValue(float(_get_nested(config, "system.min_free_space_gb", 1.0) or 0.0))
+        finally:
+            self._settings_loading = False
+        self._settings_saved_values = self._settings_values()
+        self._settings_changed()
+
+    def _settings_changed(self) -> None:
+        if self._settings_loading:
+            return
+        mode = self.settings_mode.currentData()
+        tracks_separately = mode in {"mixed_schedule", "track_only"}
+        self._settings_track_interval_label.setVisible(tracks_separately)
+        self.settings_track_interval.setVisible(tracks_separately)
+        is_mp4 = self.settings_codec.currentData() == "mp4"
+        self._settings_preset_label.setEnabled(is_mp4)
+        self.settings_preset.setEnabled(is_mp4)
+        self.settings_frame_buffer_hint.setText(FRAME_BUFFER_HINTS.get(self.settings_frame_buffer.currentData(), ""))
+
+        fixed = self._settings_profile_fixed()
+        self.settings_fps.setEnabled("camera.fps_target" not in fixed)
+        self.settings_codec.setEnabled("camera.codec" not in fixed)
+        self.settings_monochrome.setEnabled("camera.monochrome_output" not in fixed)
+        profile_label = CAMERA_PROFILES.get(self._settings_profile_key(), CAMERA_PROFILES["custom"]).label
+        if fixed:
+            self.settings_profile_note.setText(
+                f"Frame rate, video format and grayscale are set by the camera profile “{profile_label}”."
+            )
+        elif self._settings_profile_override:
+            self.settings_profile_note.setText("Custom camera settings will be used from when you save.")
+        else:
+            self.settings_profile_note.setText("")
+        self.settings_profile_note.setVisible(bool(self.settings_profile_note.text()))
+        self.settings_custom_camera_button.setVisible(bool(fixed))
+        self._settings_profile_row.setVisible(bool(self.settings_profile_note.text()))
+        self._settings_profile_row_label.setVisible(bool(self.settings_profile_note.text()))
+
+        width = _get_nested(self.config, "camera.width", "?")
+        height = _get_nested(self.config, "camera.height", "?")
+        where = "from the camera profile" if fixed else "change it in the config file"
+        self.settings_resolution.setText(f"{width} × {height}  ({where})")
+
+        dirty = self._settings_dirty()
+        self.settings_save_button.setEnabled(dirty)
+        self.settings_discard_button.setEnabled(dirty)
+        self._schedule_settings_preview()
+
+    def _schedule_settings_preview(self) -> None:
+        self._settings_preview_timer.start(SETTINGS_PREVIEW_DELAY_MS)
+
+    def _use_custom_camera_settings(self) -> None:
+        self._settings_profile_override = "custom"
+        self._settings_changed()
+
+    def _discard_settings(self) -> None:
+        self._load_settings_form()
+
+    def _load_benchmark(self) -> dict[str, Any] | None:
+        return load_benchmark(self.encode_benchmark_path)
+
+    def _refresh_settings_preview(self) -> None:
+        candidate = self._settings_candidate()
+        problems: list[str] = []
+        warnings: list[str] = []
+        try:
+            validate_config(candidate)
+        except Exception as exc:
+            problems.append(f"Not valid: {exc}")
+        metrics: dict[str, Any] = {}
+        try:
+            report = run_schedule_check(candidate)
+        except Exception as exc:
+            problems.append(f"The schedule could not be checked: {exc}")
+        else:
+            metrics = dict(report.metrics)
+            for item in report.items:
+                if item.status == "FAIL":
+                    problems.append(f"{item.name}: {item.message}")
+                elif item.status == "WARN":
+                    warnings.append(f"{item.name}: {item.message}")
+
+        benchmark = self._load_benchmark()
+        free_gb = self._box_status.storage.free_gb if self._box_status is not None else None
+        estimate = estimate_storage(candidate, self._run_history_payloads, free_gb=free_gb, benchmark=benchmark)
+        streaming = frame_buffer_mode(candidate) == FRAME_BUFFER_STREAM
+
+        lines: list[str] = []
+        per_day = recordings_per_day(candidate)
+        lines.append(
+            f"Recordings per day: {per_day}" if per_day else "Recordings per day: none (track-only mode records nothing)."
+        )
+        buffer_bytes = metrics.get("estimated_frame_buffer_bytes")
+        total_ram = metrics.get("total_ram_bytes")
+        if per_day and isinstance(buffer_bytes, (int, float)) and buffer_bytes > 0:
+            why = "frames waiting to be encoded" if streaming else "every frame is held until the recording ends"
+            of_total = f" of {format_bytes(total_ram)}" if isinstance(total_ram, (int, float)) and total_ram > 0 else ""
+            lines.append(f"Memory per recording: {format_bytes(buffer_bytes)}{of_total} on this computer ({why}).")
+        lines.append(f"Storage: {estimate.headline}.")
+        if estimate.detail:
+            lines.append(estimate.detail)
+        if estimate.level == LEVEL_WARN and estimate.days_left is not None:
+            warnings.append(
+                f"Storage: at this rate the drive is full in {describe_days(estimate.days_left)}, "
+                "after which recording is refused."
+            )
+
+        verdict = self._update_benchmark_label(candidate, benchmark)
+        if streaming and verdict == "no":
+            problems.append(
+                "Encoder: the selected encoder was slower than the camera in the encode benchmark, "
+                "so a recording that encodes while recording would fall behind."
+            )
+        elif streaming and verdict == "marginal":
+            warnings.append(
+                "Encoder: the selected encoder only just kept up in the encode benchmark. "
+                "The camera also uses the CPU during a real recording, so it may fall behind."
+            )
+
+        counts = []
+        if problems:
+            counts.append(f"{len(problems)} problem" + ("s" if len(problems) > 1 else ""))
+        if warnings:
+            counts.append(f"{len(warnings)} warning" + ("s" if len(warnings) > 1 else ""))
+        level = LEVEL_FAIL if problems else LEVEL_WARN if warnings else LEVEL_OK
+        summary = ", ".join(counts) if counts else "No problems found"
+        self._set_status_label(
+            self.settings_check_status,
+            level,
+            summary + (" with these settings." if counts else " with these settings."),
+        )
+        issues = [f"Problem: {text}" for text in problems] + [f"Warning: {text}" for text in warnings]
+        self.settings_issues_label.setText("\n".join(issues))
+        self.settings_issues_label.setVisible(bool(issues))
+        self.settings_effects_label.setText("\n".join(lines))
+
+        bar = []
+        if self._settings_dirty():
+            bar.append("Unsaved changes")
+        bar.append(summary)
+        if estimate.bytes_per_day:
+            bar.append(estimate.headline)
+        self.settings_summary_label.setText(" · ".join(bar) + ".")
+
+    def _update_benchmark_label(self, candidate: dict[str, Any], benchmark: dict[str, Any] | None) -> str | None:
+        """Describe the last encode benchmark for the selected encoder; return its verdict."""
+        if benchmark is None:
+            self.settings_benchmark_label.setText(
+                "Not run on this computer yet. It measures which encoders keep up with the camera."
+            )
+            return None
+        try:
+            measured = datetime.fromtimestamp(self.encode_benchmark_path.stat().st_mtime)
+            now = datetime.now()
+            when = (
+                f" today at {measured:%H:%M}"
+                if measured.date() == now.date()
+                else f" on {describe_moment(measured, now)}"
+            )
+        except OSError:
+            when = ""
+        if not benchmark_matches_camera(candidate, benchmark):
+            colour = "grayscale" if benchmark.get("monochrome_output") else "colour"
+            self.settings_benchmark_label.setText(
+                f"The last run{when} measured {benchmark.get('width')} × {benchmark.get('height')} {colour} "
+                "video. Run it again for the current settings."
+            )
+            return None
+        fps = float(_get_nested(candidate, "camera.fps_target", 0) or 0)
+        speeds = []
+        for result in benchmark.get("results") or []:
+            if isinstance(result, dict) and not result.get("error"):
+                name = "MJPEG" if result.get("codec") == "mjpeg" else str(result.get("mp4_preset") or result.get("label"))
+                speeds.append(f"{name} {float(result.get('frames_per_second') or 0):.1f}")
+        everything = f"All measured, in fps: {', '.join(speeds)}." if speeds else ""
+        result = benchmark_result_for(candidate, benchmark)
+        if result is None:
+            self.settings_benchmark_label.setText(
+                f"The last run{when} did not measure the selected encoder. {everything}".strip()
+            )
+            return None
+        verdict = keeps_up(result.get("frames_per_second"), fps)
+        phrase = {
+            "yes": "keeps up with",
+            "marginal": "only just keeps up with",
+            "no": "is slower than",
+        }.get(verdict, "was measured against")
+        streaming = frame_buffer_mode(candidate) == FRAME_BUFFER_STREAM
+        meaning = (
+            ""
+            if streaming
+            else " With frames held in memory this only sets how long encoding takes after each recording."
+        )
+        self.settings_benchmark_label.setText(
+            f"Selected encoder: {float(result.get('frames_per_second') or 0):.1f} fps, measured{when}, "
+            f"so it {phrase} the camera at {fps:g} fps.{meaning} {everything}"
+        )
+        return verdict
+
+    def _benchmark_source_video(self, candidate: dict[str, Any]) -> Path | None:
+        """The newest saved recording at the camera's resolution, to benchmark real footage."""
+        _, _, _, width, height = recording_signature(candidate)
+        for payload in self._run_history_payloads:
+            signature = payload.get("_recording_signature")
+            if not signature or tuple(signature)[3:5] != (width, height):
+                continue
+            video = self._run_artifact_path(payload, "video_path")
+            if video is not None and video.is_file():
+                return video
+        return None
+
+    def _run_encode_benchmark(self) -> None:
+        candidate = self._settings_candidate()
+        camera = candidate.get("camera", {})
+        encoders = list(DEFAULT_BENCHMARK_ENCODERS)
+        preset = str(camera.get("mp4_preset", "auto"))
+        if camera.get("codec") == "mp4" and preset != "auto":
+            extra = f"{camera.get('mp4_codec', 'libx264')}:{preset}"
+            if extra not in encoders:
+                encoders.append(extra)
+        arguments = [
+            "encode-benchmark",
+            "--fps",
+            f"{float(camera.get('fps_target', 5.0)):g}",
+            "--monochrome" if bool(camera.get("monochrome_output", False)) else "--color",
+            "--encoders",
+            ",".join(encoders),
+            "--json-out",
+            str(self.encode_benchmark_path),
+        ]
+        source = self._benchmark_source_video(candidate)
+        if source is not None:
+            arguments += ["--source-video", str(source)]
+        self.run_bbx_command(arguments)
+
+    def _save_settings(self, *, offer_apply: bool) -> bool:
+        try:
+            config = load_config(self.config_path) if self.config_path.exists() else copy.deepcopy(self.config)
+            self._apply_settings_to(config)
+            save_config(self.config_path, config)
+        except Exception as exc:
+            QMessageBox.critical(self, "Settings not saved", f"The recording settings were not saved:\n{exc}")
+            return False
+        self.config = load_config(self.config_path)
+        self._load_settings_form()
+        self.refresh_from_config()
+        if offer_apply:
+            self._offer_to_apply_schedule()
+        return True
+
+    def _offer_to_apply_schedule(self) -> None:
+        schedule = self._box_status.schedule if self._box_status is not None else None
+        if schedule is None or schedule.state not in {SCHEDULE_ON, SCHEDULE_PARTIAL}:
+            return
+        if installed_units_are_current(self.config, self.config_path) is not False:
+            return
+        if self._ask_apply_schedule():
+            self._start_automation()
+
+    def _ask_apply_schedule(self) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Apply to the running schedule?")
+        box.setText("The recording schedule is still using the previous run mode, interval or recording length.")
+        box.setInformativeText(
+            "Other changes, such as the frame rate or video format, are used by the next recording without this."
+        )
+        apply_now = box.addButton("Apply Now", QMessageBox.AcceptRole)
+        later = box.addButton("Later", QMessageBox.RejectRole)
+        box.setDefaultButton(apply_now)
+        box.setEscapeButton(later)
+        box.exec_()
+        return box.clickedButton() is apply_now
+
+    def _resolve_unsaved_settings(self, action: str) -> bool:
+        """Before an action that reads the saved config, settle unsaved settings."""
+        if not self._settings_dirty():
+            return True
+        choice = self._ask_unsaved_settings(action)
+        if choice == "save":
+            return self._save_settings(offer_apply=False)
+        return choice == "ignore"
+
+    def _ask_unsaved_settings(self, action: str) -> str:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Save the recording settings first?")
+        box.setText(f"The Settings page has changes that are not saved. If you {action} now, it uses the saved settings.")
+        save = box.addButton("Save and Continue", QMessageBox.AcceptRole)
+        ignore = box.addButton("Continue Without Saving", QMessageBox.DestructiveRole)
+        cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(save)
+        box.setEscapeButton(cancel)
+        box.exec_()
+        clicked = box.clickedButton()
+        return "save" if clicked is save else "ignore" if clicked is ignore else "cancel"
+
+    def _ask_unsaved_settings_on_close(self) -> str:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Save the recording settings?")
+        box.setText("The Settings page has changes that are not saved.")
+        save = box.addButton("Save", QMessageBox.AcceptRole)
+        discard = box.addButton("Discard", QMessageBox.DestructiveRole)
+        cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(save)
+        box.setEscapeButton(cancel)
+        box.exec_()
+        clicked = box.clickedButton()
+        return "save" if clicked is save else "discard" if clicked is discard else "cancel"
 
     def _build_advanced_page(self) -> QWidget:
         page = QWidget()
@@ -1768,20 +2486,25 @@ class BumbleBoxQtGUI(QMainWindow):
                 f"plan {distributed.get('plan_id') or 'unknown'}; "
                 f"{successful}/{len(nodes) if isinstance(nodes, dict) else 0} nodes successful"
             )
-        return "\n".join(
-            (
-                f"Session: {payload.get('session_name') or 'unknown'}",
-                f"Started: {self._format_run_timestamp(payload.get('started_at'))}",
-                f"Result: {'Success' if bool(payload.get('success', False)) else 'Failed'} | "
-                f"Mode: {payload.get('mode') or 'unknown'}",
-                f"RGB: {int(payload.get('frames_captured', 0) or 0)} frames at "
-                f"{self._format_optional_fps(payload.get('actual_fps'))} fps",
-                f"Thermal: {thermal_status}",
-                f"RealSense: {depth_status}",
-                f"Distributed capture: {distributed_status}",
-                f"Warnings: {warning_count} | Errors: {error_count}",
-            )
-        )
+        # Lines for optional hardware appear only when this box has it or the
+        # recording used it.
+        hardware = self._configured_hardware() | self._payload_hardware(payload)
+        lines = [
+            f"Session: {payload.get('session_name') or 'unknown'}",
+            f"Started: {self._format_run_timestamp(payload.get('started_at'))}",
+            f"Result: {'Success' if bool(payload.get('success', False)) else 'Failed'} | "
+            f"Mode: {payload.get('mode') or 'unknown'}",
+            f"RGB: {int(payload.get('frames_captured', 0) or 0)} frames at "
+            f"{self._format_optional_fps(payload.get('actual_fps'))} fps",
+        ]
+        if "thermal" in hardware:
+            lines.append(f"Thermal: {thermal_status}")
+        if "realsense" in hardware:
+            lines.append(f"RealSense: {depth_status}")
+        if "distributed" in hardware:
+            lines.append(f"Distributed capture: {distributed_status}")
+        lines.append(f"Warnings: {warning_count} | Errors: {error_count}")
+        return "\n".join(lines)
 
     def _set_result_artifact_buttons(self, payload: dict[str, Any] | None) -> None:
         for button, payload_key in self.result_artifact_buttons.values():
@@ -1791,6 +2514,62 @@ class BumbleBoxQtGUI(QMainWindow):
             summary_available and self._configured_calibration_project() is not None
         )
         self.result_sync_analysis_button.setEnabled(summary_available)
+        self._layout_result_buttons(self._configured_hardware() | self._payload_hardware(payload))
+
+    def _configured_hardware(self) -> set[str]:
+        """Optional hardware this box is set up to use."""
+        hardware: set[str] = set()
+        if bool(self.config.get("thermal", {}).get("enabled", False)):
+            hardware.add("thermal")
+        if bool(self.config.get("realsense", {}).get("enabled", False)):
+            hardware.add("realsense")
+        if bool(self.config.get("distributed_capture", {}).get("enabled", False)):
+            hardware.add("distributed")
+        if hardware & {"thermal", "realsense"}:
+            hardware.add("multimodal")
+        return hardware
+
+    @staticmethod
+    def _payload_hardware(payload: dict[str, Any] | None) -> set[str]:
+        """Optional hardware a recording used, so older recordings keep their buttons."""
+        if not payload:
+            return set()
+        hardware: set[str] = set()
+        if bool(payload.get("thermal_enabled", False)):
+            hardware.add("thermal")
+        if bool(payload.get("realsense_enabled", False)):
+            hardware.add("realsense")
+        distributed = payload.get("distributed_capture")
+        if isinstance(distributed, dict) and bool(distributed.get("enabled", False)):
+            hardware.add("distributed")
+        if hardware & {"thermal", "realsense"}:
+            hardware.add("multimodal")
+        return hardware
+
+    def _layout_result_buttons(self, hardware: set[str]) -> None:
+        visible = tuple(
+            key
+            for key, _ in self.result_button_order
+            if RESULT_BUTTON_HARDWARE.get(key) is None or RESULT_BUTTON_HARDWARE[key] in hardware
+        )
+        if visible == self._visible_result_buttons:
+            return
+        self._visible_result_buttons = visible
+        for _, button in self.result_button_order:
+            self.result_button_grid.removeWidget(button)
+            button.setVisible(False)
+        columns = 3
+        for index, key in enumerate(visible):
+            button = dict(self.result_button_order)[key]
+            self.result_button_grid.addWidget(button, index // columns, index % columns)
+            button.setVisible(True)
+
+    def _update_results_hardware_columns(self) -> None:
+        hardware = self._configured_hardware()
+        for payload in self._run_history_payloads:
+            hardware |= self._payload_hardware(payload)
+        self.results_table.setColumnHidden(4, "thermal" not in hardware)
+        self.results_table.setColumnHidden(5, "realsense" not in hardware)
 
     def _analyze_selected_run_sync(self) -> None:
         summary = self._run_artifact_path(self._selected_run_payload, "_summary_path")
@@ -2000,6 +2779,8 @@ class BumbleBoxQtGUI(QMainWindow):
         normalized = [dict(item) for item in payloads if isinstance(item, dict)] if isinstance(payloads, list) else []
         self._run_history_payloads = normalized
         self._update_latest_card()
+        self._update_results_hardware_columns()
+        self._update_storage_estimate()
         data_root = str(self.config.get("system", {}).get("data_root", "Not set"))
         self.results_status.setText(f"Showing {len(normalized)} recent recording(s) from {data_root}")
 
@@ -2057,7 +2838,7 @@ class BumbleBoxQtGUI(QMainWindow):
         self.pages.setCurrentIndex(index)
         item = self.navigation.item(index)
         self.page_title.setText(item.text().upper() if item else "BUMBLEBOX")
-        if index == 2 and not self._run_history_payloads:
+        if index == PAGE_INDEX_RESULTS and not self._run_history_payloads:
             self.refresh_results()
 
     def open_setup_wizard(self) -> None:
@@ -2152,9 +2933,19 @@ class BumbleBoxQtGUI(QMainWindow):
             self.calibration_project_label.setText("No multimodal calibration project selected.")
         self.open_calibration_button.setEnabled(calibration_path is not None)
         self.calibration_status_button.setEnabled(calibration_path is not None)
+        self._set_result_artifact_buttons(self._selected_run_payload)
+        self._update_results_hardware_columns()
+        if not self._settings_dirty():
+            self._load_settings_form()
+        self._update_storage_estimate()
         self.refresh_box_status()
 
     def closeEvent(self, event: Any) -> None:
+        if self._settings_dirty():
+            choice = self._ask_unsaved_settings_on_close()
+            if choice == "cancel" or (choice == "save" and not self._save_settings(offer_apply=False)):
+                event.ignore()
+                return
         self._status_timer.stop()
         super().closeEvent(event)
 
@@ -2184,10 +2975,8 @@ class BumbleBoxQtGUI(QMainWindow):
 
     def _apply_box_status(self, status: BoxStatus) -> None:
         self._box_status = status
-        storage, schedule = status.storage, status.schedule
-        self._set_card(
-            self.storage_card, storage.headline, storage.detail, _LEVEL_CARD_TONES.get(storage.level, "neutral")
-        )
+        schedule = status.schedule
+        self._update_storage_estimate()
         self._set_card(
             self.schedule_card, schedule.headline, schedule.detail, _LEVEL_CARD_TONES.get(schedule.level, "neutral")
         )
@@ -2208,6 +2997,29 @@ class BumbleBoxQtGUI(QMainWindow):
             self._last_scheduled_run_seen = newest
             if not first_look:
                 self.refresh_results()
+
+    def _update_storage_estimate(self) -> None:
+        """Recompute storage per day from recent recordings and the free space."""
+        free_gb = self._box_status.storage.free_gb if self._box_status is not None else None
+        self._storage_estimate = estimate_storage(
+            self.config, self._run_history_payloads, free_gb=free_gb, benchmark=self._load_benchmark()
+        )
+        self._render_storage_card()
+        self._schedule_settings_preview()
+
+    def _render_storage_card(self) -> None:
+        if self._box_status is None:
+            return
+        storage = self._box_status.storage
+        level = storage.level
+        detail = storage.detail
+        estimate = self._storage_estimate
+        # When recording is refused the estimate would only distract from why.
+        if estimate is not None and level != LEVEL_FAIL and estimate.level != LEVEL_OFF:
+            detail = f"{detail}\n{estimate.headline}" if detail else estimate.headline
+            if estimate.level == LEVEL_WARN and level == LEVEL_OK:
+                level = LEVEL_WARN
+        self._set_card(self.storage_card, storage.headline, detail, _LEVEL_CARD_TONES.get(level, "neutral"))
 
     @staticmethod
     def _parse_run_start(value: Any) -> datetime | None:
@@ -2263,6 +3075,8 @@ class BumbleBoxQtGUI(QMainWindow):
     def _run_once(self) -> None:
         if not self._confirm_live_monitor_closed("start a recording"):
             return
+        if not self._resolve_unsaved_settings("start a recording"):
+            return
         self.run_bbx_command(["run-once", "--mode", str(self.run_mode.currentData())])
 
     def _open_live_monitor(self) -> None:
@@ -2292,6 +3106,8 @@ class BumbleBoxQtGUI(QMainWindow):
 
     def _start_automation(self) -> None:
         if not self._confirm_live_monitor_closed("start automated recording"):
+            return
+        if not self._resolve_unsaved_settings("start automated recording"):
             return
         config = load_config(self.config_path)
         scheduling = config.setdefault("scheduling", {})
@@ -2330,6 +3146,8 @@ class BumbleBoxQtGUI(QMainWindow):
         return box.clickedButton() is start_anyway
 
     def _stop_automation(self) -> None:
+        if not self._confirm_stop_automation():
+            return
         config = load_config(self.config_path)
         config.setdefault("scheduling", {})["enabled"] = False
         save_config(self.config_path, config)
@@ -2338,6 +3156,30 @@ class BumbleBoxQtGUI(QMainWindow):
             ["systemd-disable"],
             success_message=("Automated recording stopped", "The BumbleBox recording timer is disabled."),
         )
+
+    def _confirm_stop_automation(self) -> bool:
+        schedule = self._box_status.schedule if self._box_status is not None else None
+        if schedule is not None and schedule.state == SCHEDULE_OFF:
+            # Nothing is scheduled, so stopping changes nothing worth asking about.
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Stop automated recording?")
+        box.setText("No more recordings will start until you press Start Automated Recording.")
+        details = ["A recording that is already in progress finishes normally."]
+        if schedule is not None and schedule.next_run is not None:
+            now = datetime.now()
+            details.append(
+                f"The next one is due {describe_moment(schedule.next_run, now)} "
+                f"({describe_relative(schedule.next_run, now)})."
+            )
+        box.setInformativeText(" ".join(details))
+        stop = box.addButton("Stop Recording Schedule", QMessageBox.DestructiveRole)
+        keep = box.addButton("Keep Recording", QMessageBox.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec_()
+        return box.clickedButton() is stop
 
     def run_bbx_command(
         self,
@@ -2365,12 +3207,17 @@ class BumbleBoxQtGUI(QMainWindow):
         success_message: tuple[str, str] | None = None,
     ) -> None:
         if self.process.state() != QProcess.NotRunning:
-            QMessageBox.warning(self, "Command already running", "Wait for the current BumbleBox command to finish.")
+            QMessageBox.warning(
+                self,
+                "Command already running",
+                "Wait for the current BumbleBox command to finish, or press Cancel on the Run page.",
+            )
             return
         self.command_queue = [list(command) for command in commands]
         self.command_success_message = success_message
+        self._cancel_requested = False
         self.console.clear()
-        self.navigation.setCurrentRow(1)
+        self.navigation.setCurrentRow(PAGE_INDEX_RUN)
         self._start_next_command()
 
     def _start_next_command(self) -> None:
@@ -2388,8 +3235,75 @@ class BumbleBoxQtGUI(QMainWindow):
             arguments.extend(["--config", str(self.config_path)])
         command_text = " ".join([str(BBX_SCRIPT), *arguments])
         self.console.append(f"$ {command_text}\n")
+        self.cancel_button.setText("Cancel")
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setVisible(True)
         self.process.setWorkingDirectory(str(REPO_ROOT))
         self.process.start(sys.executable, [str(BBX_SCRIPT), *arguments])
+
+    def _cancel_command(self) -> None:
+        if self.process.state() == QProcess.NotRunning or self._cancel_requested:
+            return
+        if self._current_command[:1] == ["run-once"] and not self._confirm_cancel_recording():
+            return
+        if self.process.state() == QProcess.NotRunning:
+            return  # it finished while the question was open
+        self._cancel_requested = True
+        self._cancelled_steps = len(self.command_queue)
+        self.command_queue.clear()
+        self.command_success_message = None
+        self.cancel_button.setText("Cancelling...")
+        self.cancel_button.setEnabled(False)
+        self._set_status_label(
+            self.command_status, LEVEL_OFF, f"{command_label(self._current_command)}: cancelling..."
+        )
+        self.console.append("\n[cancel requested]")
+        self._cancel_stage = 0
+        self._interrupt_process()
+        self._cancel_timer.start(CANCEL_INTERRUPT_GRACE_MS)
+
+    def _confirm_cancel_recording(self) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Cancel this recording?")
+        box.setText("The run stops now and is listed as failed in Results.")
+        box.setInformativeText(
+            "Video already written to disk is kept in its session folder. "
+            "Frames still held in memory are lost."
+        )
+        stop = box.addButton("Stop Recording", QMessageBox.DestructiveRole)
+        keep = box.addButton("Keep Recording", QMessageBox.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec_()
+        return box.clickedButton() is stop
+
+    def _interrupt_process(self) -> None:
+        """Ask the running command to stop the way Ctrl+C does."""
+        pid = int(self.process.processId() or 0)
+        if pid > 0 and hasattr(signal, "SIGINT") and os.name == "posix":
+            try:
+                os.kill(pid, signal.SIGINT)
+                return
+            except OSError:
+                pass
+        self.process.terminate()
+
+    def _escalate_cancel(self) -> None:
+        if self.process.state() == QProcess.NotRunning:
+            return
+        if self._cancel_stage == 0:
+            self._cancel_stage = 1
+            self.console.append("\n[the command did not stop; terminating it]")
+            self.process.terminate()
+            self._cancel_timer.start(CANCEL_TERMINATE_GRACE_MS)
+        else:
+            self.console.append("\n[the command still did not stop; killing it]")
+            self.process.kill()
+
+    def _command_ended(self) -> None:
+        self._cancel_timer.stop()
+        self.cancel_button.setVisible(False)
 
     def _read_process_output(self) -> None:
         if not self.process.isOpen():
@@ -2403,8 +3317,36 @@ class BumbleBoxQtGUI(QMainWindow):
 
     def _process_finished(self, exit_code: int, status: QProcess.ExitStatus) -> None:
         self._read_process_output()
+        self._command_ended()
         self.console.append(f"\n[finished with exit code {exit_code}]")
         self.refresh_results()
+        if self._cancel_requested:
+            self._cancel_requested = False
+            self.command_queue.clear()
+            self.command_success_message = None
+            label = command_label(self._current_command)
+            if exit_code == 0 and status == QProcess.NormalExit:
+                # It completed before the interrupt reached it.
+                skipped = " The steps after it were not run." if self._cancelled_steps else ""
+                self._set_status_label(
+                    self.command_status, LEVEL_OK, f"{label} finished before it could be cancelled.{skipped}"
+                )
+                self._cancelled_steps = 0
+                if self.config_path.exists():
+                    self.config = load_config(self.config_path)
+                    self.refresh_from_config()
+                return
+            self._cancelled_steps = 0
+            self.refresh_box_status()
+            note = (
+                " It is listed as failed in Results; anything written before the cancel is in its session folder."
+                if self._current_command[:1] == ["run-once"]
+                else ""
+            )
+            self._set_status_label(
+                self.command_status, LEVEL_WARN, f"{command_label(self._current_command)} cancelled.{note}"
+            )
+            return
         crashed = status == QProcess.CrashExit
         if exit_code != 0 or crashed:
             self.command_queue.clear()
@@ -2449,6 +3391,8 @@ class BumbleBoxQtGUI(QMainWindow):
         # would otherwise leave the window showing nothing at all.
         if error != QProcess.FailedToStart:
             return
+        self._command_ended()
+        self._cancel_requested = False
         self.command_queue.clear()
         self.command_success_message = None
         self._report_command_failure(
