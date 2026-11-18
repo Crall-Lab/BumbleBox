@@ -27,6 +27,7 @@ validated.
 - [ ] Add a detached worker service if experiments must survive controller loss during an active capture.
 - [x] Add a hardware-free three-camera recording simulation with shared timing and visual cues.
 - [x] Add a bounded local live monitor for OwlSight/RGB, thermal, RealSense color, and RealSense depth.
+- [x] Show only the feeds a setup uses in the live monitor, and let any feed fill the screen.
 - [ ] Validate sustained live-monitor load and displayed frame rates on the Raspberry Pi 5.
 - [ ] Add frame-by-frame three-camera inspection output.
 - [x] Define a versioned multimodal calibration project, capture registry, artifact contract, and readiness checks.

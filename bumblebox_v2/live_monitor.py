@@ -487,25 +487,85 @@ QPushButton {
 }
 QPushButton:hover { background: #d6e7de; }
 QPushButton#CloseButton { background: #39786a; color: white; border-color: #39786a; }
+QPushButton#PanelButton { padding: 4px 10px; font-size: 12px; border-radius: 7px; }
+QLabel#MonitorEmpty { color: #63756f; font-size: 15px; }
+QWidget#MonitorRoot[fullView="true"] { background: #101614; }
+QFrame#VideoCard[fullView="true"] { background: #101614; border: none; border-radius: 0; }
+QFrame#VideoCard[fullView="true"] QLabel#VideoTitle { color: #e3ece9; }
+QFrame#VideoCard[fullView="true"] QLabel#VideoStatus { color: #9db0aa; }
+QFrame#VideoCard[fullView="true"] QLabel#VideoSurface { border-radius: 0; padding: 0; }
 """
 
 
-def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> int:
-    options.validate()
-    from .qt_env import sanitize_current_qt_env
+STREAM_TITLES = {
+    "rgb": "RGB camera",
+    "thermal": "PureThermal / Lepton",
+    "realsense_color": "RealSense Color",
+    "realsense_depth": "RealSense Depth",
+}
 
-    sanitize_current_qt_env()
+
+def monitor_streams(sensor_names: set[str]) -> list[str]:
+    """The feeds to show, in display order, for the sensors this setup uses.
+
+    A depth camera contributes two feeds (colour and depth). A sensor that is
+    off, or assigned to another Pi, contributes none, so a camera-only box
+    gets a single feed rather than three empty panels.
+    """
+    streams: list[str] = []
+    if "rgb" in sensor_names:
+        streams.append("rgb")
+    if "thermal" in sensor_names:
+        streams.append("thermal")
+    if "realsense" in sensor_names:
+        streams.extend(["realsense_color", "realsense_depth"])
+    return streams
+
+
+def monitor_grid(count: int) -> list[tuple[int, int, int, int]]:
+    """Where each of ``count`` feeds goes: (row, column, rows spanned, columns spanned).
+
+    One feed fills the window; two sit side by side; with three the first is
+    large on the left and the other two are stacked beside it; four make a
+    2 x 2 grid.
+    """
+    if count <= 0:
+        return []
+    if count == 1:
+        return [(0, 0, 1, 1)]
+    if count == 2:
+        return [(0, 0, 1, 1), (0, 1, 1, 1)]
+    if count == 3:
+        return [(0, 0, 2, 1), (0, 1, 1, 1), (1, 1, 1, 1)]
+    return [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 1, 1)][:count]
+
+
+def rgb_stream_title(config: dict[str, Any]) -> str:
+    """Name the RGB feed after the camera profile when one is selected."""
     try:
-        from PyQt5.QtCore import QObject, QLockFile, Qt, QTimer, pyqtSignal
-        from PyQt5.QtGui import QFont, QFontDatabase, QImage, QPixmap
+        from .camera_profiles import CAMERA_PROFILES
+
+        key = str(config.get("camera", {}).get("profile", "custom"))
+        profile = CAMERA_PROFILES.get(key)
+        if profile is not None and key != "custom":
+            return f"{STREAM_TITLES['rgb']} ({profile.label})"
+    except Exception:
+        pass
+    return STREAM_TITLES["rgb"]
+
+
+def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptions) -> Any:
+    """Build the monitor window. A ``QApplication`` must already exist."""
+    options.validate()
+    try:
+        from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
+        from PyQt5.QtGui import QImage, QPixmap
         from PyQt5.QtWidgets import (
-            QApplication,
             QFrame,
             QGridLayout,
             QHBoxLayout,
             QLabel,
             QMainWindow,
-            QMessageBox,
             QPushButton,
             QVBoxLayout,
             QWidget,
@@ -519,6 +579,8 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
         status = pyqtSignal(str, str, str)
 
     class ImageSurface(QLabel):
+        double_clicked = pyqtSignal()
+
         def __init__(self, *, nearest: bool = False) -> None:
             super().__init__("Waiting for frames...")
             self.setObjectName("VideoSurface")
@@ -555,20 +617,34 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
             super().resizeEvent(event)
             self._redraw()
 
+        def mouseDoubleClickEvent(self, event: Any) -> None:
+            self.double_clicked.emit()
+
     class VideoPanel(QFrame):
+        full_view_requested = pyqtSignal()
+
         def __init__(self, title: str, *, nearest: bool = False) -> None:
             super().__init__()
             self.setObjectName("VideoCard")
             layout = QVBoxLayout(self)
             layout.setContentsMargins(13, 12, 13, 13)
             layout.setSpacing(7)
+            self._layout = layout
+            title_row = QHBoxLayout()
             title_label = QLabel(title)
             title_label.setObjectName("VideoTitle")
+            self.full_view_button = QPushButton("Full Screen")
+            self.full_view_button.setObjectName("PanelButton")
+            self.full_view_button.setToolTip("Show only this feed, filling the screen. Double-clicking the image does the same.")
+            self.full_view_button.clicked.connect(self.full_view_requested.emit)
+            title_row.addWidget(title_label, 1)
+            title_row.addWidget(self.full_view_button)
             self.status_label = QLabel("Starting...")
             self.status_label.setObjectName("VideoStatus")
             self.status_label.setWordWrap(True)
             self.surface = ImageSurface(nearest=nearest)
-            layout.addWidget(title_label)
+            self.surface.double_clicked.connect(self.full_view_requested.emit)
+            layout.addLayout(title_row)
             layout.addWidget(self.status_label)
             layout.addWidget(self.surface, 1)
             self.last_sequence = 0
@@ -577,6 +653,15 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
             self.state = "starting"
             self.message = "Starting..."
             self.dimensions: Optional[tuple[int, int]] = None
+
+        def set_full_view(self, enabled: bool) -> None:
+            """Restyle for filling the screen: dark surround, no card border, a way back."""
+            self.setProperty("fullView", "true" if enabled else "false")
+            self.full_view_button.setText("Exit Full Screen (Esc)" if enabled else "Full Screen")
+            self._layout.setContentsMargins(*((10, 8, 10, 8) if enabled else (13, 12, 13, 13)))
+            for widget in (self, self.status_label, self.surface, *self.findChildren(QLabel)):
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
 
         def set_status(self, state: str, message: str) -> None:
             self.state = str(state)
@@ -617,7 +702,6 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("BumbleBox Live Camera Monitor")
-            self.resize(1420, 900)
             self.setMinimumSize(920, 650)
             self.bridge = StatusBridge()
             self.bridge.status.connect(self._set_status)
@@ -628,7 +712,12 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
                     stream, state, message
                 ),
             )
+            # Only the feeds this setup uses get a panel.
+            self.streams = monitor_streams(self.backend.sensor_names)
+            self.resize(1420 if len(self.streams) > 1 else 1100, 900)
             self.paused = False
+            self.full_view: Optional[str] = None
+            self._was_maximized = False
             self._build()
             self.timer = QTimer(self)
             self.timer.timeout.connect(self._refresh)
@@ -639,22 +728,28 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
             root = QWidget()
             root.setObjectName("MonitorRoot")
             self.setCentralWidget(root)
+            self._root = root
             outer = QVBoxLayout(root)
             outer.setContentsMargins(18, 18, 18, 16)
             outer.setSpacing(12)
+            self._outer = outer
 
             header = QFrame()
             header.setObjectName("MonitorHeader")
+            self.header = header
             header_layout = QHBoxLayout(header)
             header_layout.setContentsMargins(18, 14, 16, 14)
             title_col = QVBoxLayout()
             title = QLabel("Live Camera Monitor")
             title.setObjectName("MonitorTitle")
+            feeds = len(self.streams)
+            showing = "no camera feeds" if not feeds else "1 camera feed" if feeds == 1 else f"{feeds} camera feeds"
             subtitle = QLabel(
-                f"OwlSight preview {options.rgb_width} x {options.rgb_height}; "
-                f"full-frame fit; display capped at {options.display_fps:g} FPS"
+                f"Showing {showing} for this setup. RGB preview {options.rgb_width} x {options.rgb_height}; "
+                f"display capped at {options.display_fps:g} FPS. Double-click a feed for full screen."
             )
             subtitle.setObjectName("MonitorSubtitle")
+            subtitle.setWordWrap(True)
             title_col.addWidget(title)
             title_col.addWidget(subtitle)
             header_layout.addLayout(title_col, 1)
@@ -671,25 +766,99 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
                 "PREVIEW ONLY: no images or video are saved. Close this monitor before recording."
             )
             note.setObjectName("PrivacyNote")
+            self.note = note
             outer.addWidget(note)
 
             grid = QGridLayout()
             grid.setSpacing(12)
+            self.grid = grid
+            titles = dict(STREAM_TITLES, rgb=rgb_stream_title(config))
             self.panels = {
-                "rgb": VideoPanel("OwlSight / RGB"),
-                "thermal": VideoPanel("PureThermal / Lepton", nearest=True),
-                "realsense_color": VideoPanel("RealSense Color"),
-                "realsense_depth": VideoPanel("RealSense Depth"),
+                stream: VideoPanel(titles[stream], nearest=(stream == "thermal")) for stream in self.streams
             }
-            grid.addWidget(self.panels["rgb"], 0, 0)
-            grid.addWidget(self.panels["thermal"], 0, 1)
-            grid.addWidget(self.panels["realsense_color"], 1, 0)
-            grid.addWidget(self.panels["realsense_depth"], 1, 1)
-            grid.setRowStretch(0, 1)
-            grid.setRowStretch(1, 1)
-            grid.setColumnStretch(0, 1)
-            grid.setColumnStretch(1, 1)
+            for stream, panel in self.panels.items():
+                panel.full_view_requested.connect(lambda selected=stream: self.toggle_full_view(selected))
+            self.empty_label = QLabel(
+                "No cameras are assigned to this Pi in this setup, so there is nothing to preview."
+            )
+            self.empty_label.setObjectName("MonitorEmpty")
+            self.empty_label.setAlignment(Qt.AlignCenter)
+            self.empty_label.setVisible(not self.panels)
             outer.addLayout(grid, 1)
+            outer.addWidget(self.empty_label, 1 if not self.panels else 0)
+            self._arrange(self.streams)
+
+        def _arrange(self, streams: list[str]) -> None:
+            """Lay out the given feeds in the grid and hide the rest."""
+            for panel in self.panels.values():
+                self.grid.removeWidget(panel)
+                panel.setVisible(False)
+            for index in range(2):
+                self.grid.setRowStretch(index, 0)
+                self.grid.setColumnStretch(index, 0)
+            for stream, (row, column, row_span, column_span) in zip(streams, monitor_grid(len(streams))):
+                panel = self.panels[stream]
+                self.grid.addWidget(panel, row, column, row_span, column_span)
+                panel.setVisible(True)
+                for used_row in range(row, row + row_span):
+                    self.grid.setRowStretch(used_row, 1)
+                for used_column in range(column, column + column_span):
+                    self.grid.setColumnStretch(used_column, 1)
+
+        def toggle_full_view(self, stream: str) -> None:
+            """Fill the screen with one feed, or go back to all of them."""
+            if self.full_view == stream:
+                self.exit_full_view()
+            else:
+                self.enter_full_view(stream)
+
+        def enter_full_view(self, stream: str) -> None:
+            if stream not in self.panels:
+                return
+            if self.full_view is None:
+                self._was_maximized = self.isMaximized()
+            else:
+                self.panels[self.full_view].set_full_view(False)
+            self.full_view = stream
+            self.header.setVisible(False)
+            self.note.setVisible(False)
+            self._outer.setContentsMargins(0, 0, 0, 0)
+            self._set_root_full_view(True)
+            self.panels[stream].set_full_view(True)
+            self._arrange([stream])
+            self.showFullScreen()
+
+        def exit_full_view(self) -> None:
+            if self.full_view is None:
+                return
+            self.panels[self.full_view].set_full_view(False)
+            self.full_view = None
+            self.header.setVisible(True)
+            self.note.setVisible(True)
+            self._outer.setContentsMargins(18, 18, 18, 16)
+            self._set_root_full_view(False)
+            self._arrange(self.streams)
+            if self._was_maximized:
+                self.showMaximized()
+            else:
+                self.showNormal()
+
+        def _set_root_full_view(self, enabled: bool) -> None:
+            self._root.setProperty("fullView", "true" if enabled else "false")
+            self._root.style().unpolish(self._root)
+            self._root.style().polish(self._root)
+
+        def keyPressEvent(self, event: Any) -> None:
+            if event.key() == Qt.Key_Escape and self.full_view is not None:
+                self.exit_full_view()
+                return
+            if event.key() == Qt.Key_F11 and self.streams:
+                self.toggle_full_view(self.full_view or self.streams[0])
+                return
+            if event.key() == Qt.Key_Space:
+                self._toggle_pause()
+                return
+            super().keyPressEvent(event)
 
         def _set_status(self, stream: str, state: str, message: str) -> None:
             panel = self.panels.get(stream)
@@ -715,6 +884,23 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
             self.backend.stop(timeout=1.0)
             super().closeEvent(event)
 
+    return LiveMonitorWindow()
+
+
+def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> int:
+    options.validate()
+    from .qt_env import sanitize_current_qt_env
+
+    sanitize_current_qt_env()
+    try:
+        from PyQt5.QtCore import QLockFile, QTimer
+        from PyQt5.QtGui import QFont, QFontDatabase
+        from PyQt5.QtWidgets import QApplication, QMessageBox
+    except ImportError as exc:  # pragma: no cover - desktop dependency
+        raise RuntimeError(
+            "The live monitor requires PyQt5. Rerun start_bumblebox.sh or install python3-pyqt5."
+        ) from exc
+
     app = QApplication.instance() or QApplication([])
     app.setApplicationName("BumbleBox Live Monitor")
     app.setStyleSheet(MONITOR_STYLE)
@@ -734,7 +920,7 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
         )
         return 1
     app._bumblebox_live_monitor_lock = lock
-    window = LiveMonitorWindow()
+    window = create_live_monitor_window(config, options)
     window.show()
     if options.duration_seconds > 0:
         QTimer.singleShot(int(round(options.duration_seconds * 1000.0)), window.close)

@@ -38,6 +38,34 @@ Close the monitor before starting a recording or automated recording schedule.
 The GUI enforces this for operator-started runs because one process cannot own
 the same camera devices twice.
 
+## What It Shows
+
+The monitor shows only the feeds this setup uses:
+
+| Setup | Feeds | Layout |
+|---|---|---|
+| RGB camera only | 1 | The feed fills the window |
+| RGB + thermal | 2 | Side by side |
+| RGB + RealSense | 3 | RGB large on the left; RealSense color and depth stacked on the right |
+| RGB + thermal + RealSense | 4 | 2 x 2 grid |
+
+A sensor that is switched off, or assigned to another Pi in two-Pi capture,
+gets no panel. `--thermal`, `--no-thermal`, `--realsense` and `--no-realsense`
+change this for one session. On a Pi with two RGB cameras, the monitor shows
+the camera that is selected in the GUI.
+
+## Full Screen
+
+Any feed can fill the screen:
+
+- press **Full Screen** on its panel, or double-click its image;
+- **Esc**, the **Exit Full Screen** button, or another double-click goes back;
+- **F11** toggles full screen for the first feed, or leaves it.
+
+In full screen the window header is hidden and only that feed is drawn. The
+other cameras keep running, so going back is immediate. **Space** pauses and
+resumes the display in either view.
+
 ## Display Architecture
 
 - RGB, thermal, and RealSense run in independent worker threads.
