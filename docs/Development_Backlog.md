@@ -28,6 +28,8 @@ validated.
 - [x] Add a hardware-free three-camera recording simulation with shared timing and visual cues.
 - [x] Add a bounded local live monitor for OwlSight/RGB, thermal, RealSense color, and RealSense depth.
 - [x] Show only the feeds a setup uses in the live monitor, and let any feed fill the screen.
+- [x] Add a grayscale view toggle to the live monitor, and a separate Record in Grayscale button on the Run page.
+- [x] Open the live monitor from the Overview page.
 - [ ] Validate sustained live-monitor load and displayed frame rates on the Raspberry Pi 5.
 - [ ] Add frame-by-frame three-camera inspection output.
 - [x] Define a versioned multimodal calibration project, capture registry, artifact contract, and readiness checks.

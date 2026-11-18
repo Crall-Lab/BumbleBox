@@ -486,6 +486,99 @@ class SettingsPageTests(QtControlTestCase):
                 window._save_settings(offer_apply=True)
             self.assertEqual(started, [True])
 
+    def test_live_monitor_button_is_on_overview_not_run(self) -> None:
+        with self.window() as window:
+            overview, run = window.pages.widget(qt_gui.PAGE_INDEX_OVERVIEW), window.pages.widget(qt_gui.PAGE_INDEX_RUN)
+            self.assertTrue(overview.isAncestorOf(window.live_monitor_button))
+            self.assertFalse(run.isAncestorOf(window.live_monitor_button))
+            self.assertEqual(window.live_monitor_button.text(), "Open Live Camera Monitor")
+            started = []
+            window.run_bbx_command = lambda arguments, **kwargs: started.append((arguments, kwargs))
+            with mock.patch("bumblebox_v2.live_monitor.live_monitor_is_running", return_value=False):
+                window.live_monitor_button.click()
+            self.assertEqual(started, [(["live-monitor"], {"detached": True})])
+
+    def test_record_in_grayscale_button_on_run_saves_at_once(self) -> None:
+        with self.window() as window:
+            self.assertTrue(window.pages.widget(qt_gui.PAGE_INDEX_RUN).isAncestorOf(window.record_gray_button))
+            self.assertEqual(window.record_gray_button.text(), "Record in Grayscale: Off")
+            self.assertFalse(window.record_gray_button.isChecked())
+
+            window.record_gray_button.click()
+            self.assertTrue(load_config(window.config_path)["camera"]["monochrome_output"])
+            self.assertEqual(window.record_gray_button.text(), "Record in Grayscale: On")
+            self.assertTrue(window.record_gray_button.isChecked())
+            self.assertTrue(window.settings_monochrome.isChecked())  # the Settings page agrees
+            self.assertFalse(window._settings_dirty())
+
+            window.record_gray_button.click()
+            self.assertFalse(load_config(window.config_path)["camera"]["monochrome_output"])
+            self.assertEqual(window.record_gray_button.text(), "Record in Grayscale: Off")
+
+    def test_record_in_grayscale_follows_the_settings_page_and_the_shown_config(self) -> None:
+        def gray(config):
+            config["camera"]["monochrome_output"] = True
+
+        with self.window(gray) as window:
+            self.assertTrue(window.record_gray_button.isChecked())
+            self.assertEqual(window.record_gray_button.text(), "Record in Grayscale: On")
+            window.settings_monochrome.setChecked(False)
+            window._save_settings(offer_apply=False)
+            self.assertFalse(window.record_gray_button.isChecked())
+
+    def test_record_in_grayscale_says_when_it_leaves_a_camera_profile(self) -> None:
+        def hq(config):
+            config["camera"]["profile"] = "hq_reference"
+
+        with self.window(hq) as window:
+            with mock.patch.object(QMessageBox, "information") as told:
+                window.record_gray_button.click()
+            self.assertEqual(told.call_args[0][1], "Camera profile changed")
+            self.assertIn("HQ Reference", told.call_args[0][2])
+            saved = load_config(window.config_path)
+            self.assertEqual(saved["camera"]["profile"], "custom")
+            self.assertTrue(saved["camera"]["monochrome_output"])
+            self.assertTrue(window.settings_monochrome.isEnabled())  # no longer locked by the profile
+
+    def test_failed_recording_toggle_puts_the_button_back(self) -> None:
+        with self.window() as window:
+            with mock.patch.object(qt_gui, "set_recording_grayscale", side_effect=OSError("read-only")), mock.patch.object(
+                QMessageBox, "critical"
+            ) as refused:
+                window.record_gray_button.click()
+            self.assertEqual(refused.call_args[0][1], "Recording setting not changed")
+            self.assertFalse(window.record_gray_button.isChecked())
+            self.assertEqual(window.record_gray_button.text(), "Record in Grayscale: Off")
+
+    def test_setting_changed_outside_the_window_is_picked_up(self) -> None:
+        from bumblebox_v2.recording_options import set_recording_grayscale
+
+        with self.window() as window:
+            self.assertFalse(window._reload_if_config_changed())  # nothing has changed
+            self.assertFalse(window.settings_monochrome.isChecked())
+            set_recording_grayscale(window.config_path, True)  # what the live monitor's button does
+            self.assertTrue(window._reload_if_config_changed())
+            self.assertTrue(window.config["camera"]["monochrome_output"])
+            self.assertTrue(window.settings_monochrome.isChecked())
+            self.assertFalse(window._settings_dirty())
+            self.assertFalse(window._reload_if_config_changed())
+
+    def test_saving_does_not_undo_a_setting_changed_outside_the_window(self) -> None:
+        from bumblebox_v2.recording_options import set_recording_grayscale
+
+        with self.window() as window:
+            window.settings_recording_seconds.setValue(45)  # an unsaved edit
+            set_recording_grayscale(window.config_path, True)
+            window._reload_if_config_changed()
+            self.assertEqual(window.settings_recording_seconds.value(), 45)  # the edit is kept
+            self.assertTrue(window._settings_dirty())
+
+            self.assertTrue(window._save_settings(offer_apply=False))
+            saved = load_config(window.config_path)
+            self.assertEqual(saved["capture"]["recording_seconds"], 45)
+            self.assertTrue(saved["camera"]["monochrome_output"])  # not overwritten by the form's older value
+            self.assertTrue(window.settings_monochrome.isChecked())
+
     def test_scrolling_over_a_field_does_not_change_it(self) -> None:
         with self.window() as window:
             spin = window.settings_recording_seconds.number

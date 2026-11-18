@@ -6,8 +6,8 @@ thermal-field, depth-coverage, and basic timing checks before an experiment.
 
 ## Start It
 
-From the PyQt GUI, open the **Run** page and select
-**Open Live Camera Monitor**.
+From the PyQt GUI, press **Open Live Camera Monitor** at the top right of the
+**Overview** page, the page the window opens on.
 
 From a terminal:
 
@@ -65,6 +65,29 @@ Any feed can fill the screen:
 In full screen the window header is hidden and only that feed is drawn. The
 other cameras keep running, so going back is immediate. **Space** pauses and
 resumes the display in either view.
+
+## Grayscale
+
+Looking in grayscale and recording in grayscale are separate, and are set in
+different windows:
+
+| Control | Where | What it changes | Saved? |
+|---|---|---|---|
+| **Grayscale View** | This monitor, in the header | How the camera images are drawn here | No; it is for looking only |
+| **Record in Grayscale** | Main window, top right of the **Run** page | Whether this camera's recordings are saved in grayscale (`camera.monochrome_output`) | Yes, straight away |
+
+The monitor only looks: it saves no images and changes no settings. You can
+look in grayscale and record in colour, or the other way round.
+
+- **Grayscale View** applies to the RGB camera and the RealSense color feed.
+  Thermal and depth keep their colour scale, which carries the measurement.
+  **G** toggles it, including in full screen. It shows the image's luma, which
+  is what a grayscale recording keeps.
+- **Record in Grayscale** takes effect from the next recording, for the camera
+  shown in the main window. A named camera profile fixes this setting, so
+  switching it under such a profile moves the camera to the Custom profile,
+  keeping its other values; a message says so when that happens. The same
+  setting is the "Save grayscale video" box on the **Settings** page.
 
 ## Display Architecture
 

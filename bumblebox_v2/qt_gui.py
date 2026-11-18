@@ -131,6 +131,7 @@ from .multi_camera import (
     schedules_match,
     suggest_second_colony_id,
 )
+from .recording_options import recording_is_grayscale, set_recording_grayscale
 from .schedule_check import run_schedule_check
 from .status_history import list_recent_run_records, load_run_summary
 from .stream_writer import FRAME_BUFFER_STREAM, frame_buffer_mode
@@ -405,6 +406,7 @@ QPushButton#Quiet {
     border-color: #dcded7;
 }
 QPushButton#Quiet:hover { background: #f5f5ef; border-color: #cdd4cf; }
+QPushButton:checked { background: #39786a; color: #ffffff; border-color: #39786a; }
 QPushButton#Segment {
     background: #fffefb;
     color: #52625e;
@@ -1694,7 +1696,16 @@ class BumbleBoxQtGUI(QMainWindow):
             "Experiment readiness",
             "A concise view of this BumbleBox. Device-specific setup stays hidden unless the device is enabled.",
         )
-        layout.addWidget(heading)
+        self.live_monitor_button = QPushButton("Open Live Camera Monitor")
+        self.live_monitor_button.setObjectName("Primary")
+        self.live_monitor_button.setToolTip(
+            "See what the cameras see, live, without saving anything. Close the monitor before recording."
+        )
+        self.live_monitor_button.clicked.connect(self._open_live_monitor)
+        heading_row = QHBoxLayout()
+        heading_row.addWidget(heading, 1)
+        heading_row.addWidget(self.live_monitor_button, 0, Qt.AlignVCenter)
+        layout.addLayout(heading_row)
         layout.addWidget(subtitle)
         self.overview_subtitle = subtitle
         self.cameras_strip = QFrame()
@@ -1814,15 +1825,17 @@ class BumbleBoxQtGUI(QMainWindow):
             "Capture and automation",
             "Record once now, or start and stop the recording schedule.",
         )
-        self.live_monitor_button = QPushButton("Open Live Camera Monitor")
-        self.live_monitor_button.setObjectName("Primary")
-        self.live_monitor_button.setToolTip(
-            "Preview enabled cameras together without saving data. Close the monitor before recording."
+        self.record_gray_button = QPushButton("Record in Grayscale: Off")
+        self.record_gray_button.setCheckable(True)
+        self.record_gray_button.setToolTip(
+            "Save this camera's recordings in grayscale (smaller files) or in colour. Saved straight "
+            "away and used from the next recording. To look at the camera in grayscale without "
+            "changing recordings, use Grayscale View in the Live Camera Monitor."
         )
-        self.live_monitor_button.clicked.connect(self._open_live_monitor)
+        self.record_gray_button.clicked.connect(self._toggle_record_grayscale)
         heading_row = QHBoxLayout()
         heading_row.addWidget(heading, 1)
-        heading_row.addWidget(self.live_monitor_button, 0, Qt.AlignVCenter)
+        heading_row.addWidget(self.record_gray_button, 0, Qt.AlignVCenter)
         layout.addLayout(heading_row)
         layout.addWidget(subtitle)
         # The controls scroll when the window is short, so the outcome of the
@@ -2428,10 +2441,21 @@ class BumbleBoxQtGUI(QMainWindow):
         return self._settings_saved_values is not None and self._settings_values() != self._settings_saved_values
 
     def _apply_settings_to(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Write the values changed on the Settings page into ``config``.
+
+        Only fields the user actually changed are written. The config file can
+        be changed elsewhere while this window is open (the live monitor's
+        Record in Grayscale button, or editing the file by hand); writing
+        every field would put the form's older values back over those.
+        """
         fixed = self._settings_profile_fixed()
+        shown_when_loaded = self._settings_saved_values or {}
         for key, value in self._settings_values().items():
-            if key not in fixed:
-                _set_nested(config, key, value)
+            if key in fixed:
+                continue
+            if key in shown_when_loaded and shown_when_loaded[key] == value:
+                continue
+            _set_nested(config, key, value)
         return config
 
     def _settings_candidate(self) -> dict[str, Any]:
@@ -3402,6 +3426,8 @@ class BumbleBoxQtGUI(QMainWindow):
             )
 
     def refresh_from_config(self) -> None:
+        # Whatever is on disk now is what this window has seen.
+        self._config_stamp_seen = self._config_file_stamp()
         self._reload_cameras()
         setup = self.config.get("setup", {})
         profile_key = str(setup.get("hardware_profile", "custom"))
@@ -3487,6 +3513,7 @@ class BumbleBoxQtGUI(QMainWindow):
         self._update_results_hardware_columns()
         if not self._settings_dirty():
             self._load_settings_form()
+        self._show_record_grayscale(recording_is_grayscale(self.config))
         self._update_camera_widgets()
         self._update_storage_estimate()
         self.refresh_box_status()
@@ -3751,6 +3778,51 @@ class BumbleBoxQtGUI(QMainWindow):
             f"Its settings were kept as {kept_as.name}. Its recordings were not touched.",
         )
 
+    def _config_file_stamp(self) -> tuple[int, int] | None:
+        try:
+            stat = self.config_path.stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    def changeEvent(self, event: Any) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            self._reload_if_config_changed()
+
+    def _reload_if_config_changed(self) -> bool:
+        """Pick up a config file that was changed outside this window.
+
+        Called when the window comes back to the front, for example after the
+        live monitor saved a recording setting. Unsaved edits on the Settings
+        page are kept; only the fields the user changed are written on save.
+        """
+        stamp = self._config_file_stamp()
+        if stamp is None or stamp == getattr(self, "_config_stamp_seen", None):
+            return False
+        self._config_stamp_seen = stamp
+        if self.process.state() != QProcess.NotRunning:
+            return False  # a running command reloads the config itself when it ends
+        try:
+            changed = load_config(self.config_path)
+        except Exception:
+            return False
+        self._adopt_config(changed)
+        return True
+
+    def _adopt_config(self, config: dict[str, Any]) -> None:
+        """Take a config that was changed outside the Settings page.
+
+        Whether the Settings page has unsaved edits has to be judged before the
+        swap: afterwards the form would be compared with the new config and
+        look edited when it is only out of date.
+        """
+        untouched = not self._settings_dirty()
+        self.config = config
+        if untouched:
+            self._load_settings_form()
+        self.refresh_from_config()
+
     def closeEvent(self, event: Any) -> None:
         if self._settings_dirty():
             choice = self._ask_unsaved_settings_on_close()
@@ -3919,6 +3991,23 @@ class BumbleBoxQtGUI(QMainWindow):
         if not self._resolve_unsaved_settings("start a recording"):
             return
         self.run_bbx_command(["run-once", "--mode", str(self.run_mode.currentData())])
+
+    def _show_record_grayscale(self, enabled: bool) -> None:
+        self.record_gray_button.setChecked(bool(enabled))
+        self.record_gray_button.setText(f"Record in Grayscale: {'On' if enabled else 'Off'}")
+
+    def _toggle_record_grayscale(self, checked: bool) -> None:
+        """Save whether the shown camera's recordings are grayscale, straight away."""
+        try:
+            change = set_recording_grayscale(self.config_path, bool(checked))
+        except Exception as exc:
+            self._show_record_grayscale(recording_is_grayscale(self.config))
+            QMessageBox.critical(self, "Recording setting not changed", str(exc))
+            return
+        self._adopt_config(load_config(self.config_path))
+        if change.left_profile:
+            # Leaving a named camera profile is a change the user did not ask for by name.
+            QMessageBox.information(self, "Camera profile changed", change.message)
 
     def _run_both_once(self) -> None:
         if len(self.cameras) < 2:

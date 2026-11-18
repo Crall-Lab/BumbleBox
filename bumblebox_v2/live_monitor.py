@@ -11,6 +11,7 @@ import time
 from typing import Any, Callable, Optional
 
 
+
 @dataclass(frozen=True)
 class LiveMonitorOptions:
     # The OwlSight selects a cropped 16:9 sensor mode for 1280x960. This
@@ -488,6 +489,7 @@ QPushButton {
 QPushButton:hover { background: #d6e7de; }
 QPushButton#CloseButton { background: #39786a; color: white; border-color: #39786a; }
 QPushButton#PanelButton { padding: 4px 10px; font-size: 12px; border-radius: 7px; }
+QPushButton:checked { background: #39786a; color: white; border-color: #39786a; }
 QLabel#MonitorEmpty { color: #63756f; font-size: 15px; }
 QWidget#MonitorRoot[fullView="true"] { background: #101614; }
 QFrame#VideoCard[fullView="true"] { background: #101614; border: none; border-radius: 0; }
@@ -503,6 +505,23 @@ STREAM_TITLES = {
     "realsense_color": "RealSense Color",
     "realsense_depth": "RealSense Depth",
 }
+
+
+# Feeds that are real colour images. Thermal and depth are drawn with a false
+# colour scale that carries the measurement, so the grayscale view leaves them.
+COLOUR_STREAMS = {"rgb", "realsense_color"}
+
+
+def bgr_to_gray(frame: Any) -> Any:
+    """Luma of a BGR image as an 8-bit array: what a grayscale recording keeps."""
+    import numpy as np
+
+    array = np.asarray(frame)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError(f"Expected a BGR image, got shape {array.shape}.")
+    blue, green, red = (array[:, :, channel].astype(np.uint16) for channel in range(3))
+    # Rec. 601 weights scaled to 256 (0.114, 0.587, 0.299).
+    return ((blue * 29 + green * 150 + red * 77) >> 8).astype(np.uint8)
 
 
 def monitor_streams(sensor_names: set[str]) -> list[str]:
@@ -555,7 +574,10 @@ def rgb_stream_title(config: dict[str, Any]) -> str:
 
 
 def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptions) -> Any:
-    """Build the monitor window. A ``QApplication`` must already exist."""
+    """Build the monitor window. A ``QApplication`` must already exist.
+
+    The monitor only looks: it saves no images and changes no settings.
+    """
     options.validate()
     try:
         from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
@@ -588,6 +610,14 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             self.setMinimumSize(300, 210)
             self._source: Optional[QPixmap] = None
             self._nearest = bool(nearest)
+            self._frame: Any = None
+            self._grayscale = False
+
+        def set_grayscale(self, enabled: bool) -> None:
+            """Draw in grayscale or colour. Redraws the frame on screen, so it works while paused."""
+            self._grayscale = bool(enabled)
+            if self._frame is not None:
+                self._render()
 
         def set_bgr(self, frame: Any) -> None:
             import numpy as np
@@ -595,15 +625,20 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             array = np.asarray(frame)
             if array.ndim != 3 or array.shape[2] != 3:
                 raise ValueError(f"Monitor display expects BGR image data, got {array.shape}.")
-            rgb = np.ascontiguousarray(array[:, :, ::-1])
-            height, width = int(rgb.shape[0]), int(rgb.shape[1])
-            image = QImage(
-                rgb.data,
-                width,
-                height,
-                int(rgb.strides[0]),
-                QImage.Format_RGB888,
-            ).copy()
+            self._frame = array
+            self._render()
+
+        def _render(self) -> None:
+            import numpy as np
+
+            array = self._frame
+            height, width = int(array.shape[0]), int(array.shape[1])
+            if self._grayscale:
+                gray = np.ascontiguousarray(bgr_to_gray(array))
+                image = QImage(gray.data, width, height, int(gray.strides[0]), QImage.Format_Grayscale8).copy()
+            else:
+                rgb = np.ascontiguousarray(array[:, :, ::-1])
+                image = QImage(rgb.data, width, height, int(rgb.strides[0]), QImage.Format_RGB888).copy()
             self._source = QPixmap.fromImage(image)
             self._redraw()
 
@@ -716,6 +751,7 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             self.streams = monitor_streams(self.backend.sensor_names)
             self.resize(1420 if len(self.streams) > 1 else 1100, 900)
             self.paused = False
+            self.grayscale_view = False
             self.full_view: Optional[str] = None
             self._was_maximized = False
             self._build()
@@ -753,20 +789,34 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             title_col.addWidget(title)
             title_col.addWidget(subtitle)
             header_layout.addLayout(title_col, 1)
+            has_colour_feed = any(stream in COLOUR_STREAMS for stream in self.streams)
+            self.gray_view_button = QPushButton("Grayscale View")
+            self.gray_view_button.setCheckable(True)
+            self.gray_view_button.setToolTip(
+                "Show the camera image in grayscale. This only changes what you see here; "
+                "recordings are not affected (that setting is on the Run page of the main window). "
+                "Shortcut: G."
+            )
+            self.gray_view_button.toggled.connect(self.set_grayscale_view)
+            self.gray_view_button.setVisible(has_colour_feed)
             self.pause_button = QPushButton("Pause Display")
             self.pause_button.clicked.connect(self._toggle_pause)
             close_button = QPushButton("Close Monitor")
             close_button.setObjectName("CloseButton")
             close_button.clicked.connect(self.close)
+            header_layout.addWidget(self.gray_view_button)
             header_layout.addWidget(self.pause_button)
             header_layout.addWidget(close_button)
             outer.addWidget(header)
 
             note = QLabel(
-                "PREVIEW ONLY: no images or video are saved. Close this monitor before recording."
+                "PREVIEW ONLY: no images or video are saved, and nothing here changes how recordings "
+                "are made. Close this monitor before recording."
             )
             note.setObjectName("PrivacyNote")
+            note.setWordWrap(True)
             self.note = note
+            self._label_toggles()
             outer.addWidget(note)
 
             grid = QGridLayout()
@@ -804,6 +854,20 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
                     self.grid.setRowStretch(used_row, 1)
                 for used_column in range(column, column + column_span):
                     self.grid.setColumnStretch(used_column, 1)
+
+        def _label_toggles(self) -> None:
+            # The state is in the words as well as the colour.
+            self.gray_view_button.setText(f"Grayscale View: {'On' if self.grayscale_view else 'Off'}")
+
+        def set_grayscale_view(self, enabled: bool) -> None:
+            """Show the colour camera feeds in grayscale. Changes the display only."""
+            self.grayscale_view = bool(enabled)
+            if self.gray_view_button.isChecked() != self.grayscale_view:
+                self.gray_view_button.setChecked(self.grayscale_view)
+            for stream, panel in self.panels.items():
+                if stream in COLOUR_STREAMS:
+                    panel.surface.set_grayscale(self.grayscale_view)
+            self._label_toggles()
 
         def toggle_full_view(self, stream: str) -> None:
             """Fill the screen with one feed, or go back to all of them."""
@@ -857,6 +921,9 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
                 return
             if event.key() == Qt.Key_Space:
                 self._toggle_pause()
+                return
+            if event.key() == Qt.Key_G and not self.gray_view_button.isHidden():
+                self.set_grayscale_view(not self.grayscale_view)
                 return
             super().keyPressEvent(event)
 

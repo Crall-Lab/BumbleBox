@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import tempfile
 import time
 import unittest
 
 import numpy as np
 
 from bumblebox_v2.cli import build_parser
-from bumblebox_v2.config import load_defaults
+from bumblebox_v2.config import load_config, load_defaults, save_config
+from bumblebox_v2.recording_options import recording_is_grayscale, set_recording_grayscale
 from bumblebox_v2.live_monitor import (
     DepthColorizer,
     LiveMonitorBackend,
     LiveMonitorOptions,
     ThermalColorizer,
+    bgr_to_gray,
     create_live_monitor_window,
     monitor_grid,
     monitor_streams,
@@ -271,6 +275,135 @@ class MonitorWindowTests(unittest.TestCase):
         self.assertFalse(window.empty_label.isHidden())
         window.toggle_full_view("rgb")  # nothing to show; must not fail
         self.assertIsNone(window.full_view)
+
+
+class GrayscaleHelperTests(unittest.TestCase):
+    def test_luma_of_primary_colours(self) -> None:
+        image = np.zeros((1, 5, 3), dtype=np.uint8)
+        image[0, 0] = (255, 0, 0)  # blue (BGR)
+        image[0, 1] = (0, 255, 0)  # green
+        image[0, 2] = (0, 0, 255)  # red
+        image[0, 3] = (255, 255, 255)
+        image[0, 4] = (90, 90, 90)
+        gray = bgr_to_gray(image)
+        self.assertEqual(gray.shape, (1, 5))
+        self.assertEqual(gray.dtype, np.uint8)
+        blue, green, red, white, mid = (int(value) for value in gray[0])
+        self.assertTrue(green > red > blue)  # the eye, and the camera's luma, weight green most
+        self.assertEqual(white, 255)
+        self.assertEqual(mid, 90)
+        with self.assertRaises(ValueError):
+            bgr_to_gray(np.zeros((4, 4), dtype=np.uint8))
+
+    def test_recording_setting_is_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            save_config(path, load_defaults())
+            self.assertFalse(recording_is_grayscale(load_config(path)))
+            change = set_recording_grayscale(path, True)
+            self.assertTrue(change.grayscale)
+            self.assertIsNone(change.left_profile)
+            self.assertTrue(recording_is_grayscale(load_config(path)))
+            self.assertIn("saved in grayscale", change.message)
+            self.assertFalse(set_recording_grayscale(path, False).grayscale)
+            self.assertFalse(load_config(path)["camera"]["monochrome_output"])
+
+    def test_profile_that_fixes_colour_is_left_only_when_it_has_to_be(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            config = load_defaults()
+            config["camera"]["profile"] = "hq_reference"  # this profile records in colour
+            save_config(path, config)
+            unchanged = set_recording_grayscale(path, False)
+            self.assertIsNone(unchanged.left_profile)
+            self.assertEqual(load_config(path)["camera"]["profile"], "hq_reference")
+
+            change = set_recording_grayscale(path, True)
+            self.assertEqual(change.left_profile, "HQ Reference")
+            self.assertIn("Custom settings", change.message)
+            saved = load_config(path)
+            self.assertEqual(saved["camera"]["profile"], "custom")
+            self.assertTrue(saved["camera"]["monochrome_output"])
+            self.assertEqual(saved["camera"]["fps_target"], 7.0)  # the profile's other values stay
+
+
+@unittest.skipIf(QApplication is None, "PyQt5 is not available")
+class MonitorGrayscaleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def window(self, *, thermal: bool = False, depth: bool = False, configure=None):
+        config = load_defaults()
+        config["runtime"]["use_mock_camera"] = True
+        config["thermal"]["enabled"] = thermal
+        config["realsense"]["enabled"] = depth
+        if configure is not None:
+            configure(config)
+        window = create_live_monitor_window(config, LiveMonitorOptions(rgb_width=64, rgb_height=48))
+        self.addCleanup(window.close)
+        window.show()
+        return window
+
+    @staticmethod
+    def colour_frame() -> np.ndarray:
+        frame = np.zeros((12, 16, 3), dtype=np.uint8)
+        frame[:, :] = (30, 200, 90)  # clearly not gray
+        return frame
+
+    @staticmethod
+    def is_gray(surface) -> bool:
+        pixel = surface._source.toImage().pixelColor(4, 4)
+        return pixel.red() == pixel.green() == pixel.blue()
+
+    def test_grayscale_view_changes_the_picture_of_the_colour_cameras(self) -> None:
+        window = self.window(thermal=True, depth=True)
+        for panel in window.panels.values():
+            panel.surface.set_bgr(self.colour_frame())
+        self.assertFalse(self.is_gray(window.panels["rgb"].surface))
+        self.assertEqual(window.gray_view_button.text(), "Grayscale View: Off")
+
+        window.gray_view_button.click()
+        self.assertTrue(window.grayscale_view)
+        self.assertEqual(window.gray_view_button.text(), "Grayscale View: On")
+        self.assertTrue(self.is_gray(window.panels["rgb"].surface))  # redrawn at once, even with no new frame
+        self.assertTrue(self.is_gray(window.panels["realsense_color"].surface))
+        # Thermal and depth use a colour scale that carries the measurement; they stay as they are.
+        self.assertFalse(self.is_gray(window.panels["thermal"].surface))
+        self.assertFalse(self.is_gray(window.panels["realsense_depth"].surface))
+
+        window.gray_view_button.click()
+        self.assertFalse(self.is_gray(window.panels["rgb"].surface))
+
+    def test_g_key_switches_the_view_also_in_full_screen(self) -> None:
+        window = self.window()
+        window.panels["rgb"].surface.set_bgr(self.colour_frame())
+        window.toggle_full_view("rgb")
+        QTest.keyClick(window, Qt.Key_G)
+        self.assertTrue(window.grayscale_view)
+        self.assertTrue(window.gray_view_button.isChecked())
+        self.assertTrue(self.is_gray(window.panels["rgb"].surface))
+        QTest.keyClick(window, Qt.Key_G)
+        self.assertFalse(window.grayscale_view)
+
+    def test_monitor_only_looks_it_has_no_recording_controls(self) -> None:
+        window = self.window()
+        self.assertFalse(hasattr(window, "record_gray_button"))
+        labels = [button.text() for button in window.findChildren(type(window.gray_view_button))]
+        self.assertFalse(any("Record" in label for label in labels), labels)
+        self.assertIn("nothing here changes how recordings are made", window.note.text())
+
+    def test_no_view_button_without_a_colour_feed(self) -> None:
+        def thermal_only_here(config):
+            config["distributed_capture"]["enabled"] = True
+            config["distributed_capture"]["nodes"] = [
+                {"name": "this", "local": True, "host": "pi1.local", "sensors": ["thermal"]},
+                {"name": "other", "local": False, "host": "pi2.local", "sensors": ["rgb"]},
+            ]
+
+        window = self.window(thermal=True, configure=thermal_only_here)
+        self.assertEqual(list(window.panels), ["thermal"])
+        self.assertTrue(window.gray_view_button.isHidden())
 
 
 if __name__ == "__main__":
