@@ -107,6 +107,7 @@ sudo apt install python3-pyqt5 labelme
 - encoder speed benchmark for choosing a stream-recording encoder, no camera needed (`encode-benchmark`)
 - same-frames comparison of tag tracking on raw frames versus each encoder's compressed video (`tracking-compression-check`)
 - unattended-recording protections: runs are refused when the data drive is missing or nearly full, only one run uses the camera at a time, and hung scheduled runs are stopped; see `docs/Unattended_Safety.md`
+- two Raspberry Pi cameras on one Pi 5, recording at the same moments, each with its own settings and pinned to its connector (`second-camera add|status|pin|remove`, `run-once --all-cameras`); see `docs/Two_Cameras.md`
 - explicit pixel-to-distance calibration (`calibrate-scale manual|aruco`)
 - generated user roadmap (`roadmap`)
 - one-shot run execution with mode override (`run-once`)
@@ -184,6 +185,7 @@ Only one primary Qt GUI instance is allowed per user. During migration, run `bbx
 - `/Users/aec/Desktop/BumbleBox/docs/FPS_Sweep.md`
 - `docs/Streaming_Capture.md`
 - `docs/Unattended_Safety.md`
+- `docs/Two_Cameras.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Storage_Setup.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Tracking_Optimization.md`
 - `/Users/aec/Desktop/BumbleBox/docs/Run_Bundle.md`

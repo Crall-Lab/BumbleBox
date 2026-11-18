@@ -71,6 +71,32 @@ See `docs/RealSense_Camera.md` for hardware validation and `docs/Multimodal_Cali
 - [ ] Check the storage estimate against a week of real recordings on a Pi.
 - [ ] Test Cancel during two-Pi capture; the other Pi may keep recording.
 
+## Two Cameras on One Pi
+
+**Status:** Implemented with one config per camera; not yet run on a Pi with two cameras
+
+**Goal:** Record from two Raspberry Pi cameras on one Pi 5 at the same moments.
+
+- [x] Choose a camera per config, by number or pinned to one physical camera
+      (`camera.camera_num`, `camera.camera_id`); refuse to record when a pinned
+      camera is missing instead of using the other one.
+- [x] One capture lock per camera, tagged session names for the second camera,
+      and separate timer names, so both schedules run together.
+- [x] `bbx second-camera add|status|pin|remove` and `bbx run-once --all-cameras`.
+- [x] GUI: add and remove the second camera, camera switch, both-camera status,
+      start/stop/record both, schedule kept in step on request, memory and
+      storage judged for both together. See `docs/Two_Cameras.md`.
+- [ ] Run on a Pi 5 with two HQ cameras: confirm the libcamera Ids are stable
+      across reboots and that pinning picks the right connector.
+- [ ] Load-test both cameras at full resolution in memory mode and in
+      encode-while-recording mode; record the frame rates each camera reaches.
+- [ ] Make `encode-benchmark` able to test two streams at once.
+- [ ] Decide whether frames need to be synchronised between cameras; if so,
+      record both in one run with a shared clock (the larger redesign).
+- [ ] Make `export-bundle` and `fps-sweep` pick the newest run of one camera
+      when two share a data folder.
+- [ ] Let the live monitor show both cameras side by side.
+
 ## View-Only Status Page (Optional Add-On)
 
 **Status:** Not started; deferred on 2026-11-12

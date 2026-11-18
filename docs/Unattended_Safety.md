@@ -47,8 +47,8 @@ If you record to the SD card on purpose with `data_root` under `/mnt` or
 ## 2. Only one run uses the camera at a time
 
 Scheduled runs can coincide. In `mixed_schedule` mode, for example, the record
-and track timers both fire on the hour. A run now takes a machine-wide lock
-while it is capturing. A second run waits up to
+and track timers both fire on the hour. A run now takes a lock on its camera
+while it is capturing. A second run on that camera waits up to
 `runtime.capture_lock_wait_seconds` (default 60) for the first to finish
 capturing, then starts. If the wait runs out, the second run stops with:
 
@@ -68,6 +68,10 @@ Before, they shared one folder and overwrote each other's files.
 
 If runs are skipped regularly, the schedule is too tight for the recording
 length; `bbx schedule-check` shows why.
+
+On a Pi with two cameras each camera has its own lock, so the two record at
+the same time while runs on one camera still take turns. See
+`docs/Two_Cameras.md`.
 
 ## 3. A hung run is stopped
 

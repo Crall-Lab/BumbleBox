@@ -36,7 +36,14 @@ from .simulated_capture import (
     simulated_rgb_yuv420_frame,
     simulated_thermal_frame,
 )
-from .capture_lock import DEFAULT_LOCK_WAIT_SECONDS, capture_lock
+from .camera_select import (
+    capture_lock_suffix,
+    configured_camera_id,
+    configured_camera_num,
+    picamera2_camera_kwargs,
+    session_tag,
+)
+from .capture_lock import DEFAULT_LOCK_WAIT_SECONDS, capture_lock, default_lock_path
 from .storage_guard import ensure_storage_ready
 from .stream_writer import (
     FRAME_BUFFER_STREAM,
@@ -190,6 +197,11 @@ class RunSummary:
     warnings: List[str]
     errors: List[str]
     success: bool
+    # Which camera of a two-camera Pi made this run. Older summaries lack
+    # these and count as the first camera.
+    camera_num: int = 0
+    camera_id: Optional[str] = None
+    camera_session_tag: str = ""
 
 
 @dataclass
@@ -345,7 +357,12 @@ def _native_camera_probe_command() -> Optional[list[str]]:
 def _make_session_paths(config: Dict[str, Any]) -> Tuple[str, Path]:
     hostname = socket.gethostname()
     now = datetime.now()
-    base_name = f"{hostname}_{now.strftime('%Y-%m-%d_%H_%M_%S')}"
+    # A second camera on the same Pi tags its sessions (for example "cam2"),
+    # so two cameras recording in the same second never produce files with
+    # the same name, in the data folder or in the local tracking index.
+    tag = session_tag(config)
+    device = f"{hostname}_{tag}" if tag else hostname
+    base_name = f"{device}_{now.strftime('%Y-%m-%d_%H_%M_%S')}"
 
     data_root = Path(config["system"]["data_root"])
     day_dir = data_root / now.strftime("%Y-%m-%d")
@@ -611,10 +628,11 @@ class _PicameraCaptureSession:
                 pass
 
             try:
+                camera_kwargs = picamera2_camera_kwargs(self.config, self._Picamera2)
                 if self.resolved_tuning_file:
                     tuning = self._Picamera2.load_tuning_file(str(self.resolved_tuning_file))
-                    return self._Picamera2(tuning=tuning)
-                return self._Picamera2()
+                    return self._Picamera2(tuning=tuning, **camera_kwargs)
+                return self._Picamera2(**camera_kwargs)
             except IndexError as exc:
                 last_error = RuntimeError(
                     "No camera detected by picamera2/libcamera (IndexError during camera open). "
@@ -2813,6 +2831,9 @@ def run_once(
             camera_lock.enter_context(
                 capture_lock(
                     float(config["runtime"].get("capture_lock_wait_seconds", DEFAULT_LOCK_WAIT_SECONDS)),
+                    # One lock per camera: two cameras on one Pi may record at
+                    # the same time, two runs on the same camera may not.
+                    lock_path=default_lock_path(capture_lock_suffix(config)),
                     on_wait=lambda holder: _progress_message(
                         "capture",
                         f"Waiting for another BumbleBox capture to release the camera ({holder}).",
@@ -3280,6 +3301,9 @@ def run_once(
         warnings=warnings,
         errors=errors,
         success=(len(errors) == 0),
+        camera_num=configured_camera_num(config),
+        camera_id=configured_camera_id(config),
+        camera_session_tag=session_tag(config),
     )
 
     summary_path = Path(summary.session_dir) / f"{summary.session_name}_run_summary.json"

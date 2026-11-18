@@ -26,6 +26,7 @@ from .camera_profiles import (
     validate_camera_ir_compatibility,
 )
 from .qt_env import sanitize_current_qt_env
+from .camera_select import picamera2_camera_kwargs
 from .tuning import inspect_camera_tuning_resolution, resolve_camera_tuning_file
 
 
@@ -303,11 +304,12 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
 
         try:
             resolved_tuning_file = tuning_info.get("resolved")
+            camera_kwargs = picamera2_camera_kwargs(config, Picamera2)
             if resolved_tuning_file:
                 tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
-                picam2 = Picamera2(tuning=tuning)
+                picam2 = Picamera2(tuning=tuning, **camera_kwargs)
             else:
-                picam2 = Picamera2()
+                picam2 = Picamera2(**camera_kwargs)
             properties = getattr(picam2, "camera_properties", {})
             if isinstance(properties, dict):
                 opened_camera_properties = _jsonable(properties)
@@ -505,10 +507,11 @@ def _open_picamera2(
             pass
 
         try:
+            camera_kwargs = picamera2_camera_kwargs(config, Picamera2)
             if resolved_tuning_file:
                 tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
-                return Picamera2(tuning=tuning)
-            return Picamera2()
+                return Picamera2(tuning=tuning, **camera_kwargs)
+            return Picamera2(**camera_kwargs)
         except IndexError as exc:
             raise RuntimeError(
                 "No camera detected by picamera2/libcamera (IndexError during camera open). "

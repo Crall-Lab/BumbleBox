@@ -7,8 +7,10 @@ import re
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -128,6 +130,15 @@ from .run_bundle import (
 )
 from .run_engine import format_run_summary, reset_camera_runtime, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
+from .multi_camera import (
+    check_camera_set,
+    combined_memory,
+    create_second_camera,
+    load_cameras,
+    pin_cameras,
+    remove_second_camera,
+    schedules_match,
+)
 from .storage_guard import check_storage_ready, format_storage_readiness
 from .tracking_compression_check import (
     DEFAULT_CHECK_SECONDS,
@@ -1370,7 +1381,94 @@ def _cmd_nest_label_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_once_all_cameras(args: argparse.Namespace) -> int:
+    """Record from every camera of this Pi at the same moment.
+
+    Each camera runs as its own ``bbx run-once`` process with its own config,
+    exactly as its scheduled run does, so this is also how to test that the
+    Pi can carry both cameras at once.
+    """
+    from .box_status import explain_failure
+
+    primary_path = Path(args.config)
+    try:
+        cameras = load_cameras(primary_path, _load_or_defaults(primary_path))
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+    if len(cameras) < 2:
+        print("Only one camera is set up on this Pi; recording from it.")
+
+    forwarded: list[str] = []
+    if args.mode:
+        forwarded += ["--mode", str(args.mode)]
+    if args.mock_camera:
+        forwarded.append("--mock-camera")
+    if args.codec:
+        forwarded += ["--codec", str(args.codec)]
+    if getattr(args, "frame_buffer", None):
+        forwarded += ["--frame-buffer", str(args.frame_buffer)]
+    if getattr(args, "mp4_preset", None):
+        forwarded += ["--mp4-preset", str(args.mp4_preset)]
+
+    script = Path(__file__).resolve().parents[1] / "bbx.py"
+    outputs: dict[int, list[str]] = {camera.index: [] for camera in cameras}
+    processes = []
+    readers = []
+
+    def _relay(camera_index: int, label: str, stream: Any) -> None:
+        for line in stream:
+            outputs[camera_index].append(line)
+            print(f"[{label}] {line}", end="", flush=True)
+
+    for camera in cameras:
+        process = subprocess.Popen(
+            [sys.executable, str(script), "run-once", "--config", str(camera.path), *forwarded],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        processes.append(process)
+        reader = threading.Thread(
+            target=_relay, args=(camera.index, camera.label.lower(), process.stdout), daemon=True
+        )
+        reader.start()
+        readers.append(reader)
+
+    interrupted = False
+    try:
+        while any(process.poll() is None for process in processes):
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        # Ctrl+C, or Cancel in the GUI: pass it on so each recording stops
+        # cleanly and writes its own summary.
+        interrupted = True
+        for process in processes:
+            if process.poll() is None:
+                process.send_signal(signal.SIGINT)
+    codes = [process.wait() for process in processes]
+    for reader in readers:
+        reader.join(timeout=5)
+    for process in processes:
+        if process.stdout is not None:
+            process.stdout.close()
+
+    print("")
+    for camera, code in zip(cameras, codes):
+        if code == 0:
+            print(f"{camera.label}: recorded.")
+        else:
+            reason = explain_failure("".join(outputs[camera.index]), exit_code=code, command=["run-once"]).reason
+            print(f"{camera.label} failed: {reason}")
+    if interrupted:
+        return 130
+    return 0 if all(code == 0 for code in codes) else 1
+
+
 def _cmd_run_once(args: argparse.Namespace) -> int:
+    if getattr(args, "all_cameras", False):
+        return _run_once_all_cameras(args)
     config_path = Path(args.config)
     try:
         config = _load_or_defaults(config_path)
@@ -4115,6 +4213,103 @@ def _cmd_systemd_action(args: argparse.Namespace) -> int:
     return 0 if result.success else 1
 
 
+def _cmd_second_camera_add(args: argparse.Namespace) -> int:
+    try:
+        result = create_second_camera(Path(args.config), colony_id=args.colony_id, data_root=args.data_root)
+    except FileExistsError as exc:
+        print(f"Second camera setup failed: {exc}")
+        return 1
+    except (FileNotFoundError, ConfigError, RuntimeError, OSError) as exc:
+        print(f"Second camera setup failed: {exc}")
+        return 1
+    print(f"Second camera config: {result.path}")
+    for note in result.notes:
+        print(f"Note: {note}")
+    print("Its schedule is off. Check its settings, then start both schedules (GUI Run page, or")
+    print(f"`bbx systemd-write --config {result.path}` and `bbx systemd-install --config {result.path}`).")
+    return 0
+
+
+def _cmd_second_camera_status(args: argparse.Namespace) -> int:
+    from .camera_select import detect_cameras
+
+    primary_path = Path(args.config)
+    try:
+        cameras = load_cameras(primary_path, _load_or_defaults(primary_path))
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+    detected = detect_cameras()
+    print(f"Cameras detected now: {len(detected)}")
+    for camera in detected:
+        print(f"  {camera.num}: {camera.description}")
+    if len(cameras) < 2:
+        print("Second camera: not set up. Add it with `bbx second-camera add`.")
+        return 0
+    for camera in cameras:
+        camera_cfg = camera.config.get("camera", {})
+        pin = f"pinned to {camera_cfg.get('camera_id')}" if camera.pinned else f"camera number {camera_cfg.get('camera_num', 0)}, not pinned"
+        print(f"{camera.long_label}: {camera.path}")
+        print(f"  camera: {pin}")
+        print(f"  data folder: {camera.config.get('system', {}).get('data_root')}")
+        print(f"  timers: {camera.config.get('scheduling', {}).get('unit_prefix')}-*")
+    problems = check_camera_set(cameras)
+    for problem in problems:
+        print(f"[FAIL] {problem}")
+    if not all(camera.pinned for camera in cameras):
+        print("[WARN] The cameras are not pinned. Connect both and run `bbx second-camera pin`.")
+    same = schedules_match(cameras[0].config, cameras[1].config)
+    print("Schedules: the same" if same else "Schedules: different (each camera follows its own)")
+    load = combined_memory(cameras)
+    if load is not None:
+        print(f"[{ {'ok': 'PASS', 'warn': 'WARN', 'fail': 'FAIL'}[load.level] }] {load.message}")
+        if load.level == "fail":
+            problems.append(load.message)
+    return 1 if problems else 0
+
+
+def _cmd_second_camera_pin(args: argparse.Namespace) -> int:
+    try:
+        pinned = pin_cameras(Path(args.config))
+    except (FileNotFoundError, ConfigError, RuntimeError, OSError) as exc:
+        print(f"Second camera pin failed: {exc}")
+        return 1
+    if not pinned:
+        print("Second camera pin failed: two connected cameras are needed, and they were not both detected.")
+        return 1
+    print("Both configs are now pinned to their cameras.")
+    return 0
+
+
+def _cmd_second_camera_remove(args: argparse.Namespace) -> int:
+    primary_path = Path(args.config)
+    try:
+        cameras = load_cameras(primary_path, _load_or_defaults(primary_path))
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return 1
+    if len(cameras) < 2:
+        print("Second camera remove failed: no second camera is set up.")
+        return 1
+    second = cameras[1]
+    try:
+        # Its timers point at the config file; stop them before it goes.
+        disabled = run_systemd_action(
+            config=second.config, action="disable", output_dir=args.output_dir, config_path=second.path
+        )
+        if not disabled.success:
+            print("Note: the second camera's timers could not be disabled (they may not be installed).")
+    except Exception as exc:
+        print(f"Note: the second camera's timers could not be disabled: {exc}")
+    try:
+        target = remove_second_camera(primary_path)
+    except OSError as exc:
+        print(f"Second camera remove failed: {exc}")
+        return 1
+    print(f"Second camera removed. Its settings were kept as {target}; its recordings were not touched.")
+    return 0
+
+
 def _add_common_config_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config",
@@ -4142,6 +4337,45 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser("doctor", help="Run hardware and dependency checks.")
     _add_common_config_arg(doctor_parser)
     doctor_parser.set_defaults(func=_cmd_doctor)
+
+    second_camera_parser = subparsers.add_parser(
+        "second-camera",
+        help="Set up a second Raspberry Pi camera on this Pi, recording alongside the first.",
+        description=(
+            "A Raspberry Pi 5 has two camera connectors. The second camera gets its own config file "
+            "next to the first one's, so both can record on the same schedule. See docs/Two_Cameras.md."
+        ),
+    )
+    second_camera_sub = second_camera_parser.add_subparsers(dest="second_camera_command", required=True)
+    second_camera_add = second_camera_sub.add_parser(
+        "add", help="Create the second camera's config from the first camera's."
+    )
+    _add_common_config_arg(second_camera_add)
+    second_camera_add.add_argument("--colony-id", help="Colony ID for the second camera (default: the next number).")
+    second_camera_add.add_argument(
+        "--data-root", help="Data folder for the second camera (default: the same folder as the first)."
+    )
+    second_camera_add.set_defaults(func=_cmd_second_camera_add)
+    second_camera_status = second_camera_sub.add_parser(
+        "status", help="Show both cameras, whether they are pinned, and whether they can run together."
+    )
+    _add_common_config_arg(second_camera_status)
+    second_camera_status.set_defaults(func=_cmd_second_camera_status)
+    second_camera_pin = second_camera_sub.add_parser(
+        "pin", help="Tie each config to one physical camera, so unplugging one cannot swap them."
+    )
+    _add_common_config_arg(second_camera_pin)
+    second_camera_pin.set_defaults(func=_cmd_second_camera_pin)
+    second_camera_remove = second_camera_sub.add_parser(
+        "remove", help="Stop the second camera's schedule and set its config aside. Recordings are kept."
+    )
+    _add_common_config_arg(second_camera_remove)
+    second_camera_remove.add_argument(
+        "--output-dir",
+        default=str(Path.cwd() / "systemd"),
+        help="Directory containing generated .service/.timer files.",
+    )
+    second_camera_remove.set_defaults(func=_cmd_second_camera_remove)
 
     storage_parser = subparsers.add_parser(
         "storage",
@@ -4651,6 +4885,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional one-run override of capture.frame_buffer: 'ram' holds the recording in memory and "
             "encodes it afterwards; 'stream' encodes to disk during capture."
+        ),
+    )
+    run_once_parser.add_argument(
+        "--all-cameras",
+        action="store_true",
+        help=(
+            "On a Pi with two cameras set up, record from both at the same moment, "
+            "each with its own config (see `bbx second-camera`)."
         ),
     )
     run_once_parser.add_argument(

@@ -32,6 +32,17 @@ local_index:
 camera:
   profile: "custom"
   model: "auto"
+  # Which Raspberry Pi camera this config records from, for a Pi with two
+  # cameras. Leave these alone on a one-camera box. See docs/Two_Cameras.md.
+  # camera_num: the camera's number (0 is the first camera).
+  # camera_id: pins one physical camera by its libcamera Id. When set it
+  #   decides, and a run is refused if that camera is not connected, instead
+  #   of recording from the other one.
+  # session_tag: added to session and file names (for example "cam2") so two
+  #   cameras never produce files with the same name.
+  camera_num: 0
+  camera_id: null
+  session_tag: ""
   width: 4056
   height: 3040
   fps_target: 5.0

@@ -24,6 +24,7 @@ from .camera_controls import (
 )
 from .hardware_profiles import hardware_profile_choices, normalize_hardware_profile
 from .storage_guard import normalize_require_mounted_storage
+from .camera_select import SESSION_TAG_PATTERN
 from .stream_writer import VALID_FRAME_BUFFERS, VALID_MP4_PRESETS
 
 try:
@@ -368,6 +369,20 @@ def validate_config(config: Dict[str, Any]) -> None:
     if camera_model not in VALID_CAMERA_MODELS:
         raise ConfigError(
             f"camera.model must be one of {sorted(VALID_CAMERA_MODELS)}, got: {camera_model}"
+        )
+    camera_num = config["camera"].get("camera_num", 0)
+    if isinstance(camera_num, bool) or not isinstance(camera_num, int) or camera_num < 0:
+        raise ConfigError(f"camera.camera_num must be a whole number, 0 or more, got: {camera_num!r}")
+    camera_id = config["camera"].get("camera_id")
+    if camera_id is not None and not (isinstance(camera_id, str) and camera_id.strip()):
+        raise ConfigError("camera.camera_id must be null or the libcamera Id of a camera")
+    camera_session_tag = config["camera"].get("session_tag", "")
+    if camera_session_tag is None:
+        camera_session_tag = ""
+    if not isinstance(camera_session_tag, str) or not SESSION_TAG_PATTERN.match(camera_session_tag):
+        raise ConfigError(
+            "camera.session_tag must be at most 16 letters, digits or hyphens "
+            f"(it becomes part of file names), got: {camera_session_tag!r}"
         )
     camera_infrared = config["camera"].get("infrared", False)
     if not isinstance(camera_infrared, bool):

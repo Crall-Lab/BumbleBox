@@ -31,8 +31,11 @@ try:
     from PyQt5.QtGui import QDesktopServices, QFont, QFontDatabase, QTextCursor
     from PyQt5.QtWidgets import (
         QApplication,
+        QButtonGroup,
         QCheckBox,
         QComboBox,
+        QDialog,
+        QDialogButtonBox,
         QDoubleSpinBox,
         QFileDialog,
         QFormLayout,
@@ -102,6 +105,7 @@ from .box_status import (
     signature_from_snapshot,
 )
 from .camera_profiles import CAMERA_PROFILES, apply_camera_profile
+from .camera_select import DetectedCamera, detect_cameras
 from .config import DEFAULT_USER_CONFIG_PATH, load_config, load_defaults, save_config, validate_config
 from .hardware_profiles import HARDWARE_PROFILES, apply_hardware_profile
 from .multimodal_calibration import (
@@ -110,6 +114,19 @@ from .multimodal_calibration import (
     format_calibration_project_status,
     get_calibration_project_status,
     initialize_calibration_project,
+)
+from .multi_camera import (
+    CameraEntry,
+    check_camera_set,
+    combined_memory,
+    copy_schedule,
+    create_second_camera,
+    load_cameras,
+    pin_cameras,
+    remove_second_camera,
+    schedule_values,
+    schedules_match,
+    suggest_second_colony_id,
 )
 from .schedule_check import run_schedule_check
 from .status_history import list_recent_run_records, load_run_summary
@@ -203,7 +220,7 @@ QWidget {
     font-family: "Avenir Next", "Noto Sans", "DejaVu Sans", sans-serif;
     font-size: 14px;
 }
-QMainWindow, QWizard, QWidget#AppRoot { background: #f7f6f1; }
+QMainWindow, QWizard, QDialog, QWidget#AppRoot { background: #f7f6f1; }
 QWidget#ContentShell {
     background: qlineargradient(
         x1: 0, y1: 0, x2: 1, y2: 1,
@@ -373,6 +390,21 @@ QPushButton#Quiet {
     border-color: #dcded7;
 }
 QPushButton#Quiet:hover { background: #f5f5ef; border-color: #cdd4cf; }
+QPushButton#Segment {
+    background: #fffefb;
+    color: #52625e;
+    border: 1px solid #cfdcd5;
+    border-radius: 0;
+    padding: 6px 14px;
+}
+QPushButton#Segment:hover { background: #f2f7f4; }
+QPushButton#Segment:checked { background: #39786a; color: #ffffff; border-color: #39786a; }
+QPushButton#Segment[position="first"] { border-top-left-radius: 10px; border-bottom-left-radius: 10px; }
+QPushButton#Segment[position="last"] {
+    border-top-right-radius: 10px;
+    border-bottom-right-radius: 10px;
+    border-left: none;
+}
 QPushButton#Primary:disabled, QPushButton#Accent:disabled, QPushButton#Quiet:disabled {
     background: #edf0ec;
     color: #a4aaa6;
@@ -504,6 +536,21 @@ def _encode_benchmark_path() -> Path:
     return root / "BumbleBox" / "encode_benchmark_latest.json"
 
 
+def _same_drive(first: Any, second: Any) -> bool:
+    """Whether two folders are on the same drive, judged by their nearest existing parents."""
+
+    def device(path: Any) -> int:
+        probe = Path(str(path)).expanduser()
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        return probe.stat().st_dev
+
+    try:
+        return device(first) == device(second)
+    except OSError:
+        return False
+
+
 def _set_nested(config: dict[str, Any], dotted_key: str, value: Any) -> None:
     section, _, key = dotted_key.partition(".")
     config.setdefault(section, {})[key] = value
@@ -576,7 +623,8 @@ class _FitScrollArea(QScrollArea):
 
 
 class _RunHistorySignals(QObject):
-    finished = pyqtSignal(int, object, object)
+    # generation, the shown camera's runs, error, {camera index: runs} for the other camera
+    finished = pyqtSignal(int, object, object, object)
 
 
 def _is_finished_recording(payload: dict[str, Any]) -> bool:
@@ -584,49 +632,83 @@ def _is_finished_recording(payload: dict[str, Any]) -> bool:
 
 
 class _RunHistoryWorker(QRunnable):
-    def __init__(self, generation: int, data_root: str, limit: int = 60) -> None:
+    """Reads recent run summaries off the GUI thread.
+
+    ``targets`` is ``(camera index, data folder, session tag)`` for each camera
+    of this box. Two cameras usually share a data folder, so each folder is
+    scanned once and the runs are split by the tag in their summaries.
+    """
+
+    def __init__(
+        self,
+        generation: int,
+        targets: list[tuple[int, str, str]],
+        active_index: int = 1,
+        limit: int = 60,
+    ) -> None:
         super().__init__()
         self.generation = int(generation)
-        self.data_root = str(data_root)
+        self.targets = [(int(index), str(root), str(tag)) for index, root, tag in targets]
+        self.active_index = int(active_index)
         self.limit = int(limit)
         self.signals = _RunHistorySignals()
 
-    def _emit_finished(self, payloads: list[dict[str, Any]], error: str | None) -> None:
+    def _emit_finished(
+        self,
+        payloads: list[dict[str, Any]],
+        error: str | None,
+        others: dict[int, list[dict[str, Any]]] | None = None,
+    ) -> None:
         try:
-            self.signals.finished.emit(self.generation, payloads, error)
+            self.signals.finished.emit(self.generation, payloads, error, others or {})
         except RuntimeError:
             # The application window may close while a removable-drive scan is finishing.
             pass
 
-    def run(self) -> None:
-        payloads: list[dict[str, Any]] = []
-        measured = 0
+    @staticmethod
+    def _load_payload(record: Any) -> dict[str, Any] | None:
         try:
-            for record in list_recent_run_records(self.data_root, limit=self.limit):
-                try:
-                    payload = load_run_summary(record.summary_path)
-                except Exception:
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                payload = dict(payload)
-                payload["_summary_path"] = str(record.summary_path.resolve())
-                recorded_session_text = str(payload.get("session_dir") or "").strip()
-                recorded_session_dir = Path(recorded_session_text).expanduser()
-                payload["_session_dir_local"] = str(
-                    recorded_session_dir.resolve()
-                    if recorded_session_text and recorded_session_dir.exists()
-                    else record.summary_path.parent.resolve()
-                )
-                if measured < STORAGE_ESTIMATE_SCAN_RUNS and _is_finished_recording(payload):
-                    measured += 1
-                    payload["_session_bytes"] = session_size_bytes(payload["_session_dir_local"])
-                    payload["_recording_signature"] = signature_from_snapshot(payload.get("config_snapshot_path"))
-                payloads.append(payload)
+            payload = load_run_summary(record.summary_path)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload = dict(payload)
+        payload["_summary_path"] = str(record.summary_path.resolve())
+        recorded_session_text = str(payload.get("session_dir") or "").strip()
+        recorded_session_dir = Path(recorded_session_text).expanduser()
+        payload["_session_dir_local"] = str(
+            recorded_session_dir.resolve()
+            if recorded_session_text and recorded_session_dir.exists()
+            else record.summary_path.parent.resolve()
+        )
+        return payload
+
+    def run(self) -> None:
+        by_camera: dict[int, list[dict[str, Any]]] = {index: [] for index, _, _ in self.targets}
+        measured = {index: 0 for index in by_camera}
+        folders: dict[str, dict[str, int]] = {}
+        for index, root, tag in self.targets:
+            folders.setdefault(root, {})[tag] = index
+        try:
+            for root, tags in folders.items():
+                for record in list_recent_run_records(root, limit=self.limit * len(tags)):
+                    index = tags.get(record.camera_session_tag)
+                    if index is None or len(by_camera[index]) >= self.limit:
+                        continue
+                    payload = self._load_payload(record)
+                    if payload is None:
+                        continue
+                    if measured[index] < STORAGE_ESTIMATE_SCAN_RUNS and _is_finished_recording(payload):
+                        measured[index] += 1
+                        payload["_session_bytes"] = session_size_bytes(payload["_session_dir_local"])
+                        payload["_recording_signature"] = signature_from_snapshot(payload.get("config_snapshot_path"))
+                    by_camera[index].append(payload)
         except Exception as exc:
             self._emit_finished([], str(exc))
             return
-        self._emit_finished(payloads, None)
+        active = by_camera.pop(self.active_index, [])
+        self._emit_finished(active, None, by_camera)
 
 
 class _BoxStatusSignals(QObject):
@@ -639,20 +721,21 @@ class _BoxStatusWorker(QRunnable):
     A stalled drive or a slow answer from systemd must not freeze the window.
     """
 
-    def __init__(self, generation: int, config: dict[str, Any], config_path: Path) -> None:
+    def __init__(self, generation: int, targets: list[tuple[int, dict[str, Any], Path]]) -> None:
         super().__init__()
         self.generation = int(generation)
-        self.config = config
-        self.config_path = config_path
+        self.targets = targets  # (camera index, config, config path)
         self.signals = _BoxStatusSignals()
 
     def run(self) -> None:
+        statuses: dict[int, Any] = {}
+        for index, config, config_path in self.targets:
+            try:
+                statuses[index] = collect_box_status(config, config_path)
+            except Exception:  # pragma: no cover - collect_box_status guards its parts
+                continue
         try:
-            status: object = collect_box_status(self.config, self.config_path)
-        except Exception as exc:  # pragma: no cover - collect_box_status guards its parts
-            status = str(exc)
-        try:
-            self.signals.finished.emit(self.generation, status)
+            self.signals.finished.emit(self.generation, statuses)
         except RuntimeError:
             # The window may close while a check is finishing.
             pass
@@ -755,6 +838,13 @@ class HardwarePage(QWizardPage):
         layout.addWidget(self.thermal)
         layout.addWidget(self.realsense)
         layout.addWidget(self.second_pi)
+        two_cameras_hint = QLabel(
+            "Two Raspberry Pi cameras on this one Pi? Finish this setup for the first camera, then add "
+            "the second on the Hardware page."
+        )
+        two_cameras_hint.setObjectName("Hint")
+        two_cameras_hint.setWordWrap(True)
+        layout.addWidget(two_cameras_hint)
         layout.addStretch(1)
         self.profile.currentIndexChanged.connect(self._profile_changed)
         self._profile_changed()
@@ -1233,11 +1323,86 @@ class BumbleBoxSetupWizard(QWizard):
         super().accept()
 
 
+class SecondCameraDialog(QDialog):
+    """Asks the two things that differ for a second camera on the same Pi."""
+
+    def __init__(self, parent: QWidget | None, *, detected: list[DetectedCamera], colony_id: str, data_root: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add a second camera")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        intro = QLabel(
+            "Camera 2 will record alongside Camera 1 on this Pi. It starts with Camera 1's recording "
+            "settings and its own schedule, which stays off until you start it."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        if len(detected) >= 2:
+            found = "Cameras connected now: " + "; ".join(camera.description for camera in detected) + "."
+            found += " Each camera's settings will be pinned to one of them."
+        else:
+            found = (
+                f"{len(detected)} camera(s) detected right now. You can add Camera 2 anyway and connect it "
+                "later; press Pin Cameras on the Hardware page once both are connected."
+            )
+        self.detected_label = QLabel(found)
+        self.detected_label.setObjectName("Hint")
+        self.detected_label.setWordWrap(True)
+        layout.addWidget(self.detected_label)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(12)
+        self.colony_id = QLineEdit(colony_id)
+        path_row = QWidget()
+        path_layout = QHBoxLayout(path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        self.data_root = QLineEdit(data_root)
+        browse = QPushButton("Choose")
+        browse.setObjectName("Quiet")
+        browse.clicked.connect(self._browse)
+        path_layout.addWidget(self.data_root, 1)
+        path_layout.addWidget(browse)
+        form.addRow("Colony ID for Camera 2", self.colony_id)
+        form.addRow("Data folder for Camera 2", path_row)
+        layout.addLayout(form)
+        folder_hint = QLabel(
+            "The same folder as Camera 1 is fine: Camera 2's sessions are named ..._cam2_..., so the "
+            "two cameras' files cannot be confused."
+        )
+        folder_hint.setObjectName("Hint")
+        folder_hint.setWordWrap(True)
+        layout.addWidget(folder_hint)
+
+        buttons = QDialogButtonBox()
+        add = buttons.addButton("Add Camera 2", QDialogButtonBox.AcceptRole)
+        add.setObjectName("Primary")
+        buttons.addButton("Cancel", QDialogButtonBox.RejectRole).setObjectName("Quiet")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _browse(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "Choose Camera 2's data folder", self.data_root.text())
+        if selected:
+            self.data_root.setText(selected)
+
+
 class BumbleBoxQtGUI(QMainWindow):
     def __init__(self, config_path: Path) -> None:
         super().__init__()
+        # A Pi can have two cameras, each with its own config file. The window
+        # shows one at a time: config_path and config are the shown camera's.
+        self.primary_config_path = config_path
         self.config_path = config_path
         self.config = _load_config_or_defaults(config_path)
+        self.camera_index = 1
+        self.cameras: list[CameraEntry] = [CameraEntry(1, config_path, self.config)]
+        self._camera_statuses: dict[int, BoxStatus] = {}
+        self._other_camera_payloads: dict[int, list[dict[str, Any]]] = {}
+        self._command_on_success: Any = None
         self.command_queue: list[list[str]] = []
         self.command_success_message: tuple[str, str] | None = None
         self._run_history_generation = 0
@@ -1329,6 +1494,27 @@ class BumbleBoxQtGUI(QMainWindow):
         self.page_title.setObjectName("PageLabel")
         header.addWidget(self.page_title)
         header.addStretch(1)
+        # Shown only on a Pi with two cameras: picks which camera every page shows.
+        self.camera_switch = QWidget()
+        switch_layout = QHBoxLayout(self.camera_switch)
+        switch_layout.setContentsMargins(0, 0, 0, 0)
+        switch_layout.setSpacing(0)
+        self.camera_button_group = QButtonGroup(self)
+        self.camera_button_group.setExclusive(True)
+        self.camera_buttons: dict[int, QPushButton] = {}
+        for index, position in ((1, "first"), (2, "last")):
+            button = QPushButton(f"Camera {index}")
+            button.setObjectName("Segment")
+            button.setProperty("position", position)
+            button.setCheckable(True)
+            button.setToolTip("Show this camera's status, recordings and settings.")
+            button.clicked.connect(lambda _checked=False, selected=index: self._select_camera(selected))
+            self.camera_button_group.addButton(button, index)
+            self.camera_buttons[index] = button
+            switch_layout.addWidget(button)
+        self.camera_switch.setVisible(False)
+        header.addWidget(self.camera_switch)
+        header.addSpacing(10)
         self.profile_badge = QLabel()
         self.profile_badge.setObjectName("ProfileBadge")
         header.addWidget(self.profile_badge)
@@ -1355,6 +1541,28 @@ class BumbleBoxQtGUI(QMainWindow):
         )
         layout.addWidget(heading)
         layout.addWidget(subtitle)
+        self.overview_subtitle = subtitle
+        self.cameras_strip = QFrame()
+        self.cameras_strip.setObjectName("Card")
+        self.cameras_strip.setProperty("tone", "neutral")
+        strip_layout = QVBoxLayout(self.cameras_strip)
+        strip_layout.setContentsMargins(17, 13, 17, 13)
+        strip_layout.setSpacing(8)
+        strip_title = QLabel("BOTH CAMERAS")
+        strip_title.setObjectName("Eyebrow")
+        strip_layout.addWidget(strip_title)
+        strip_row = QHBoxLayout()
+        strip_row.setSpacing(10)
+        self.camera_status_labels: dict[int, QLabel] = {}
+        for index in (1, 2):
+            label = QLabel("")
+            label.setObjectName("StatusNeutral")
+            label.setWordWrap(True)
+            self.camera_status_labels[index] = label
+            strip_row.addWidget(label, 1)
+        strip_layout.addLayout(strip_row)
+        self.cameras_strip.setVisible(False)
+        layout.addWidget(self.cameras_strip)
         self.setup_status = QLabel()
         self.setup_status.setWordWrap(True)
         layout.addWidget(self.setup_status)
@@ -1415,6 +1623,7 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.addWidget(value_label)
         layout.addWidget(detail_label)
         layout.addStretch(1)
+        card.title_label = eyebrow
         card.value_label = value_label
         card.detail_label = detail_label
         return card
@@ -1450,7 +1659,16 @@ class BumbleBoxQtGUI(QMainWindow):
             "Capture and automation",
             "Record once now, or start and stop the recording schedule.",
         )
-        layout.addWidget(heading)
+        self.live_monitor_button = QPushButton("Open Live Camera Monitor")
+        self.live_monitor_button.setObjectName("Primary")
+        self.live_monitor_button.setToolTip(
+            "Preview enabled cameras together without saving data. Close the monitor before recording."
+        )
+        self.live_monitor_button.clicked.connect(self._open_live_monitor)
+        heading_row = QHBoxLayout()
+        heading_row.addWidget(heading, 1)
+        heading_row.addWidget(self.live_monitor_button, 0, Qt.AlignVCenter)
+        layout.addLayout(heading_row)
         layout.addWidget(subtitle)
         # The controls scroll when the window is short, so the outcome of the
         # last command and its output always stay in view below them.
@@ -1468,13 +1686,15 @@ class BumbleBoxQtGUI(QMainWindow):
         run.setObjectName("Accent")
         run.clicked.connect(self._run_once)
         row.addWidget(run)
-        self.live_monitor_button = QPushButton("Open Live Camera Monitor")
-        self.live_monitor_button.setObjectName("Primary")
-        self.live_monitor_button.setToolTip(
-            "Preview enabled cameras together without saving data. Close the monitor before recording."
+        self.run_once_button = run
+        self.run_both_button = QPushButton("Record Both Now")
+        self.run_both_button.setToolTip(
+            "Records from both cameras at the same moment, each with its own settings. "
+            "Use it to check that this Pi can carry both."
         )
-        self.live_monitor_button.clicked.connect(self._open_live_monitor)
-        row.addWidget(self.live_monitor_button)
+        self.run_both_button.clicked.connect(self._run_both_once)
+        self.run_both_button.setVisible(False)
+        row.addWidget(self.run_both_button)
         row.addStretch(1)
         controls_layout.addLayout(row)
 
@@ -1491,6 +1711,10 @@ class BumbleBoxQtGUI(QMainWindow):
         self.schedule_detail_label.setWordWrap(True)
         self.schedule_detail_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         automation_layout.addWidget(self.schedule_detail_label)
+        self.both_cameras_checkbox = QCheckBox("Start and stop both cameras together")
+        self.both_cameras_checkbox.setChecked(True)
+        self.both_cameras_checkbox.setVisible(False)
+        automation_layout.addWidget(self.both_cameras_checkbox)
         buttons = QHBoxLayout()
         start = QPushButton("Start Automated Recording")
         start.setObjectName("Primary")
@@ -1738,6 +1962,30 @@ class BumbleBoxQtGUI(QMainWindow):
         distributed_buttons.addWidget(self.distributed_hardware_label, 1)
         distributed_buttons.addWidget(distributed_check)
         layout.addWidget(self.distributed_hardware_group)
+        self.second_camera_group = QGroupBox("Second camera")
+        self.second_camera_group.setProperty("tone", "sky")
+        second_layout = QVBoxLayout(self.second_camera_group)
+        self.second_camera_label = QLabel()
+        self.second_camera_label.setWordWrap(True)
+        self.second_camera_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        second_layout.addWidget(self.second_camera_label)
+        second_buttons = QHBoxLayout()
+        self.add_second_camera_button = QPushButton("Add Second Camera...")
+        self.add_second_camera_button.setObjectName("Accent")
+        self.add_second_camera_button.clicked.connect(self._add_second_camera)
+        self.pin_cameras_button = QPushButton("Pin Cameras")
+        self.pin_cameras_button.setToolTip(
+            "Ties each camera's settings to one physical camera, so unplugging one cannot swap them."
+        )
+        self.pin_cameras_button.clicked.connect(self._pin_cameras)
+        self.remove_second_camera_button = QPushButton("Remove Second Camera...")
+        self.remove_second_camera_button.setObjectName("Quiet")
+        self.remove_second_camera_button.clicked.connect(self._remove_second_camera)
+        for button in (self.add_second_camera_button, self.pin_cameras_button, self.remove_second_camera_button):
+            second_buttons.addWidget(button)
+        second_buttons.addStretch(1)
+        second_layout.addLayout(second_buttons)
+        layout.addWidget(self.second_camera_group)
         change = QPushButton("Change Hardware Profile")
         change.setObjectName("Quiet")
         change.clicked.connect(self.open_setup_wizard)
@@ -1792,7 +2040,7 @@ class BumbleBoxQtGUI(QMainWindow):
             ("record_and_track", "Record, then track"),
             ("record_only", "Record only"),
             ("mixed_schedule", "Record and track on separate schedules"),
-            ("track_only", "Track existing videos only"),
+            ("track_only", "Track only (no video saved)"),
         ):
             self.settings_mode.addItem(label, value)
         self.settings_recording_seconds = QSpinBox()
@@ -2083,13 +2331,19 @@ class BumbleBoxQtGUI(QMainWindow):
 
         benchmark = self._load_benchmark()
         free_gb = self._box_status.storage.free_gb if self._box_status is not None else None
-        estimate = estimate_storage(candidate, self._run_history_payloads, free_gb=free_gb, benchmark=benchmark)
+        estimate = estimate_storage(
+            candidate,
+            self._run_history_payloads,
+            free_gb=free_gb,
+            benchmark=benchmark,
+            sharing_drive=self._sharing_drive(),
+        )
         streaming = frame_buffer_mode(candidate) == FRAME_BUFFER_STREAM
 
         lines: list[str] = []
         per_day = recordings_per_day(candidate)
         lines.append(
-            f"Recordings per day: {per_day}" if per_day else "Recordings per day: none (track-only mode records nothing)."
+            f"Recordings per day: {per_day}" if per_day else "Recordings per day: none (track-only mode saves no video)."
         )
         buffer_bytes = metrics.get("estimated_frame_buffer_bytes")
         total_ram = metrics.get("total_ram_bytes")
@@ -2105,6 +2359,17 @@ class BumbleBoxQtGUI(QMainWindow):
                 f"Storage: at this rate the drive is full in {describe_days(estimate.days_left)}, "
                 "after which recording is refused."
             )
+
+        other = self._other_camera()
+        if other is not None:
+            load = combined_memory([CameraEntry(self.camera_index, self.config_path, candidate), other])
+            if load is not None:
+                if load.level == "fail":
+                    problems.append(f"Memory: {load.message}")
+                elif load.level == "warn":
+                    warnings.append(f"Memory: {load.message}")
+                else:
+                    lines.append(load.message)
 
         verdict = self._update_benchmark_label(candidate, benchmark)
         if streaming and verdict == "no":
@@ -2237,26 +2502,68 @@ class BumbleBoxQtGUI(QMainWindow):
     def _save_settings(self, *, offer_apply: bool) -> bool:
         try:
             config = load_config(self.config_path) if self.config_path.exists() else copy.deepcopy(self.config)
+            schedule_before = schedule_values(config)
             self._apply_settings_to(config)
             save_config(self.config_path, config)
         except Exception as exc:
             QMessageBox.critical(self, "Settings not saved", f"The recording settings were not saved:\n{exc}")
             return False
         self.config = load_config(self.config_path)
+        if schedule_values(self.config) != schedule_before:
+            self._offer_same_schedule_to_other_camera()
         self._load_settings_form()
         self.refresh_from_config()
         if offer_apply:
             self._offer_to_apply_schedule()
         return True
 
+    def _offer_same_schedule_to_other_camera(self) -> None:
+        """After a schedule change on one camera, offer to keep the two cameras in step."""
+        other = self._other_camera()
+        if other is None:
+            return
+        try:
+            other_config = load_config(other.path)
+        except Exception:
+            return
+        if schedules_match(self.config, other_config) or not self._ask_copy_schedule(other):
+            return
+        copy_schedule(self.config, other_config)
+        try:
+            save_config(other.path, other_config)
+        except Exception as exc:
+            QMessageBox.critical(self, "Schedule not copied", f"{other.label}'s settings were not changed:\n{exc}")
+
+    def _ask_copy_schedule(self, other: CameraEntry) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(f"Use this schedule for {other.label} too?")
+        box.setText(
+            f"You changed when {self._active_camera().label} records. {other.label} still has its own schedule."
+        )
+        box.setInformativeText(
+            "With the same run mode, recording length and interval, both cameras record at the same moments."
+        )
+        both = box.addButton("Both Cameras", QMessageBox.AcceptRole)
+        only = box.addButton(f"{self._active_camera().label} Only", QMessageBox.RejectRole)
+        box.setDefaultButton(both)
+        box.setEscapeButton(only)
+        box.exec_()
+        return box.clickedButton() is both
+
     def _offer_to_apply_schedule(self) -> None:
-        schedule = self._box_status.schedule if self._box_status is not None else None
-        if schedule is None or schedule.state not in {SCHEDULE_ON, SCHEDULE_PARTIAL}:
-            return
-        if installed_units_are_current(self.config, self.config_path) is not False:
-            return
-        if self._ask_apply_schedule():
-            self._start_automation()
+        """Offer to restart any running schedule whose timers no longer match its settings."""
+        stale: list[CameraEntry] = []
+        for entry in self.cameras:
+            status = self._camera_statuses.get(entry.index)
+            if entry.index == self.camera_index and self._box_status is not None:
+                status = self._box_status
+            if status is None or status.schedule.state not in {SCHEDULE_ON, SCHEDULE_PARTIAL}:
+                continue
+            if installed_units_are_current(entry.config, entry.path) is False:
+                stale.append(entry)
+        if stale and self._ask_apply_schedule():
+            self._start_automation(stale)
 
     def _ask_apply_schedule(self) -> bool:
         box = QMessageBox(self)
@@ -2743,8 +3050,11 @@ class BumbleBoxQtGUI(QMainWindow):
         self.results_refresh_button.setEnabled(False)
         self.results_status.setText("Scanning recent recording summaries...")
         self.latest_run_status.setText("Loading recent recording status...")
-        data_root = str(self.config.get("system", {}).get("data_root", "")).strip()
-        worker = _RunHistoryWorker(generation, data_root, limit=60)
+        targets = [
+            (entry.index, str(entry.config.get("system", {}).get("data_root", "")).strip(), entry.tag)
+            for entry in self.cameras
+        ]
+        worker = _RunHistoryWorker(generation, targets, self.camera_index, limit=60)
         worker.signals.finished.connect(self._run_history_loaded)
         self._run_history_workers[generation] = worker
         self.thread_pool.start(worker)
@@ -2754,11 +3064,13 @@ class BumbleBoxQtGUI(QMainWindow):
         generation: int,
         payloads: object,
         error: object,
+        others: object = None,
     ) -> None:
         self._run_history_workers.pop(generation, None)
         if generation != self._run_history_generation:
             return
         self._run_history_loading = False
+        self._other_camera_payloads = others if isinstance(others, dict) else {}
         self.results_refresh_button.setEnabled(True)
         self._selected_run_payload = None
         self.results_table.setRowCount(0)
@@ -2836,8 +3148,7 @@ class BumbleBoxQtGUI(QMainWindow):
         if index < 0:
             return
         self.pages.setCurrentIndex(index)
-        item = self.navigation.item(index)
-        self.page_title.setText(item.text().upper() if item else "BUMBLEBOX")
+        self._update_page_title()
         if index == PAGE_INDEX_RESULTS and not self._run_history_payloads:
             self.refresh_results()
 
@@ -2853,6 +3164,7 @@ class BumbleBoxQtGUI(QMainWindow):
             )
 
     def refresh_from_config(self) -> None:
+        self._reload_cameras()
         setup = self.config.get("setup", {})
         profile_key = str(setup.get("hardware_profile", "custom"))
         profile = HARDWARE_PROFILES.get(profile_key, HARDWARE_PROFILES["custom"])
@@ -2937,8 +3249,269 @@ class BumbleBoxQtGUI(QMainWindow):
         self._update_results_hardware_columns()
         if not self._settings_dirty():
             self._load_settings_form()
+        self._update_camera_widgets()
         self._update_storage_estimate()
         self.refresh_box_status()
+
+    # -- Two cameras on one Pi --------------------------------------------------
+
+    def _reload_cameras(self) -> None:
+        """Re-read which cameras this box has (one config file each)."""
+        try:
+            cameras = load_cameras(
+                self.primary_config_path,
+                self.config if self.camera_index == 1 else _load_config_or_defaults(self.primary_config_path),
+            )
+        except Exception:
+            # A second config that cannot be read must not take the window down
+            # with it; carry on with the first camera alone.
+            primary = self.config if self.camera_index == 1 else _load_config_or_defaults(self.primary_config_path)
+            cameras = [CameraEntry(1, self.primary_config_path, primary)]
+        if self.camera_index > len(cameras):
+            self.camera_index = 1
+            self.config_path = self.primary_config_path
+            self.config = cameras[0].config
+            self._reset_camera_view()
+        cameras[self.camera_index - 1].config = self.config
+        self.cameras = cameras
+
+    def _active_camera(self) -> CameraEntry:
+        return self.cameras[self.camera_index - 1]
+
+    def _other_camera(self) -> CameraEntry | None:
+        return next((entry for entry in self.cameras if entry.index != self.camera_index), None)
+
+    def _reset_camera_view(self) -> None:
+        """Forget what was shown for the previous camera."""
+        self._box_status = self._camera_statuses.get(self.camera_index)
+        # A scan still running was started for the other camera; its result
+        # must not land in this camera's view.
+        self._run_history_generation += 1
+        self._run_history_loading = False
+        self._run_history_refresh_pending = False
+        self._run_history_payloads = []
+        self._other_camera_payloads = {}
+        self._run_history_error = None
+        self._selected_run_payload = None
+        self._last_scheduled_run_seen = None
+        self._storage_estimate = None
+        self._settings_saved_values = None
+        self.results_table.setRowCount(0)
+
+    def _update_page_title(self) -> None:
+        item = self.navigation.currentItem()
+        title = item.text().upper() if item else "BUMBLEBOX"
+        if len(self.cameras) == 2:
+            title = f"{title}  ·  {self._active_camera().label.upper()}"
+        self.page_title.setText(title)
+
+    def _update_camera_widgets(self) -> None:
+        two = len(self.cameras) == 2
+        active = self._active_camera()
+        self.camera_switch.setVisible(two)
+        for index, button in self.camera_buttons.items():
+            if index <= len(self.cameras):
+                button.setText(self.cameras[index - 1].long_label)
+            button.setChecked(index == self.camera_index)
+        self.cameras_strip.setVisible(two)
+        self.run_both_button.setVisible(two)
+        self.both_cameras_checkbox.setVisible(two)
+        self.run_once_button.setText(f"Record {active.label} Now" if two else "Run Once Now")
+        self.overview_subtitle.setText(
+            f"Showing {active.long_label}. Use the camera buttons at the top right to see the other one."
+            if two
+            else "A concise view of this BumbleBox. Device-specific setup stays hidden unless the device is enabled."
+        )
+        self.rgb_group.setTitle(active.long_label if two else "Primary camera")
+        self.camera_card.title_label.setText((active.label if two else "Primary camera").upper())
+
+        if two:
+            first, second = self.cameras
+            pinned = first.pinned and second.pinned
+            lines = [
+                f"{second.long_label} records alongside {first.long_label}. Each has its own settings, "
+                "schedule and status; pick one with the camera buttons at the top right.",
+                (
+                    "Each camera's settings are pinned to one physical camera."
+                    if pinned
+                    else "The cameras are matched by number, not pinned. If one is unplugged, the other could "
+                    "record in its place. Connect both and press Pin Cameras."
+                ),
+            ]
+            lines += [f"Problem: {problem}" for problem in check_camera_set(self.cameras)]
+            self.second_camera_label.setText("\n".join(lines))
+        else:
+            self.second_camera_label.setText(
+                "This Pi can record from two Raspberry Pi cameras at the same time. The second camera gets "
+                "its own settings, schedule and status, and can record into the same data folder."
+            )
+        self.add_second_camera_button.setVisible(not two)
+        self.pin_cameras_button.setVisible(two and not all(entry.pinned for entry in self.cameras))
+        self.remove_second_camera_button.setVisible(two)
+        self._render_camera_strip()
+        self._update_page_title()
+
+    def _render_camera_strip(self) -> None:
+        """One line per camera on Overview: schedule state, and storage if it is refusing."""
+        for entry in self.cameras:
+            label = self.camera_status_labels.get(entry.index)
+            if label is None:
+                continue
+            status = self._camera_statuses.get(entry.index)
+            shown = " (shown below)" if entry.index == self.camera_index else ""
+            if status is None:
+                self._set_status_label(label, LEVEL_OFF, f"{entry.long_label}{shown}: checking...")
+                continue
+            text = f"{entry.long_label}{shown}: {status.schedule.headline}"
+            level = status.schedule.level
+            if status.storage.level == LEVEL_FAIL:
+                text += f"  ·  {status.storage.headline}"
+                level = LEVEL_FAIL
+            self._set_status_label(label, level, text)
+
+    def _select_camera(self, index: int) -> None:
+        if index == self.camera_index or index > len(self.cameras):
+            self._update_camera_widgets()
+            return
+        if self.process.state() != QProcess.NotRunning:
+            QMessageBox.warning(
+                self,
+                "Command still running",
+                "Wait for the current command to finish, or cancel it on the Run page, before switching cameras.",
+            )
+            self._update_camera_widgets()
+            return
+        if self._settings_dirty():
+            choice = self._ask_unsaved_settings_on_close()
+            if choice == "cancel" or (choice == "save" and not self._save_settings(offer_apply=False)):
+                self._update_camera_widgets()
+                return
+        entry = self.cameras[index - 1]
+        self.camera_index = index
+        self.config_path = entry.path
+        self.config = _load_config_or_defaults(entry.path)
+        self._reset_camera_view()
+        self.refresh_from_config()
+        if self._box_status is not None:
+            self._apply_box_status(self._box_status)
+        self.refresh_results()
+
+    def _add_second_camera(self) -> None:
+        if len(self.cameras) == 2:
+            return
+        detected = detect_cameras()
+        details = self._ask_second_camera_details(detected)
+        if details is None:
+            return
+        colony_id, data_root = details
+        first_root = str(self.cameras[0].config.get("system", {}).get("data_root", "")).strip()
+        try:
+            result = create_second_camera(
+                self.primary_config_path,
+                colony_id=colony_id,
+                data_root=data_root if data_root and data_root != first_root else None,
+                cameras=detected,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Second camera not added", str(exc))
+            return
+        if self.camera_index == 1 and self.config_path.exists():
+            self.config = load_config(self.config_path)  # pinning may have changed it
+        self.refresh_from_config()
+        self.refresh_results()
+        QMessageBox.information(
+            self,
+            "Second camera added",
+            "Camera 2 starts with Camera 1's recording settings, and its schedule is off.\n\n"
+            + "\n".join(result.notes)
+            + "\n\nNext: pick Camera 2 at the top right, check its camera on Hardware, then start both "
+            "schedules on Run.",
+        )
+
+    def _ask_second_camera_details(self, detected: list[DetectedCamera]) -> tuple[str, str] | None:
+        """Ask for the second camera's colony ID and data folder; ``None`` if cancelled."""
+        primary = self.cameras[0].config
+        dialog = SecondCameraDialog(
+            self,
+            detected=detected,
+            colony_id=suggest_second_colony_id(primary),
+            data_root=str(primary.get("system", {}).get("data_root", "")),
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return None
+        return dialog.colony_id.text().strip(), dialog.data_root.text().strip()
+
+    def _pin_cameras(self) -> None:
+        try:
+            pinned = pin_cameras(self.primary_config_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Cameras not pinned", str(exc))
+            return
+        if not pinned:
+            QMessageBox.warning(
+                self,
+                "Cameras not pinned",
+                "Both cameras must be connected and detected to pin them. Check the ribbon cables "
+                "(Check Camera on this page), then try again.",
+            )
+            return
+        self.config = load_config(self.config_path)
+        self.refresh_from_config()
+        QMessageBox.information(
+            self, "Cameras pinned", "Each camera's settings are now tied to one physical camera."
+        )
+
+    def _remove_second_camera(self) -> None:
+        if len(self.cameras) < 2:
+            return
+        second = self.cameras[1]
+        if not self._confirm_remove_second_camera(second):
+            return
+        status = self._camera_statuses.get(2)
+        scheduled = status is not None and status.schedule.state in {SCHEDULE_ON, SCHEDULE_PARTIAL}
+        if scheduled:
+            # Its timers point at its config file, so stop them before the file goes.
+            self.run_bbx_commands(
+                [["systemd-disable", "--config", str(second.path)]],
+                on_success=self._finish_remove_second_camera,
+            )
+        else:
+            self._finish_remove_second_camera()
+
+    def _confirm_remove_second_camera(self, second: CameraEntry) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Remove the second camera?")
+        box.setText(f"{second.long_label} will stop recording and leave this window.")
+        box.setInformativeText(
+            "Its recordings are not touched, and its settings are kept in a renamed file so it can be "
+            "restored. Camera 1 is not affected."
+        )
+        remove = box.addButton("Remove Camera 2", QMessageBox.DestructiveRole)
+        keep = box.addButton("Keep It", QMessageBox.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec_()
+        return box.clickedButton() is remove
+
+    def _finish_remove_second_camera(self) -> None:
+        try:
+            kept_as = remove_second_camera(self.primary_config_path)
+        except OSError as exc:
+            QMessageBox.critical(self, "Second camera not removed", str(exc))
+            return
+        self._camera_statuses.pop(2, None)
+        self.camera_index = 1
+        self.config_path = self.primary_config_path
+        self.config = _load_config_or_defaults(self.primary_config_path)
+        self._reset_camera_view()
+        self.refresh_from_config()
+        self.refresh_results()
+        QMessageBox.information(
+            self,
+            "Second camera removed",
+            f"Its settings were kept as {kept_as.name}. Its recordings were not touched.",
+        )
 
     def closeEvent(self, event: Any) -> None:
         if self._settings_dirty():
@@ -2957,7 +3530,10 @@ class BumbleBoxQtGUI(QMainWindow):
             return
         self._box_status_generation += 1
         self._box_status_loading = True
-        worker = _BoxStatusWorker(self._box_status_generation, copy.deepcopy(self.config), self.config_path)
+        worker = _BoxStatusWorker(
+            self._box_status_generation,
+            [(entry.index, copy.deepcopy(entry.config), entry.path) for entry in self.cameras],
+        )
         worker.signals.finished.connect(self._box_status_loaded)
         self._box_status_workers[worker.generation] = worker
         self.thread_pool.start(worker)
@@ -2967,14 +3543,23 @@ class BumbleBoxQtGUI(QMainWindow):
         if generation != self._box_status_generation:
             return
         self._box_status_loading = False
-        if isinstance(status, BoxStatus):
-            self._apply_box_status(status)
+        statuses = {self.camera_index: status} if isinstance(status, BoxStatus) else status
+        if isinstance(statuses, dict):
+            self._camera_statuses = {
+                int(index): value for index, value in statuses.items() if isinstance(value, BoxStatus)
+            }
+            shown = self._camera_statuses.get(self.camera_index)
+            if shown is not None:
+                self._apply_box_status(shown)
+            self._render_camera_strip()
         if self._box_status_refresh_pending:
             self._box_status_refresh_pending = False
             QTimer.singleShot(0, self.refresh_box_status)
 
     def _apply_box_status(self, status: BoxStatus) -> None:
         self._box_status = status
+        self._camera_statuses[self.camera_index] = status
+        self._render_camera_strip()
         schedule = status.schedule
         self._update_storage_estimate()
         self._set_card(
@@ -3002,10 +3587,28 @@ class BumbleBoxQtGUI(QMainWindow):
         """Recompute storage per day from recent recordings and the free space."""
         free_gb = self._box_status.storage.free_gb if self._box_status is not None else None
         self._storage_estimate = estimate_storage(
-            self.config, self._run_history_payloads, free_gb=free_gb, benchmark=self._load_benchmark()
+            self.config,
+            self._run_history_payloads,
+            free_gb=free_gb,
+            benchmark=self._load_benchmark(),
+            sharing_drive=self._sharing_drive(),
         )
         self._render_storage_card()
         self._schedule_settings_preview()
+
+    def _sharing_drive(self) -> tuple[str, float | None] | None:
+        """The other camera's label and storage use per day, if it fills the same drive."""
+        other = self._other_camera()
+        if other is None:
+            return None
+        if not _same_drive(
+            self.config.get("system", {}).get("data_root", ""), other.config.get("system", {}).get("data_root", "")
+        ):
+            return None
+        other_estimate = estimate_storage(
+            other.config, self._other_camera_payloads.get(other.index, []), benchmark=self._load_benchmark()
+        )
+        return other.label, other_estimate.bytes_per_day
 
     def _render_storage_card(self) -> None:
         if self._box_status is None:
@@ -3079,6 +3682,24 @@ class BumbleBoxQtGUI(QMainWindow):
             return
         self.run_bbx_command(["run-once", "--mode", str(self.run_mode.currentData())])
 
+    def _run_both_once(self) -> None:
+        if len(self.cameras) < 2:
+            return
+        if not self._confirm_live_monitor_closed("start a recording"):
+            return
+        if not self._resolve_unsaved_settings("start a recording"):
+            return
+        self.run_bbx_command(
+            [
+                "run-once",
+                "--all-cameras",
+                "--mode",
+                str(self.run_mode.currentData()),
+                "--config",
+                str(self.primary_config_path),
+            ]
+        )
+
     def _open_live_monitor(self) -> None:
         from .live_monitor import live_monitor_is_running
 
@@ -3104,25 +3725,59 @@ class BumbleBoxQtGUI(QMainWindow):
         )
         return False
 
-    def _start_automation(self) -> None:
+    def _automation_targets(self) -> list[CameraEntry]:
+        """The cameras Start and Stop act on: both when the box is ticked, else the shown one."""
+        if len(self.cameras) == 2 and self.both_cameras_checkbox.isChecked():
+            return list(self.cameras)
+        return [self._active_camera()]
+
+    def _schedule_known_off(self, index: int) -> bool:
+        status = self._camera_statuses.get(index)
+        return status is not None and status.schedule.state == SCHEDULE_OFF
+
+    def _start_automation(self, targets: list[CameraEntry] | None = None) -> None:
         if not self._confirm_live_monitor_closed("start automated recording"):
             return
         if not self._resolve_unsaved_settings("start automated recording"):
             return
-        config = load_config(self.config_path)
-        scheduling = config.setdefault("scheduling", {})
-        scheduling["enabled"] = True
-        scheduling["backend"] = "systemd"
-        scheduling["scope"] = "user"
-        review = review_schedule_start(config)
+        targets = list(targets) if targets else self._automation_targets()
+        two = len(self.cameras) == 2
+        review = StartReview()
+        prepared: list[tuple[CameraEntry, dict[str, Any]]] = []
+        for entry in targets:
+            config = load_config(entry.path)
+            scheduling = config.setdefault("scheduling", {})
+            scheduling["enabled"] = True
+            scheduling["backend"] = "systemd"
+            scheduling["scope"] = "user"
+            prepared.append((entry, config))
+            one = review_schedule_start(config)
+            prefix = f"{entry.label}: " if two else ""
+            review.problems += [prefix + problem for problem in one.problems]
+            review.suggestions += [text for text in one.suggestions if text not in review.suggestions]
+        if two:
+            # Judge the pair as it will run: each camera's own check knows
+            # nothing about the other recording at the same moment.
+            starting = {entry.index: config for entry, config in prepared}
+            pair = [CameraEntry(entry.index, entry.path, starting.get(entry.index, entry.config)) for entry in self.cameras]
+            review.problems += check_camera_set(pair)
+            load = combined_memory(pair)
+            if load is not None and load.level == "fail":
+                review.problems.append(load.message)
         if not review.ok and not self._confirm_start_despite_problems(review):
             return
-        save_config(self.config_path, config)
-        self.config = config
+        commands: list[list[str]] = []
+        for entry, config in prepared:
+            save_config(entry.path, config)
+            if entry.index == self.camera_index:
+                self.config = config
+            which = ["--config", str(entry.path)] if two else []
+            commands += [["systemd-write", *which], ["systemd-install", *which]]
+        both = len(prepared) == 2
         self.run_bbx_commands(
-            [["systemd-write"], ["systemd-install"]],
+            commands,
             success_message=(
-                "Automated recording started",
+                "Automated recording started for both cameras" if both else "Automated recording started",
                 "The clock-aligned recording schedule is active and will continue after logout.",
             ),
         )
@@ -3146,26 +3801,56 @@ class BumbleBoxQtGUI(QMainWindow):
         return box.clickedButton() is start_anyway
 
     def _stop_automation(self) -> None:
-        if not self._confirm_stop_automation():
+        targets = self._automation_targets()
+        if len(targets) == 2:
+            # Leave out a camera whose schedule is already off; stopping it would only report an error.
+            targets = [entry for entry in targets if not self._schedule_known_off(entry.index)] or [
+                self._active_camera()
+            ]
+        if not self._confirm_stop_automation(targets):
             return
-        config = load_config(self.config_path)
-        config.setdefault("scheduling", {})["enabled"] = False
-        save_config(self.config_path, config)
-        self.config = config
-        self.run_bbx_command(
-            ["systemd-disable"],
-            success_message=("Automated recording stopped", "The BumbleBox recording timer is disabled."),
+        two = len(self.cameras) == 2
+        commands: list[list[str]] = []
+        for entry in targets:
+            config = load_config(entry.path)
+            config.setdefault("scheduling", {})["enabled"] = False
+            save_config(entry.path, config)
+            if entry.index == self.camera_index:
+                self.config = config
+            commands.append(["systemd-disable", *(["--config", str(entry.path)] if two else [])])
+        both = len(targets) == 2
+        message = (
+            "Automated recording stopped for both cameras" if both else "Automated recording stopped",
+            "The BumbleBox recording timer is disabled.",
         )
+        if len(commands) == 1:
+            self.run_bbx_command(commands[0], success_message=message)
+        else:
+            self.run_bbx_commands(commands, success_message=message)
 
-    def _confirm_stop_automation(self) -> bool:
+    def _confirm_stop_automation(self, targets: list[CameraEntry] | None = None) -> bool:
+        targets = list(targets) if targets else [self._active_camera()]
         schedule = self._box_status.schedule if self._box_status is not None else None
-        if schedule is not None and schedule.state == SCHEDULE_OFF:
+        if len(targets) == 1 and targets[0].index != self.camera_index:
+            other_status = self._camera_statuses.get(targets[0].index)
+            schedule = other_status.schedule if other_status is not None else None
+        if len(targets) == 1 and schedule is not None and schedule.state == SCHEDULE_OFF:
             # Nothing is scheduled, so stopping changes nothing worth asking about.
             return True
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("Stop automated recording?")
-        box.setText("No more recordings will start until you press Start Automated Recording.")
+        if len(targets) == 2:
+            box.setWindowTitle("Stop automated recording on both cameras?")
+            box.setText("No more recordings will start on either camera until you press Start Automated Recording.")
+        elif len(self.cameras) == 2:
+            box.setWindowTitle(f"Stop automated recording on {targets[0].label}?")
+            box.setText(
+                f"No more recordings will start on {targets[0].label} until you press Start Automated "
+                "Recording. The other camera is not affected."
+            )
+        else:
+            box.setWindowTitle("Stop automated recording?")
+            box.setText("No more recordings will start until you press Start Automated Recording.")
         details = ["A recording that is already in progress finishes normally."]
         if schedule is not None and schedule.next_run is not None:
             now = datetime.now()
@@ -3187,6 +3872,7 @@ class BumbleBoxQtGUI(QMainWindow):
         *,
         detached: bool = False,
         success_message: tuple[str, str] | None = None,
+        on_success: Any = None,
     ) -> None:
         if detached:
             detached_arguments = list(arguments)
@@ -3198,13 +3884,14 @@ class BumbleBoxQtGUI(QMainWindow):
                 str(REPO_ROOT),
             )
             return
-        self.run_bbx_commands([arguments], success_message=success_message)
+        self.run_bbx_commands([arguments], success_message=success_message, on_success=on_success)
 
     def run_bbx_commands(
         self,
         commands: list[list[str]],
         *,
         success_message: tuple[str, str] | None = None,
+        on_success: Any = None,
     ) -> None:
         if self.process.state() != QProcess.NotRunning:
             QMessageBox.warning(
@@ -3215,6 +3902,7 @@ class BumbleBoxQtGUI(QMainWindow):
             return
         self.command_queue = [list(command) for command in commands]
         self.command_success_message = success_message
+        self._command_on_success = on_success
         self._cancel_requested = False
         self.console.clear()
         self.navigation.setCurrentRow(PAGE_INDEX_RUN)
@@ -3252,6 +3940,7 @@ class BumbleBoxQtGUI(QMainWindow):
         self._cancelled_steps = len(self.command_queue)
         self.command_queue.clear()
         self.command_success_message = None
+        self._command_on_success = None
         self.cancel_button.setText("Cancelling...")
         self.cancel_button.setEnabled(False)
         self._set_status_label(
@@ -3351,6 +4040,7 @@ class BumbleBoxQtGUI(QMainWindow):
         if exit_code != 0 or crashed:
             self.command_queue.clear()
             self.command_success_message = None
+            self._command_on_success = None
             self.refresh_box_status()
             label = command_label(self._current_command)
             if crashed:
@@ -3376,6 +4066,9 @@ class BumbleBoxQtGUI(QMainWindow):
             LEVEL_OK,
             success_title or f"{command_label(self._current_command)} finished.",
         )
+        on_success, self._command_on_success = self._command_on_success, None
+        if on_success is not None:
+            on_success()
         if self.config_path.exists():
             self.config = load_config(self.config_path)
             self.refresh_from_config()

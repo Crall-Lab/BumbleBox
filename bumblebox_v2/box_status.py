@@ -380,6 +380,7 @@ def estimate_storage(
     *,
     free_gb: Optional[float] = None,
     benchmark: Optional[Dict[str, Any]] = None,
+    sharing_drive: Optional[Tuple[str, Optional[float]]] = None,
 ) -> StorageEstimate:
     """Estimate storage per day and days of space left from past recordings.
 
@@ -394,10 +395,16 @@ def estimate_storage(
     When no such recording exists yet, a saved encode benchmark that was run
     on real footage at the same resolution is used instead; that measures the
     video file only.
+
+    ``sharing_drive`` is ``(label, bytes_per_day)`` for another camera that
+    writes to the same drive. Its use is added when working out how long the
+    free space lasts; ``bytes_per_day`` is ``None`` while that is not known.
     """
     per_day = recordings_per_day(config)
     if per_day == 0:
-        return StorageEstimate(LEVEL_OFF, "No new video", "Track-only mode does not record.")
+        return StorageEstimate(
+            LEVEL_OFF, "No new video", "Track-only mode saves tracking files but no video."
+        )
 
     wanted = recording_signature(config)
     samples = []
@@ -459,8 +466,17 @@ def estimate_storage(
     except (TypeError, ValueError):
         reserve_gb = DEFAULT_MIN_FREE_SPACE_GB
     usable = max(0.0, (float(free_gb) - reserve_gb) * 1e9)
-    estimate.days_left = usable / bytes_per_day
-    estimate.headline += f" · {describe_days(estimate.days_left)} of space left"
+    total_per_day = bytes_per_day
+    not_counted = ""
+    if sharing_drive is not None:
+        other_label, other_per_day = sharing_drive
+        if other_per_day:
+            total_per_day += float(other_per_day)
+            estimate.headline += f" ({format_bytes(total_per_day)} with {other_label})"
+        else:
+            not_counted = f", not counting {other_label}"
+    estimate.days_left = usable / total_per_day
+    estimate.headline += f" · {describe_days(estimate.days_left)} of space left{not_counted}"
     if estimate.days_left < SPACE_RUNNING_LOW_DAYS:
         estimate.level = LEVEL_WARN
     return estimate
@@ -692,9 +708,12 @@ def describe_schedule_plan(config: Dict[str, Any]) -> str:
     record_every = capture.get("record_interval_minutes", "?")
     track_every = capture.get("track_interval_minutes", "?")
     if mode == "track_only":
-        return f"Tracks existing videos every {track_every} min."
+        return f"Tracks tags for {length} every {track_every} min, without saving video."
     if mode == "mixed_schedule":
-        return f"Records {length} every {record_every} min; tracks every {track_every} min."
+        return (
+            f"Records {length} every {record_every} min; "
+            f"also tracks without saving video every {track_every} min."
+        )
     if mode == "record_only":
         return f"Records {length} every {record_every} min."
     return f"Records {length} every {record_every} min, then tracks."

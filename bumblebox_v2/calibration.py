@@ -194,6 +194,7 @@ def capture_calibration_image(
         start_autofocus_after_camera_start,
     )
     from .camera_profiles import apply_camera_profile, validate_camera_ir_compatibility
+    from .camera_select import picamera2_camera_kwargs
 
     config = apply_camera_profile(config)
     ir_error = validate_camera_ir_compatibility(config)
@@ -238,10 +239,11 @@ def capture_calibration_image(
             pass
 
         try:
+            camera_kwargs = picamera2_camera_kwargs(config, Picamera2)
             if tuning_file:
                 tuning = Picamera2.load_tuning_file(str(tuning_file))
-                return Picamera2(tuning=tuning)
-            return Picamera2()
+                return Picamera2(tuning=tuning, **camera_kwargs)
+            return Picamera2(**camera_kwargs)
         except IndexError as exc:
             raise RuntimeError(
                 "No camera detected by picamera2/libcamera (IndexError during camera open). "

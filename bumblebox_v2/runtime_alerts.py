@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .camera_select import session_tag as configured_session_tag
 from .status_history import list_recent_run_records, load_run_summary
 from .storage_guard import check_storage_ready
 
@@ -64,8 +65,10 @@ def _latest_recording_video(data_root: Path) -> Optional[Path]:
     return newest_path
 
 
-def _latest_recorded_video_from_run_history(data_root: Path, limit: int = 40) -> Optional[Path]:
-    records = list_recent_run_records(data_root, limit=limit)
+def _latest_recorded_video_from_run_history(
+    data_root: Path, limit: int = 40, *, session_tag: Optional[str] = None
+) -> Optional[Path]:
+    records = list_recent_run_records(data_root, limit=limit, session_tag=session_tag)
     for record in records:
         if record.mode not in RECORDING_MODES:
             continue
@@ -95,8 +98,10 @@ def _record_timestamp_iso(iso_text: str) -> Optional[float]:
         return None
 
 
-def _latest_recording_attempt(data_root: Path, limit: int = 40) -> Optional[Dict[str, Any]]:
-    records = list_recent_run_records(data_root, limit=limit)
+def _latest_recording_attempt(
+    data_root: Path, limit: int = 40, *, session_tag: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    records = list_recent_run_records(data_root, limit=limit, session_tag=session_tag)
     for record in records:
         if record.mode not in RECORDING_MODES:
             continue
@@ -207,8 +212,9 @@ def _recording_freshness_alert(config: Dict[str, Any]) -> RuntimeAlert:
     if not data_root.exists():
         return RuntimeAlert("WARN", "Recording freshness", f"No data root found at {data_root}.")
 
-    latest_attempt = _latest_recording_attempt(data_root)
-    latest_recorded_video = _latest_recorded_video_from_run_history(data_root)
+    camera_tag = configured_session_tag(config)
+    latest_attempt = _latest_recording_attempt(data_root, session_tag=camera_tag)
+    latest_recorded_video = _latest_recorded_video_from_run_history(data_root, session_tag=camera_tag)
     used_fallback_scan = False
     if latest_recorded_video is None:
         latest_recorded_video = _latest_recording_video(data_root)

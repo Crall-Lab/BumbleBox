@@ -471,7 +471,7 @@ class SettingsPageTests(QtControlTestCase):
         with self.window() as window:
             window._apply_box_status(_quiet_status(schedule_state=box_status.SCHEDULE_ON))
             started = []
-            window._start_automation = lambda: started.append(True)
+            window._start_automation = lambda targets=None: started.append(True)
             window.settings_record_interval.setValue(15)
             with mock.patch.object(qt_gui, "installed_units_are_current", return_value=False), mock.patch.object(
                 window, "_ask_apply_schedule", return_value=True
@@ -495,6 +495,367 @@ class SettingsPageTests(QtControlTestCase):
             )
             QApplication.sendEvent(spin, event)
             self.assertEqual(spin.value(), 20)
+
+
+CAM_A = "/base/axi/pcie@120000/rp1/i2c@88000/imx477@1a"
+CAM_B = "/base/axi/pcie@120000/rp1/i2c@80000/imx477@1a"
+
+
+class TwoCameraTests(QtControlTestCase):
+    """A Pi with two cameras: one config each, one window that switches between them."""
+
+    def detected(self):
+        from bumblebox_v2.camera_select import DetectedCamera
+
+        return [DetectedCamera(0, "imx477", CAM_A), DetectedCamera(1, "imx477", CAM_B)]
+
+    def add_second(self, window, *, pinned: bool = True, colony: str = "07"):
+        cameras = self.detected() if pinned else []
+        with mock.patch.object(qt_gui, "detect_cameras", return_value=cameras), mock.patch.object(
+            window, "_ask_second_camera_details", return_value=(colony, str(self.root / "data"))
+        ), mock.patch.object(QMessageBox, "information") as told:
+            window._add_second_camera()
+        return told
+
+    def second_path(self, window) -> Path:
+        return window.primary_config_path.with_name("config.camera2.yaml")
+
+    def test_one_camera_box_shows_no_camera_controls(self) -> None:
+        with self.window() as window:
+            self.assertEqual(len(window.cameras), 1)
+            for hidden in (window.camera_switch, window.cameras_strip, window.run_both_button,
+                           window.both_cameras_checkbox, window.pin_cameras_button,
+                           window.remove_second_camera_button):
+                self.assertTrue(hidden.isHidden())
+            self.assertFalse(window.add_second_camera_button.isHidden())
+            self.assertEqual(window.page_title.text(), "OVERVIEW")
+            self.assertEqual(window.run_once_button.text(), "Run Once Now")
+
+    def test_adding_a_second_camera_creates_its_settings_and_shows_the_switcher(self) -> None:
+        with self.window() as window:
+            told = self.add_second(window)
+            self.assertEqual(told.call_args[0][1], "Second camera added")
+            self.assertEqual(len(window.cameras), 2)
+            second = load_config(self.second_path(window))
+            self.assertEqual(second["system"]["colony_id"], "07")
+            self.assertEqual(second["camera"]["camera_id"], CAM_B)
+            self.assertEqual(window.config["camera"]["camera_id"], CAM_A)  # the first camera was pinned too
+            self.assertFalse(window.camera_switch.isHidden())
+            self.assertFalse(window.cameras_strip.isHidden())
+            self.assertEqual(window.camera_buttons[2].text(), "Camera 2 (colony 07)")
+            self.assertTrue(window.camera_buttons[1].isChecked())
+            self.assertTrue(window.add_second_camera_button.isHidden())
+            self.assertTrue(window.pin_cameras_button.isHidden())
+            self.assertFalse(window.remove_second_camera_button.isHidden())
+            self.assertEqual(window.page_title.text(), "OVERVIEW  ·  CAMERA 1")
+            self.assertEqual(window.run_once_button.text(), "Record Camera 1 Now")
+
+    def test_cancelling_the_dialog_adds_nothing(self) -> None:
+        with self.window() as window:
+            with mock.patch.object(qt_gui, "detect_cameras", return_value=[]), mock.patch.object(
+                window, "_ask_second_camera_details", return_value=None
+            ):
+                window._add_second_camera()
+            self.assertEqual(len(window.cameras), 1)
+            self.assertFalse(self.second_path(window).exists())
+
+    def test_unpinned_cameras_offer_pinning(self) -> None:
+        with self.window() as window:
+            self.add_second(window, pinned=False)
+            self.assertFalse(window.pin_cameras_button.isHidden())
+            self.assertIn("not pinned", window.second_camera_label.text())
+            with mock.patch.object(qt_gui, "pin_cameras", return_value=False), mock.patch.object(
+                QMessageBox, "warning"
+            ) as warned:
+                window._pin_cameras()
+            self.assertEqual(warned.call_args[0][1], "Cameras not pinned")
+
+            from bumblebox_v2 import multi_camera
+
+            with mock.patch.object(multi_camera, "detect_cameras", return_value=self.detected()), mock.patch.object(
+                QMessageBox, "information"
+            ):
+                window._pin_cameras()
+            self.assertTrue(window.pin_cameras_button.isHidden())
+            self.assertIn("pinned to one physical camera", window.second_camera_label.text())
+
+    def test_switching_shows_the_other_cameras_settings_and_status(self) -> None:
+        with self.window() as window:
+            self.add_second(window)
+            second = load_config(self.second_path(window))
+            second["capture"]["recording_seconds"] = 44
+            save_config(self.second_path(window), second)
+            on = _quiet_status(schedule_state=box_status.SCHEDULE_ON)
+            window._box_status_loaded(window._box_status_generation, {1: _quiet_status(), 2: on})
+            self.assertIn("Camera 2 (colony 07): On", window.camera_status_labels[2].text())
+            self.assertIn("(shown below)", window.camera_status_labels[1].text())
+
+            window._select_camera(2)
+            self.assertEqual(window.config_path, self.second_path(window))
+            self.assertEqual(window.settings_recording_seconds.value(), 44)
+            self.assertEqual(window.page_title.text(), "OVERVIEW  ·  CAMERA 2")
+            self.assertTrue(window.camera_buttons[2].isChecked())
+            self.assertEqual(window.schedule_card.value_label.text(), "On · next recording 14:30 (in 12 min)")
+            self.assertEqual(window.camera_card.title_label.text(), "CAMERA 2")
+            self.assertIn("(shown below)", window.camera_status_labels[2].text())
+
+            window._select_camera(1)
+            self.assertEqual(window.config_path, window.primary_config_path)
+            self.assertEqual(window.settings_recording_seconds.value(), 20)
+            self.assertEqual(window.schedule_card.value_label.text(), "Off")
+
+    def test_unsaved_settings_hold_the_switch(self) -> None:
+        with self.window() as window:
+            self.add_second(window)
+            window.settings_recording_seconds.setValue(33)
+            with mock.patch.object(window, "_ask_unsaved_settings_on_close", return_value="cancel"):
+                window._select_camera(2)
+            self.assertEqual(window.camera_index, 1)
+            self.assertTrue(window.camera_buttons[1].isChecked())
+            # Recording length is part of the schedule, so saving also asks whether
+            # Camera 2 should follow; here it should not.
+            with mock.patch.object(window, "_ask_unsaved_settings_on_close", return_value="save"), mock.patch.object(
+                window, "_ask_copy_schedule", return_value=False
+            ):
+                window._select_camera(2)
+            self.assertEqual(window.camera_index, 2)
+            self.assertEqual(load_config(window.primary_config_path)["capture"]["recording_seconds"], 33)
+
+    def test_each_camera_sees_only_its_own_recordings(self) -> None:
+        with self.window() as window:
+            self.add_second(window)
+            day = self.root / "data" / "2026-11-18"
+            for name, tag in (("host_2026-11-18_14_00_00", ""), ("host_cam2_2026-11-18_14_00_00", "cam2")):
+                session = day / name
+                session.mkdir(parents=True)
+                (session / f"{name}_run_summary.json").write_text(
+                    json.dumps(
+                        {"session_name": name, "session_dir": str(session), "started_at": "2026-11-18T14:00:00",
+                         "mode": "record_only", "success": True, "frames_captured": 10, "actual_fps": 5.0,
+                         "camera_session_tag": tag}
+                    )
+                )
+            window.refresh_results()
+            # A scan may already have been running while the files were being written;
+            # wait for one that has seen both.
+            self.pump(
+                lambda: bool(window._run_history_payloads)
+                and bool(window._other_camera_payloads.get(2))
+                and not window._run_history_loading
+            )
+            self.assertEqual([p["session_name"] for p in window._run_history_payloads], ["host_2026-11-18_14_00_00"])
+            self.assertEqual(
+                [p["session_name"] for p in window._other_camera_payloads[2]], ["host_cam2_2026-11-18_14_00_00"]
+            )
+            # Switch while a scan for Camera 1 is still running: its result must be dropped.
+            window.refresh_results()
+            window._select_camera(2)
+            self.pump(lambda: not window._run_history_loading and bool(window._run_history_payloads))
+            self.assertEqual(
+                [p["session_name"] for p in window._run_history_payloads], ["host_cam2_2026-11-18_14_00_00"]
+            )
+            self.assertEqual(window.results_table.rowCount(), 1)
+
+    def test_storage_card_counts_both_cameras_on_the_same_drive(self) -> None:
+        with self.window() as window:
+            self.add_second(window)
+            signature = box_status.recording_signature(window.config)
+
+            def run(tag):
+                return ResultButtonTests.payload(
+                    mode="record_and_track", frames_captured=100, _session_bytes=150e6,
+                    _recording_signature=signature, camera_session_tag=tag,
+                )
+
+            window._run_history_loaded(window._run_history_generation, [run("")], None, {2: [run("cam2")]})
+            window._apply_box_status(_quiet_status(free_gb=212))
+            detail = window.storage_card.detail_label.text()
+            self.assertIn("About 7.2 GB per day (14 GB with Camera 2)", detail)
+            self.assertIn("about 15 days of space left", detail)
+
+    def test_start_and_stop_act_on_both_cameras_by_default(self) -> None:
+        with self.window() as window, mock.patch.object(
+            qt_gui, "review_schedule_start", return_value=box_status.StartReview()
+        ), mock.patch("bumblebox_v2.live_monitor.live_monitor_is_running", return_value=False):
+            self.add_second(window)
+            first, second = str(window.primary_config_path), str(self.second_path(window))
+            started = []
+            window.run_bbx_commands = lambda commands, **kwargs: started.append((commands, kwargs))
+            window._start_automation()
+            commands, kwargs = started[0]
+            self.assertEqual(
+                commands,
+                [["systemd-write", "--config", first], ["systemd-install", "--config", first],
+                 ["systemd-write", "--config", second], ["systemd-install", "--config", second]],
+            )
+            self.assertEqual(kwargs["success_message"][0], "Automated recording started for both cameras")
+            self.assertTrue(load_config(first)["scheduling"]["enabled"])
+            self.assertTrue(load_config(second)["scheduling"]["enabled"])
+
+            on = _quiet_status(schedule_state=box_status.SCHEDULE_ON)
+            window._box_status_loaded(window._box_status_generation, {1: on, 2: on})
+            with mock.patch.object(window, "_confirm_stop_automation", return_value=True) as asked:
+                window._stop_automation()
+            self.assertEqual(len(asked.call_args[0][0]), 2)
+            self.assertEqual(
+                started[1][0], [["systemd-disable", "--config", first], ["systemd-disable", "--config", second]]
+            )
+            self.assertFalse(load_config(second)["scheduling"]["enabled"])
+
+    def test_one_camera_can_be_started_and_stopped_alone(self) -> None:
+        with self.window() as window, mock.patch.object(
+            qt_gui, "review_schedule_start", return_value=box_status.StartReview()
+        ), mock.patch("bumblebox_v2.live_monitor.live_monitor_is_running", return_value=False):
+            self.add_second(window)
+            window.both_cameras_checkbox.setChecked(False)
+            started = []
+            window.run_bbx_commands = lambda commands, **kwargs: started.append(commands)
+            window._start_automation()
+            first = str(window.primary_config_path)
+            self.assertEqual(started[0], [["systemd-write", "--config", first], ["systemd-install", "--config", first]])
+            self.assertFalse(load_config(self.second_path(window))["scheduling"]["enabled"])
+
+            # With both ticked, a camera whose schedule is already off is left out of Stop.
+            window.both_cameras_checkbox.setChecked(True)
+            window._box_status_loaded(
+                window._box_status_generation,
+                {1: _quiet_status(schedule_state=box_status.SCHEDULE_ON), 2: _quiet_status()},
+            )
+            stopped = []
+            window.run_bbx_command = lambda arguments, **kwargs: stopped.append(arguments)
+            with mock.patch.object(window, "_confirm_stop_automation", return_value=True):
+                window._stop_automation()
+            self.assertEqual(stopped, [["systemd-disable", "--config", first]])
+
+    def test_too_much_memory_for_both_cameras_is_raised_before_starting(self) -> None:
+        from bumblebox_v2.multi_camera import CombinedLoad
+
+        with self.window() as window, mock.patch.object(
+            qt_gui, "review_schedule_start", return_value=box_status.StartReview()
+        ), mock.patch("bumblebox_v2.live_monitor.live_monitor_is_running", return_value=False), mock.patch.object(
+            qt_gui, "combined_memory", return_value=CombinedLoad("fail", "Both cameras need 7.0 GiB of 8.0 GiB.")
+        ):
+            self.add_second(window)
+            started = []
+            window.run_bbx_commands = lambda commands, **kwargs: started.append(commands)
+            asked = []
+            window._confirm_start_despite_problems = lambda review: asked.append(review) or False
+            window._start_automation()
+            self.assertEqual(started, [])
+            self.assertIn("Both cameras need 7.0 GiB of 8.0 GiB.", asked[0].problems)
+
+    def test_record_both_runs_one_command_for_the_pair(self) -> None:
+        with self.window() as window, mock.patch("bumblebox_v2.live_monitor.live_monitor_is_running", return_value=False):
+            self.add_second(window)
+            ran = []
+            window.run_bbx_command = lambda arguments, **kwargs: ran.append(arguments)
+            window._run_both_once()
+            self.assertEqual(
+                ran,
+                [["run-once", "--all-cameras", "--mode", "record_and_track", "--config", str(window.primary_config_path)]],
+            )
+
+    def test_record_both_through_the_real_command(self) -> None:
+        def mock_cameras(config):
+            config["local_index"]["enabled"] = False
+            config["pipeline"]["mode"] = "record_only"
+            config["camera"].update({"width": 64, "height": 48, "codec": "mjpeg"})
+            config["capture"]["recording_seconds"] = 0.5
+            config["runtime"].update({"use_mock_camera": True, "fps_report_on_each_recording": False})
+
+        with tempfile.TemporaryDirectory() as locks, mock.patch.dict(
+            os.environ, {"BUMBLEBOX_CAPTURE_LOCK": str(Path(locks) / "capture.lock")}
+        ), self.window(mock_cameras) as window, mock.patch(
+            "bumblebox_v2.live_monitor.live_monitor_is_running", return_value=False
+        ):
+            self.add_second(window, pinned=False)
+            window.run_mode.setCurrentIndex(window.run_mode.findData("record_only"))
+            window._run_both_once()
+            self.pump(lambda: window.command_status.objectName() == "StatusGood", timeout=60)
+            output = window.console.toPlainText()
+            self.assertIn("Camera 1: recorded.", output)
+            self.assertIn("Camera 2: recorded.", output)
+            self.assertEqual(window.command_status.text(), "Recording finished.")
+
+            self.pump(lambda: bool(window._run_history_payloads) and bool(window._other_camera_payloads.get(2)))
+            self.assertNotIn("_cam2_", window._run_history_payloads[0]["session_name"])
+            self.assertIn("_cam2_", window._other_camera_payloads[2][0]["session_name"])
+            self.assertEqual(window.results_table.rowCount(), 1)
+
+    def test_changed_schedule_can_be_given_to_the_other_camera(self) -> None:
+        with self.window() as window:
+            self.add_second(window)
+            window.settings_record_interval.setValue(15)
+            with mock.patch.object(window, "_ask_copy_schedule", return_value=False) as asked:
+                window._save_settings(offer_apply=False)
+            self.assertEqual(asked.call_count, 1)
+            self.assertEqual(load_config(self.second_path(window))["capture"]["record_interval_minutes"], 30)
+
+            window.settings_record_interval.setValue(10)
+            with mock.patch.object(window, "_ask_copy_schedule", return_value=True):
+                window._save_settings(offer_apply=False)
+            self.assertEqual(load_config(self.second_path(window))["capture"]["record_interval_minutes"], 10)
+
+            # A change that does not touch the schedule asks nothing.
+            window.settings_fps.setValue(4.0)
+            with mock.patch.object(window, "_ask_copy_schedule", side_effect=AssertionError("should not ask")):
+                window._save_settings(offer_apply=False)
+
+    def test_removing_the_second_camera_stops_its_schedule_first(self) -> None:
+        with self.window() as window:
+            self.add_second(window)
+            window._box_status_loaded(
+                window._box_status_generation,
+                {1: _quiet_status(), 2: _quiet_status(schedule_state=box_status.SCHEDULE_ON)},
+            )
+            window._select_camera(2)
+            queued = []
+            window.run_bbx_commands = lambda commands, **kwargs: queued.append((commands, kwargs))
+            with mock.patch.object(window, "_confirm_remove_second_camera", return_value=False):
+                window._remove_second_camera()
+            self.assertEqual(queued, [])
+
+            with mock.patch.object(window, "_confirm_remove_second_camera", return_value=True):
+                window._remove_second_camera()
+            commands, kwargs = queued[0]
+            self.assertEqual(commands, [["systemd-disable", "--config", str(self.second_path(window))]])
+            self.assertTrue(self.second_path(window).exists())  # not removed until its timers are off
+
+            with mock.patch.object(QMessageBox, "information") as told:
+                kwargs["on_success"]()
+            self.assertEqual(told.call_args[0][1], "Second camera removed")
+            self.assertFalse(self.second_path(window).exists())
+            self.assertEqual(len(list(self.root.glob("config.camera2.removed-*.yaml"))), 1)
+            self.assertEqual((len(window.cameras), window.camera_index), (1, 1))
+            self.assertEqual(window.config_path, window.primary_config_path)
+            self.assertTrue(window.camera_switch.isHidden())
+
+    def test_second_camera_with_no_schedule_is_removed_at_once(self) -> None:
+        with self.window() as window:
+            self.add_second(window)
+            window._box_status_loaded(window._box_status_generation, {1: _quiet_status(), 2: _quiet_status()})
+            window.run_bbx_commands = lambda commands, **kwargs: self.fail("no command should be needed")
+            with mock.patch.object(window, "_confirm_remove_second_camera", return_value=True), mock.patch.object(
+                QMessageBox, "information"
+            ):
+                window._remove_second_camera()
+            self.assertEqual(len(window.cameras), 1)
+
+    def test_the_add_dialog_explains_and_prefills(self) -> None:
+        with self.window() as window:
+            dialog = qt_gui.SecondCameraDialog(window, detected=self.detected(), colony_id="02", data_root="/data")
+            try:
+                self.assertEqual(dialog.colony_id.text(), "02")
+                self.assertEqual(dialog.data_root.text(), "/data")
+                self.assertIn("imx477 on connector i2c@88000", dialog.detected_label.text())
+                self.assertIn("pinned", dialog.detected_label.text())
+            finally:
+                dialog.close()
+            alone = qt_gui.SecondCameraDialog(window, detected=self.detected()[:1], colony_id="02", data_root="/data")
+            try:
+                self.assertIn("1 camera(s) detected", alone.detected_label.text())
+            finally:
+                alone.close()
 
 
 if __name__ == "__main__":

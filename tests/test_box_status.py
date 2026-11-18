@@ -132,7 +132,11 @@ class TextHelperTests(unittest.TestCase):
         self.assertEqual(describe_schedule_plan(schedule_config("record_only")), "Records 20 s every 30 min.")
         self.assertEqual(
             describe_schedule_plan(schedule_config("mixed_schedule")),
-            "Records 20 s every 30 min; tracks every 5 min.",
+            "Records 20 s every 30 min; also tracks without saving video every 5 min.",
+        )
+        self.assertEqual(
+            describe_schedule_plan(schedule_config("track_only")),
+            "Tracks tags for 20 s every 5 min, without saving video.",
         )
 
 

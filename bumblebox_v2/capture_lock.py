@@ -34,19 +34,26 @@ class CaptureBusyError(RuntimeError):
     """Raised when another capture kept the camera for longer than the allowed wait."""
 
 
-def default_lock_path() -> Path:
+def default_lock_path(suffix: str = "") -> Path:
     """Where the lock file lives.
 
     It is deliberately not on the data drive: the lock must work when that
     drive is missing, and must be shared by every user that can start a run.
+
+    ``suffix`` names a second camera (for example ``"cam1"``). Each camera has
+    its own lock, so two cameras can record at once while two runs on one
+    camera still cannot.
     """
     override = os.environ.get(LOCK_PATH_ENV, "").strip()
     if override:
-        return Path(override).expanduser()
-    run_lock = Path("/run/lock")
-    if run_lock.is_dir() and os.access(run_lock, os.W_OK):
-        return run_lock / LOCK_FILE_NAME
-    return Path(tempfile.gettempdir()) / LOCK_FILE_NAME
+        base = Path(override).expanduser()
+    else:
+        run_lock = Path("/run/lock")
+        directory = run_lock if run_lock.is_dir() and os.access(run_lock, os.W_OK) else Path(tempfile.gettempdir())
+        base = directory / LOCK_FILE_NAME
+    if not suffix:
+        return base
+    return base.with_name(f"{base.stem}-{suffix}{base.suffix}")
 
 
 def _open_lock_file(path: Path) -> int:

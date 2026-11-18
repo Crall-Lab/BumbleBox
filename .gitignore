@@ -44,6 +44,7 @@ Thumbs.db
 
 # Project-local generated config/runtime artifacts
 /bumblebox_v2/config.yaml
+/bumblebox_v2/config.camera2*.yaml
 *.log
 
 # Project-local tracking index artifacts.
