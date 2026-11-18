@@ -87,6 +87,15 @@ TimeoutStartSec=3620
 recording time plus the larger of 30 minutes and two schedule intervals. A
 20-second recording every 30 minutes gets 60 minutes and 20 seconds.
 
+With a long interval that rule would be far too generous, so the limit is
+also never later than five minutes before the next slot, whenever the
+interval leaves room for the recording plus 30 minutes. A two-hour recording
+once a day gets 23 hours 55 minutes; a 20-second recording every hour gets
+55 minutes.
+
+A long recording has a faster safeguard as well: a watchdog that restarts a
+failed or stalled recorder within minutes. See `docs/Long_Recordings.md`.
+
 When the limit is reached, systemd stops the run and marks it failed. The next
 scheduled run starts normally. In stream mode the video recorded so far is
 kept; tracking that was still in progress is lost and can be redone with
@@ -186,3 +195,5 @@ until the next slot.
   (no RGB camera) does not run the storage check.
 - These protections have been tested with the mock camera and simulated
   drives, not yet on a Raspberry Pi with a real drive unplugged.
+- A run that is killed outright now still appears in Results, marked "Did not
+  finish"; see `docs/Long_Recordings.md`.

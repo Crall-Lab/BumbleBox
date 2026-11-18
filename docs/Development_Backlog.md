@@ -69,6 +69,28 @@ See `docs/RealSense_Camera.md` for hardware validation and `docs/Multimodal_Cali
 - [x] State what the settings imply: storage used per day and days until the
       drive is full, on the Overview storage card and the Settings page.
 - [ ] Check the storage estimate against a week of real recordings on a Pi.
+- [x] Let lengths and intervals be typed in seconds, minutes, hours or days on
+      the Settings page and in the setup wizard (the config still stores
+      seconds and minutes).
+- [x] Add `scheduling.start_time`, the time of day recordings are counted from,
+      so a daily recording can start at a chosen time.
+- [ ] Make `scheduling.active_hours` do something: record only between two
+      times of day. It is in the config but unused.
+- [x] Split a long recording into consecutive files without stopping the
+      camera, so a two-hour session is a row of short videos with no gaps
+      (`capture.chunk_minutes`). See `docs/Long_Recordings.md`.
+- [x] Restart a failed or stalled recording for the time left in its session
+      (`capture.restart_on_failure`), and record a run that is killed as
+      "Did not finish" instead of leaving no trace.
+- [x] Stop a hung run before the next slot on long intervals (the automatic
+      service time limit was 50 hours for a daily schedule).
+- [ ] Run a two-hour session on a Pi, on one camera and on two: frame rate
+      held, temperature, file sizes, and a pulled camera cable mid-session.
+- [ ] Decide whether a session interrupted by a reboot should resume when the
+      Pi comes back inside its window. Off by design at present.
+- [ ] Save the timestamps of the file in progress as it is written, so a
+      recorder that is killed outright loses nothing but unflushed frames.
+- [ ] Make the tracking overlay video cover every file of a split recording.
 - [ ] Test Cancel during two-Pi capture; the other Pi may keep recording.
 
 ## Two Cameras on One Pi

@@ -488,13 +488,194 @@ class SettingsPageTests(QtControlTestCase):
 
     def test_scrolling_over_a_field_does_not_change_it(self) -> None:
         with self.window() as window:
-            spin = window.settings_recording_seconds
+            spin = window.settings_recording_seconds.number
             event = QWheelEvent(
                 QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, 120),
                 Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False,
             )
             QApplication.sendEvent(spin, event)
             self.assertEqual(spin.value(), 20)
+            self.assertEqual(window.settings_recording_seconds.value(), 20)
+
+
+class ScheduleFieldTests(QtControlTestCase):
+    """Lengths and intervals in seconds, minutes, hours or days, and the time of day."""
+
+    @staticmethod
+    def choose(field, number: float, unit: str) -> None:
+        field.number.setValue(number)
+        field.unit.setCurrentIndex(field.unit.findData(unit))
+
+    def test_saved_values_are_shown_in_their_natural_unit(self) -> None:
+        def daily(config):
+            config["capture"].update({"recording_seconds": 7200, "record_interval_minutes": 1440})
+            config["scheduling"]["start_time"] = "10:00"
+
+        with self.window(daily) as window:
+            length, every = window.settings_recording_seconds, window.settings_record_interval
+            self.assertEqual((length.number.value(), length.unit.currentData()), (2.0, "h"))
+            self.assertEqual(length.unit.currentText(), "hours")
+            self.assertEqual((every.number.value(), every.unit.currentData()), (1.0, "day"))
+            self.assertEqual(every.unit.currentText(), "day")
+            self.assertEqual(window.settings_start_time.time().toString("HH:mm"), "10:00")
+            self.assertEqual(window.settings_start_hint.text(), "It starts at this time every day.")
+            self.assertFalse(window._settings_dirty())
+            window._refresh_settings_preview()
+            self.assertIn("Records 2 h once a day at 10:00, then tracks.", window.settings_effects_label.text())
+
+    def test_two_hours_once_a_day_at_ten_is_saved_in_seconds_and_minutes(self) -> None:
+        with self.window() as window:
+            self.assertEqual(window.settings_recording_seconds.unit.currentData(), "s")
+            self.assertEqual(
+                window.settings_start_hint.text(), "Falls on 00:00 and every 30 min after it, around the clock."
+            )
+            self.choose(window.settings_recording_seconds, 2, "h")
+            self.choose(window.settings_record_interval, 1, "day")
+            window.settings_start_time.setTime(qt_gui.QTime(10, 0))
+            self.assertTrue(window._settings_dirty())
+            self.assertTrue(window._save_settings(offer_apply=False))
+            saved = load_config(window.config_path)
+            self.assertEqual(saved["capture"]["recording_seconds"], 7200)
+            self.assertEqual(saved["capture"]["record_interval_minutes"], 1440)
+            self.assertEqual(saved["scheduling"]["start_time"], "10:00")
+            self.assertFalse(window._settings_dirty())
+
+    def test_choosing_a_unit_keeps_the_number_as_typed(self) -> None:
+        with self.window() as window:
+            field = window.settings_recording_seconds
+            field.number.setValue(90)
+            self.assertEqual(field.value(), 90)
+            field.unit.setCurrentIndex(field.unit.findData("min"))
+            self.assertEqual(field.number.value(), 90)
+            self.assertEqual(field.value(), 5400)
+            self.choose(field, 1.5, "h")
+            self.assertEqual(field.value(), 5400)
+            self.assertEqual(field.number.text(), "1.5")
+            self.choose(field, 2.5, "s")
+            self.assertEqual(field.value(), 2.5)
+
+    def test_any_number_can_be_typed_before_the_unit_is_chosen(self) -> None:
+        with self.window() as window:
+            every = window.settings_record_interval
+            self.choose(every, 1, "day")
+            every.number.setValue(12)  # typing 12 while the unit still says days
+            self.assertEqual(every.number.value(), 12)
+            every.unit.setCurrentIndex(every.unit.findData("h"))
+            self.assertEqual(every.value(), 720)
+            self.assertIsNone(every.problem())
+            self.choose(every, 1.5, "h")
+            self.assertEqual(every.value(), 90)
+            self.assertIsInstance(every.value(), int)
+
+    def test_out_of_range_values_are_flagged_and_not_saved(self) -> None:
+        with self.window() as window:
+            length, every = window.settings_recording_seconds, window.settings_record_interval
+            self.choose(length, 100, "h")  # a recording is at most a day
+            self.assertEqual(length.problem(), "at most 24 hours")
+            self.choose(every, 5, "day")  # timers repeat daily at most
+            self.assertEqual(every.problem(), "at most 1 day")
+            window._refresh_settings_preview()
+            self.assertEqual(window.settings_check_status.objectName(), "StatusFail")
+            self.assertIn("Problem: Record for: at most 24 hours.", window.settings_issues_label.text())
+            self.assertIn("Problem: Record every: at most 1 day.", window.settings_issues_label.text())
+            with mock.patch.object(QMessageBox, "critical") as refused:
+                self.assertFalse(window._save_settings(offer_apply=False))
+            self.assertIn("Record every: at most 1 day.", refused.call_args[0][2])
+            saved = load_config(window.config_path)
+            self.assertEqual((saved["capture"]["recording_seconds"], saved["capture"]["record_interval_minutes"]), (20, 30))
+
+            self.choose(length, 2, "h")
+            self.choose(every, 0.5, "day")
+            self.assertEqual(window._settings_field_problems(), [])
+            self.assertTrue(window._save_settings(offer_apply=False))
+            self.assertEqual(load_config(window.config_path)["capture"]["record_interval_minutes"], 720)
+
+    def test_unit_names_follow_the_number(self) -> None:
+        with self.window() as window:
+            field = window.settings_record_interval
+            self.choose(field, 1, "h")
+            self.assertEqual(field.unit.currentText(), "hour")
+            field.number.setValue(2)
+            self.assertEqual(field.unit.currentText(), "hours")
+
+    def test_changed_start_time_offers_to_restart_the_running_schedule(self) -> None:
+        with self.window() as window:
+            window._apply_box_status(_quiet_status(schedule_state=box_status.SCHEDULE_ON))
+            installed = self.root / "installed"
+            from bumblebox_v2.systemd_units import write_systemd_units
+
+            write_systemd_units(config=window.config, config_path=window.config_path, output_dir=installed)
+            real_check = box_status.installed_units_are_current
+            started = []
+            window._start_automation = lambda targets=None: started.append(targets)
+            # 09:10, not 09:30: with a 30-minute interval, 09:30 gives the same slots as midnight.
+            window.settings_start_time.setTime(qt_gui.QTime(9, 10))
+            with mock.patch.object(
+                qt_gui,
+                "installed_units_are_current",
+                side_effect=lambda config, path: real_check(config, path, installed_dir=installed),
+            ), mock.patch.object(window, "_ask_apply_schedule", return_value=True):
+                window._save_settings(offer_apply=True)
+            self.assertEqual(len(started), 1)
+
+    def test_file_splitting_and_restart_settings(self) -> None:
+        with self.window() as window:
+            self.assertEqual(window.settings_chunk_minutes.value(), 10.0)
+            self.assertEqual(window.settings_restart.currentData(), "auto")
+            # Splitting only exists when encoding while recording.
+            self.assertTrue(window.settings_chunk_minutes.isHidden())
+            window.settings_frame_buffer.setCurrentIndex(window.settings_frame_buffer.findData("stream"))
+            self.assertFalse(window.settings_chunk_minutes.isHidden())
+
+            window.settings_chunk_minutes.setValue(5)
+            window.settings_restart.setCurrentIndex(window.settings_restart.findData("never"))
+            self.assertTrue(window._save_settings(offer_apply=False))
+            saved = load_config(window.config_path)
+            self.assertEqual(saved["capture"]["chunk_minutes"], 5.0)
+            self.assertIs(saved["capture"]["restart_on_failure"], False)
+            self.assertEqual(window.settings_restart.currentData(), "never")  # and it reads back as saved
+
+            window.settings_chunk_minutes.setValue(0)
+            self.assertEqual(window.settings_chunk_minutes.text(), "Never (one file)")
+            window.settings_restart.setCurrentIndex(window.settings_restart.findData("always"))
+            self.assertTrue(window._save_settings(offer_apply=False))
+            saved = load_config(window.config_path)
+            self.assertEqual(saved["capture"]["chunk_minutes"], 0.0)
+            self.assertIs(saved["capture"]["restart_on_failure"], True)
+            self.assertEqual(window.settings_restart.currentData(), "always")
+            self.assertFalse(window._settings_dirty())
+
+    def test_results_show_split_recordings_and_runs_that_did_not_finish(self) -> None:
+        with self.window() as window:
+            split = ResultButtonTests.payload(video_parts=["a_part001.mp4", "a_part002.mp4", "a_part003.mp4"])
+            window._run_history_loaded(window._run_history_generation, [split], None)
+            self.assertIn("Video: 3 files, one after the other", window.result_detail.text())
+
+            unfinished = ResultButtonTests.payload(
+                success=False,
+                unfinished=True,
+                errors=["Did not finish: the recorder was stopped, crashed, or lost power. 2 video file(s) with 40 frames were saved before that."],
+                video_parts=["b_part001.mp4", "b_part002.mp4"],
+            )
+            window._run_history_loaded(window._run_history_generation, [unfinished], None)
+            self.assertIn("FAILED", window.latest_card.value_label.text())
+            self.assertIn("Did not finish", window.latest_card.detail_label.text())
+            self.assertIn("2 video file(s) with 40 frames were saved", window.latest_card.detail_label.text())
+            self.assertEqual(window.results_table.item(0, 1).text(), "Failed")
+
+    def test_wizard_uses_the_same_fields(self) -> None:
+        with self.window() as window:
+            wizard = qt_gui.BumbleBoxSetupWizard(window.config_path, window.config, window)
+            try:
+                page = wizard.experiment_page
+                self.assertEqual((page.recording_seconds.value(), page.interval_minutes.value()), (20, 30))
+                self.choose(page.recording_seconds, 10, "min")
+                self.choose(page.interval_minutes, 2, "h")
+                page.start_time.setTime(qt_gui.QTime(8, 15))
+                self.assertEqual((page.recording_seconds.value(), page.interval_minutes.value()), (600, 120))
+                self.assertEqual(page.start_time.time().toString("HH:mm"), "08:15")
+            finally:
+                wizard.close()
 
 
 CAM_A = "/base/axi/pcie@120000/rp1/i2c@88000/imx477@1a"

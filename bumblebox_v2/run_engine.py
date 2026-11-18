@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +31,8 @@ from .realsense_camera import (
     RealSenseRecordingSession,
     capture_simulated_realsense_recording,
 )
+from . import heartbeat
+from .time_units import describe_seconds
 from .simulated_capture import (
     simulated_frame_times,
     simulated_rgb_yuv420_frame,
@@ -46,6 +48,7 @@ from .camera_select import (
 from .capture_lock import DEFAULT_LOCK_WAIT_SECONDS, capture_lock, default_lock_path
 from .storage_guard import ensure_storage_ready
 from .stream_writer import (
+    stream_chunk_frames,
     FRAME_BUFFER_STREAM,
     StreamedVideo,
     StreamingVideoWriter,
@@ -70,7 +73,11 @@ PROGRESS_UPDATE_STEPS = 10
 _PROGRESS_PRINT_LOCK = threading.Lock()
 
 
+UNFINISHED_RUN_ERROR = "Did not finish: the recorder was stopped, crashed, or lost power."
+
+
 def _progress_message(stage: str, message: str) -> None:
+    heartbeat.beat()
     with _PROGRESS_PRINT_LOCK:
         print(f"[{stage}] {message}", flush=True)
 
@@ -202,6 +209,9 @@ class RunSummary:
     camera_num: int = 0
     camera_id: Optional[str] = None
     camera_session_tag: str = ""
+    # Every video file of a recording that was split into consecutive files,
+    # in order; empty for a recording kept as one file (see video_path).
+    video_parts: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -391,6 +401,7 @@ def _write_timestamps(
     *,
     timestamp_records: Optional[List[FrameTimestampRecord]] = None,
     node_name: Optional[str] = None,
+    first_frame: int = 0,
 ) -> Path:
     path = session_dir / f"{session_name}_frame_timestamps.csv"
     with path.open("w") as f:
@@ -399,8 +410,9 @@ def _write_timestamps(
         )
         node = str(node_name or socket.gethostname())
         records = list(timestamp_records or [])
-        for i, value in enumerate(timestamps):
-            record = records[i] if i < len(records) else None
+        for position, value in enumerate(timestamps):
+            i = first_frame + position
+            record = records[position] if position < len(records) else None
             if record is None:
                 f.write(f"{i},{node},rgb,host_receive,{value:.6f},,,,,\n")
                 continue
@@ -471,20 +483,28 @@ def _mock_capture_frames(
     timestamp_records: List[FrameTimestampRecord] = []
     start_monotonic = time.perf_counter()
     monotonic_to_unix_offset_s = time.time() - time.perf_counter()
+    # The mock camera normally hands over all its frames at once. With
+    # runtime.mock_camera_realtime it waits like a real camera, which is what
+    # long-recording behaviour (file roll-over, the watchdog) needs to be tried.
+    realtime = bool(config["runtime"].get("mock_camera_realtime", False))
     for i, relative_s in enumerate(scheduled_times):
+        if realtime:
+            wait = start_monotonic + relative_s - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
         frame = simulated_rgb_yuv420_frame(width, height, relative_s, duration)
+        record = _build_timestamp_record(
+            start_monotonic=start_monotonic,
+            captured_monotonic_s=start_monotonic + relative_s,
+            monotonic_to_unix_offset_s=monotonic_to_unix_offset_s,
+        )
         if frame_sink is None:
             frames.append(frame)
         else:
-            frame_sink.add(frame)
+            frame_sink.add(frame, record)
         timestamps.append(relative_s)
-        timestamp_records.append(
-            _build_timestamp_record(
-                start_monotonic=start_monotonic,
-                captured_monotonic_s=start_monotonic + relative_s,
-                monotonic_to_unix_offset_s=monotonic_to_unix_offset_s,
-            )
-        )
+        timestamp_records.append(record)
+        heartbeat.beat()
         if progress is not None:
             progress.update(i + 1)
 
@@ -552,10 +572,6 @@ def _capture_frames_from_started_picamera(
             else:
                 yuv420 = picam2.capture_array()
             captured_monotonic_s = time.perf_counter()
-            if frame_sink is None:
-                frames.append(yuv420)
-            else:
-                frame_sink.add(yuv420)
             record = _build_timestamp_record(
                 start_monotonic=start,
                 captured_monotonic_s=captured_monotonic_s,
@@ -563,8 +579,13 @@ def _capture_frames_from_started_picamera(
                 sensor_timestamp_ns=sensor_timestamp_ns,
                 timestamp_source=("sensor_and_host" if sensor_timestamp_ns is not None else "host_receive"),
             )
+            if frame_sink is None:
+                frames.append(yuv420)
+            else:
+                frame_sink.add(yuv420, record)
             timestamps.append(record.time_s)
             timestamp_records.append(record)
+            heartbeat.beat()
             frame_index += 1
             if progress is not None:
                 progress.update(frame_index)
@@ -2399,10 +2420,14 @@ class _VideoFrameSequence:
     cheapest in increasing index order.
     """
 
-    def __init__(self, video_path: Path, frame_count: int) -> None:
-        self.video_path = Path(video_path)
+    def __init__(self, video_path: Any, frame_count: int) -> None:
+        # One file, or the consecutive files of a recording that was split.
+        paths = [video_path] if isinstance(video_path, (str, Path)) else list(video_path)
+        self.video_paths = [Path(path) for path in paths]
+        self.video_path = self.video_paths[0]
         self._frame_count = max(0, int(frame_count))
         self._capture: Any = None
+        self._file_index = 0
         self._next_index = 0
 
     def __len__(self) -> int:
@@ -2418,14 +2443,20 @@ class _VideoFrameSequence:
             raise IndexError(index)
         if self._capture is None or index < self._next_index:
             self.close()
-            self._capture = cv2.VideoCapture(str(self.video_path))
-            self._next_index = 0
+            self._capture = cv2.VideoCapture(str(self.video_paths[0]))
         frame = None
         while self._next_index <= index:
             ok, frame = self._capture.read()
             if not ok or frame is None:
+                # This file is finished; carry on in the next one, if any.
+                if self._file_index + 1 < len(self.video_paths):
+                    self._capture.release()
+                    self._file_index += 1
+                    self._capture = cv2.VideoCapture(str(self.video_paths[self._file_index]))
+                    continue
                 raise IndexError(
-                    f"{self.video_path.name} ended at frame {self._next_index}; frame {index} was requested."
+                    f"{self.video_paths[self._file_index].name} ended at frame {self._next_index}; "
+                    f"frame {index} was requested."
                 )
             self._next_index += 1
         return frame
@@ -2437,6 +2468,7 @@ class _VideoFrameSequence:
             except Exception:
                 pass
         self._capture = None
+        self._file_index = 0
         self._next_index = 0
 
 
@@ -2533,6 +2565,7 @@ def _track_from_video(
     session_name: str,
     session_dir: Path,
     video_path: Path,
+    video_parts: Optional[List[Path]] = None,
 ) -> Tuple[Any, Any]:
     try:
         from tag_tracking_utils import trackTagsFromVid
@@ -2544,16 +2577,51 @@ def _track_from_video(
     colony_id = config["system"]["colony_id"]
     aruco_params = config["tracking"].get("aruco_params")
 
-    df, df2, _ = trackTagsFromVid(
-        str(video_path),
-        str(session_dir),
-        session_name,
-        config["tracking"]["tag_dictionary"],
-        box_preset,
-        now_str,
-        colony_id,
-        aruco_params=aruco_params,
-    )
+    parts = [Path(path) for path in (video_parts or [])]
+    if len(parts) <= 1:
+        df, df2, _ = trackTagsFromVid(
+            str(video_path),
+            str(session_dir),
+            session_name,
+            config["tracking"]["tag_dictionary"],
+            box_preset,
+            now_str,
+            colony_id,
+            aruco_params=aruco_params,
+        )
+        return df, df2
+
+    # A split recording: track each file, then join the results with frame
+    # numbers that run through the whole recording.
+    import pandas as pd
+
+    tracked, untagged = [], []
+    first_frame = 0
+    for number, part in enumerate(parts, start=1):
+        _progress_message("tracking", f"Tracking video file {number} of {len(parts)}: {part.name}.")
+        part_name = f"{session_name}_part{number:03d}"
+        part_df, part_df2, part_frames = trackTagsFromVid(
+            str(part),
+            str(session_dir),
+            part_name,
+            config["tracking"]["tag_dictionary"],
+            box_preset,
+            now_str,
+            colony_id,
+            aruco_params=aruco_params,
+        )
+        for frame_table in (part_df, part_df2):
+            frame_table["frame"] = frame_table["frame"] + first_frame
+            frame_table["filename"] = session_name
+        tracked.append(part_df)
+        untagged.append(part_df2)
+        first_frame += int(part_frames)
+        for leftover in (session_dir / f"{part_name}_raw.csv", session_dir / f"{part_name}_noID.csv"):
+            leftover.unlink(missing_ok=True)
+    df = pd.concat(tracked, ignore_index=True)
+    df2 = pd.concat(untagged, ignore_index=True)
+    df.to_csv(session_dir / f"{session_name}_raw.csv", index=False)
+    df2.to_csv(session_dir / f"{session_name}_noID.csv", index=False)
     return df, df2
 
 
@@ -2777,6 +2845,7 @@ def run_once(
     tracking_processing_fps: Optional[float] = None
     video_codec: Optional[str] = None
     video_path: Optional[Path] = None
+    video_parts: List[Path] = []
     recording_preview_png_path: Optional[Path] = None
     timestamp_path: Optional[Path] = None
     thermal_capture: Optional[dict[str, Any]] = None
@@ -2800,6 +2869,41 @@ def run_once(
             "run",
             f"Session {session_name} started in {mode} mode.",
         )
+        # A run that is killed, or loses power, never reaches the code that
+        # writes its summary, and would then be missing from every list of
+        # runs. So a summary saying "did not finish" is written now and
+        # replaced by the real one at the end.
+        unfinished: Dict[str, Any] = {
+            "started_at": started_at,
+            "finished_at": "",
+            "mode": mode,
+            "session_name": session_name,
+            "session_dir": str(session_dir),
+            "hostname": socket.gethostname(),
+            "frames_captured": 0,
+            "actual_fps": 0.0,
+            "video_path": None,
+            "video_parts": [],
+            "capture_frame_buffer": frame_buffer_mode(config),
+            "thermal_enabled": False,
+            "realsense_enabled": False,
+            "camera_num": configured_camera_num(config),
+            "camera_id": configured_camera_id(config),
+            "camera_session_tag": session_tag(config),
+            "warnings": [],
+            "errors": [UNFINISHED_RUN_ERROR],
+            "success": False,
+            "unfinished": True,
+        }
+        unfinished_path = session_dir / f"{session_name}_run_summary.json"
+
+        def _save_unfinished() -> None:
+            try:
+                unfinished_path.write_text(json.dumps(unfinished, indent=2))
+            except OSError:
+                pass  # the real summary is written at the end regardless
+
+        _save_unfinished()
 
         if should_record and frame_buffer_mode(config) == FRAME_BUFFER_STREAM:
             capture_frame_buffer = FRAME_BUFFER_STREAM
@@ -2807,6 +2911,39 @@ def run_once(
                 1,
                 int(round(float(config["capture"]["recording_seconds"]) * float(config["camera"]["fps_target"]))),
             )
+            # A long recording is written as consecutive files, so a failure
+            # late in the session costs one file rather than all of it. A
+            # recording that fits in one file keeps its usual name.
+            chunk_frames = stream_chunk_frames(config)
+            if expected_frames <= chunk_frames:
+                chunk_frames = 0
+
+            def _part_saved(chunk: Any) -> None:
+                # Runs on the writer's background thread as each file closes:
+                # its timestamps go to disk now, not at the end of the session.
+                _write_timestamps(
+                    [float(getattr(record, "time_s", 0.0)) for record in chunk.records],
+                    session_dir,
+                    f"{session_name}_part{chunk.index:03d}",
+                    timestamp_records=list(chunk.records),
+                    first_frame=int(chunk.first_frame),
+                )
+                # Keep the "did not finish" summary current, so a run that is
+                # cut short still lists the files it completed.
+                unfinished["video_parts"].append(str(chunk.video_path))
+                unfinished["video_path"] = unfinished["video_parts"][0]
+                unfinished["frames_captured"] = int(chunk.first_frame) + int(chunk.frame_count)
+                unfinished["errors"] = [
+                    f"{UNFINISHED_RUN_ERROR} {len(unfinished['video_parts'])} video file(s) with "
+                    f"{unfinished['frames_captured']} frames were saved before that."
+                ]
+                _save_unfinished()
+                _progress_message(
+                    "output",
+                    f"Video file {chunk.index} saved: {Path(chunk.video_path).name} "
+                    f"({chunk.frame_count} frames from frame {chunk.first_frame}).",
+                )
+
             stream_writer = StreamingVideoWriter(
                 output_dir=session_dir,
                 stem=session_name,
@@ -2817,7 +2954,15 @@ def run_once(
                 monochrome_output=_camera_monochrome_output_enabled(config),
                 max_queue_bytes=stream_queue_bytes(config),
                 preview_frame_index=expected_frames // 2,
+                chunk_frames=chunk_frames,
+                on_chunk_closed=_part_saved,
             )
+            if chunk_frames:
+                _progress_message(
+                    "capture",
+                    f"The recording is split into a new video file every {chunk_frames} frames "
+                    f"(about {describe_seconds(round(chunk_frames / float(config['camera']['fps_target'])))}).",
+                )
             _progress_message(
                 "capture",
                 "Stream mode: frames are encoded to disk during capture "
@@ -2878,6 +3023,9 @@ def run_once(
                     frame_sink=stream_writer,
                 )
                 frame_count = len(timestamps)
+                # Capture is over: tell the watchdog, so that slow work from
+                # here on (encoding, tracking) is not mistaken for a stall.
+                heartbeat.capture_finished()
                 if thermal_capture is not None:
                     thermal_artifacts = _write_thermal_recording_outputs(
                         session_dir=session_dir,
@@ -2913,6 +3061,9 @@ def run_once(
                     frame_sink=stream_writer,
                 )
                 frame_count = len(timestamps)
+                # Capture is over: tell the watchdog, so that slow work from
+                # here on (encoding, tracking) is not mistaken for a stall.
+                heartbeat.capture_finished()
                 _progress_message(
                     "capture",
                     f"RGB acquisition finished: {frame_count} frames at {actual_fps:.3f} FPS.",
@@ -2947,6 +3098,8 @@ def run_once(
                     actual_fps=float(actual_fps if actual_fps > 0 else config["camera"]["fps_target"])
                 )
                 video_path = streamed_video.video_path
+                if streamed_video.chunks:
+                    video_parts = list(streamed_video.video_paths)
                 stream_encoder_stats = streamed_video.stats.to_dict()
                 warnings.extend(streamed_video.warnings)
                 if streamed_video.frame_count != frame_count:
@@ -2976,7 +3129,9 @@ def run_once(
             if thermal_capture is not None:
                 # Stream mode has no RGB frames in memory: read them back from the recording.
                 side_by_side_rgb_frames: Any = (
-                    _VideoFrameSequence(video_path, frame_count) if stream_writer is not None else frames
+                    _VideoFrameSequence(video_parts or video_path, frame_count)
+                    if stream_writer is not None
+                    else frames
                 )
                 try:
                     thermal_side_by_side_artifacts = _write_rgb_thermal_side_by_side_outputs(
@@ -3040,7 +3195,7 @@ def run_once(
                     warnings.append("tracking_source=video requires recording; falling back to RAM tracking.")
                     df, df2 = _track_from_ram(config, session_name, session_dir, frames)
                 else:
-                    df, df2 = _track_from_video(config, session_name, session_dir, video_path)
+                    df, df2 = _track_from_video(config, session_name, session_dir, video_path, video_parts)
             else:
                 df, df2 = _track_from_ram(config, session_name, session_dir, frames)
             tracking_elapsed_seconds = time.perf_counter() - tracking_started
@@ -3142,9 +3297,19 @@ def run_once(
             # Capture or encoding failed part-way. Let the encoder close its
             # file cleanly so whatever was recorded so far stays readable.
             stream_writer.abort()
-            partial = stream_writer.capture_path
-            if partial.exists() and partial.stat().st_size > 0:
-                warnings.append(f"A partial stream recording was kept: {partial.name}")
+            kept = [chunk for chunk in stream_writer.chunks if chunk.frame_count > 0]
+            if kept:
+                # A split recording: every file written so far is complete.
+                video_parts = [Path(chunk.video_path or chunk.capture_path) for chunk in kept]
+                video_path = video_parts[0]
+                warnings.append(
+                    f"The recording stopped early; {len(kept)} video file(s) with "
+                    f"{sum(chunk.frame_count for chunk in kept)} frames were kept."
+                )
+            else:
+                partial = stream_writer.capture_path
+                if partial.exists() and partial.stat().st_size > 0:
+                    warnings.append(f"A partial stream recording was kept: {partial.name}")
     finally:
         camera_lock.close()
         if stream_writer is not None:
@@ -3304,6 +3469,7 @@ def run_once(
         camera_num=configured_camera_num(config),
         camera_id=configured_camera_id(config),
         camera_session_tag=session_tag(config),
+        video_parts=[str(path) for path in video_parts],
     )
 
     summary_path = Path(summary.session_dir) / f"{summary.session_name}_run_summary.json"
@@ -3399,7 +3565,8 @@ def format_run_summary(summary: RunSummary) -> str:
         f"Recording codec: {summary.video_codec or 'n/a'}",
         f"Frame buffer: {summary.capture_frame_buffer}",
         f"Stream encoder: {_format_stream_encoder_stats(summary.stream_encoder_stats)}",
-        f"Video: {summary.video_path or 'none'}",
+        f"Video: {summary.video_path or 'none'}"
+        + (f" (first of {len(summary.video_parts)} files)" if len(summary.video_parts) > 1 else ""),
         f"Midpoint PNG: {summary.recording_preview_png_path or 'none'}",
         f"Timestamps: {summary.timestamp_path or 'none'}",
         f"Thermal enabled: {summary.thermal_enabled}",

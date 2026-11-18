@@ -45,6 +45,7 @@ SCHEDULE_KEYS = (
     ("capture", "recording_seconds"),
     ("capture", "record_interval_minutes"),
     ("capture", "track_interval_minutes"),
+    ("scheduling", "start_time"),
 )
 
 MEMORY_FAIL_RATIO = 0.80

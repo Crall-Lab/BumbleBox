@@ -130,6 +130,13 @@ from .run_bundle import (
 )
 from .run_engine import format_run_summary, reset_camera_runtime, run_once
 from .schedule_check import format_schedule_check_report, run_schedule_check
+from .recording_watchdog import (
+    describe_result,
+    max_restarts,
+    restart_enabled,
+    stall_seconds,
+    supervise_recording,
+)
 from .multi_camera import (
     check_camera_set,
     combined_memory,
@@ -1466,6 +1473,33 @@ def _run_once_all_cameras(args: argparse.Namespace) -> int:
     return 0 if all(code == 0 for code in codes) else 1
 
 
+def _run_once_watched(args: argparse.Namespace, config: dict) -> int:
+    """Run this recording as a child process and start it again if it fails or stalls.
+
+    See ``recording_watchdog``. Each attempt is the same command with
+    ``--watchdog-child`` added; a restart also gets the time left to record.
+    """
+    total_seconds = float(config["capture"]["recording_seconds"])
+    script = Path(__file__).resolve().parents[1] / "bbx.py"
+    base = [sys.executable, str(script), *getattr(args, "command_line", ["run-once"]), "--watchdog-child"]
+
+    def build_command(seconds: float, attempt_number: int) -> list[str]:
+        if attempt_number == 1:
+            return base
+        return [*base, "--recording-seconds", f"{seconds:.1f}"]
+
+    result = supervise_recording(
+        build_command,
+        total_seconds=total_seconds,
+        stall_after=stall_seconds(config),
+        restarts_allowed=max_restarts(config),
+    )
+    closing_line = describe_result(result, total_seconds)
+    if closing_line:
+        print(closing_line, flush=True)
+    return result.exit_code
+
+
 def _cmd_run_once(args: argparse.Namespace) -> int:
     if getattr(args, "all_cameras", False):
         return _run_once_all_cameras(args)
@@ -1515,6 +1549,21 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
         context_label="run-once",
     ):
         return 1
+
+    if getattr(args, "recording_seconds", None):
+        config.setdefault("capture", {})
+        config["capture"]["recording_seconds"] = float(args.recording_seconds)
+
+    watched_mode = str(args.mode or config.get("pipeline", {}).get("mode", "record_and_track"))
+    two_pi = distributed_capture_enabled(config) and not bool(getattr(args, "no_distributed", False))
+    if (
+        not getattr(args, "watchdog_child", False)
+        and not getattr(args, "no_restart", False)
+        and watched_mode in {"record_only", "record_and_track", "track_only"}
+        and not two_pi
+        and restart_enabled(config)
+    ):
+        return _run_once_watched(args, config)
 
     try:
         selected_mode = str(args.mode or config.get("pipeline", {}).get("mode", "record_and_track"))
@@ -4888,6 +4937,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_once_parser.add_argument(
+        "--recording-seconds",
+        type=float,
+        help="Optional one-run override of capture.recording_seconds.",
+    )
+    run_once_parser.add_argument(
+        "--no-restart",
+        action="store_true",
+        help=(
+            "Do not start the recording again if it fails or stalls "
+            "(one-run override of capture.restart_on_failure)."
+        ),
+    )
+    run_once_parser.add_argument("--watchdog-child", action="store_true", help=argparse.SUPPRESS)
+    run_once_parser.add_argument(
         "--all-cameras",
         action="store_true",
         help=(
@@ -6253,4 +6316,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         pass
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Kept so a command can start itself again as a child (the recording watchdog).
+    args.command_line = list(argv) if argv is not None else list(sys.argv[1:])
     return args.func(args)

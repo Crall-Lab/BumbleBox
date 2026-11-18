@@ -209,6 +209,37 @@ python3 /Users/aec/Desktop/BumbleBox/bbx.py systemd-install
 python3 /Users/aec/Desktop/BumbleBox/bbx.py systemd-status
 ```
 
+### When recordings happen
+
+Three settings decide it. The GUI **Settings** page edits all three, and takes
+lengths and intervals in seconds, minutes, hours or days.
+
+| Setting | Meaning | Example |
+|---|---|---|
+| `capture.recording_seconds` | Length of each recording | `7200` (2 hours) |
+| `capture.record_interval_minutes` | Time between recording starts; at most a day | `1440` (once a day) |
+| `scheduling.start_time` | Time of day the recordings are counted from (24-hour `HH:MM`) | `"10:00"` |
+
+Examples:
+
+| Wanted | `recording_seconds` | `record_interval_minutes` | `start_time` |
+|---|---|---|---|
+| 20 s every 30 min, on the hour and half hour | `20` | `30` | `"00:00"` |
+| 20 s every 30 min, at :10 and :40 | `20` | `30` | `"00:10"` |
+| 2 hours once a day, starting at 10:00 | `7200` | `1440` | `"10:00"` |
+| 10 min every 12 hours, at 09:00 and 21:00 | `600` | `720` | `"09:00"` |
+
+Recordings run around the clock; `scheduling.active_hours` is not used yet.
+With an interval that does not divide a day evenly, the last gap before the
+start time is shorter than the rest.
+
+A recording longer than a few tens of seconds at full resolution needs
+`capture.frame_buffer: stream` (see `docs/Streaming_Capture.md`).
+
+The interval and start time are written into the timer files, so they take
+effect when the timers are next written and installed. The GUI offers to do
+this when you save a change while the schedule is running.
+
 ## Step 11: GUI Workflow (optional)
 
 Create a Desktop icon (optional but recommended for non-technical users):

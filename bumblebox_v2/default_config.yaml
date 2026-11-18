@@ -145,6 +145,19 @@ capture:
   # may occupy. If the encoder falls further behind than this, capture waits
   # for it and the run summary reports the stall.
   stream_queue_mb: 512
+  # Stream mode only: start a new video file this often (minutes), without
+  # pausing the camera. A recording shorter than this stays one file. Each
+  # finished file is complete, with its own timestamps, so a failure late in
+  # a long session costs at most the file being written. 0 keeps one file.
+  chunk_minutes: 10
+  # If a recording crashes or stops making progress, stop it and record again
+  # for the time left in the session. "auto" does this for recordings of two
+  # minutes or more; true always; false never. See docs/Long_Recordings.md.
+  restart_on_failure: "auto"
+  # No progress for this many seconds counts as a stall.
+  stall_seconds: 120
+  # Give up after this many restarts within one session.
+  max_restarts: 5
 
 tracking:
   tag_dictionary: "4X4_50"
@@ -189,6 +202,8 @@ calibration:
 
 runtime:
   use_mock_camera: false
+  # Development only: make the mock camera wait between frames like a real one.
+  mock_camera_realtime: false
   camera_warmup_seconds: 2.0
   speed_cutoff_seconds: 4
   save_frame_timestamps: true
@@ -207,6 +222,14 @@ scheduling:
   unit_prefix: "bumblebox-v2"
   service_user: "auto"
   enabled: false
+  # Time of day (24-hour HH:MM) that recordings are counted from. With an
+  # interval of a day (capture.record_interval_minutes: 1440) this is when the
+  # daily recording starts. With a shorter interval, recordings fall on this
+  # time and every interval after it, around the clock: every 30 min from
+  # "00:10" gives :10 and :40 of each hour. Takes effect when the timers are
+  # next written and installed.
+  start_time: "00:00"
+  # Not used yet: recordings run around the clock.
   active_hours: "00:00-23:59"
   # Longest a scheduled run may take (minutes) before systemd stops it, so one
   # hung run cannot block every later recording. "auto" allows the recording

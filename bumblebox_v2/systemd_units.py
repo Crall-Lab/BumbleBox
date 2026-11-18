@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from .config import normalize_service_user_value
+from .time_units import start_minutes as schedule_start_minutes
 
 
 @dataclass
@@ -42,6 +43,7 @@ def _preferred_exec_launcher() -> Path:
 
 
 MIN_RUN_TIMEOUT_SECONDS = 30 * 60
+NEXT_SLOT_MARGIN_SECONDS = 5 * 60
 RUN_TIMEOUT_AUTO = "auto"
 
 
@@ -53,6 +55,11 @@ def run_timeout_seconds(config: Dict[str, Any], interval_minutes: int, *, pipeli
     every later run of the same unit. "auto" allows the recording time plus
     the larger of 30 minutes and two schedule intervals, which is generous for
     encoding and tracking but still lets recording resume after a hang.
+
+    With a long interval that rule alone is far too generous: a daily schedule
+    would get two days, so a hung run would also take the next day's slot
+    with it. Whenever the interval leaves room for the recording plus 30
+    minutes, the limit is therefore five minutes before the next slot at most.
     """
     scheduling = config.get("scheduling", {}) if isinstance(config.get("scheduling"), dict) else {}
     configured = scheduling.get("run_timeout_minutes", RUN_TIMEOUT_AUTO)
@@ -66,7 +73,12 @@ def run_timeout_seconds(config: Dict[str, Any], interval_minutes: int, *, pipeli
             recording_seconds = float(config.get("capture", {}).get("recording_seconds", 0) or 0)
         except (TypeError, ValueError):
             recording_seconds = 0.0
-    return int(round(max(0.0, recording_seconds))) + allowance
+    recording = int(round(max(0.0, recording_seconds)))
+    limit = recording + allowance
+    before_next_slot = max(1, int(interval_minutes)) * 60 - NEXT_SLOT_MARGIN_SECONDS
+    if before_next_slot >= recording + MIN_RUN_TIMEOUT_SECONDS:
+        limit = min(limit, before_next_slot)
+    return limit
 
 
 def _service_text(
@@ -105,13 +117,21 @@ def _service_text(
     return "\n".join(lines)
 
 
-def _calendar_specs_for_interval(interval_minutes: int) -> List[str]:
+def _calendar_specs_for_interval(interval_minutes: int, start_minutes: int = 0) -> List[str]:
+    """systemd calendar times for a slot every ``interval_minutes``.
+
+    Slots are counted from ``start_minutes`` after midnight and wrap around the
+    day: every 30 min from 00:10 gives :10 and :40 of each hour, and an
+    interval of a day gives one slot, at the start time.
+    """
     interval = max(1, int(interval_minutes))
+    start = int(start_minutes) % (24 * 60)
     slots_by_hour: Dict[int, List[int]] = {}
-    for total_minutes in range(0, 24 * 60, interval):
-        hour = total_minutes // 60
-        minute = total_minutes % 60
-        slots_by_hour.setdefault(hour, []).append(minute)
+    for offset in range(0, 24 * 60, interval):
+        total_minutes = (start + offset) % (24 * 60)
+        slots_by_hour.setdefault(total_minutes // 60, []).append(total_minutes % 60)
+    for minutes in slots_by_hour.values():
+        minutes.sort()
 
     groups: Dict[Tuple[int, ...], List[int]] = {}
     for hour in range(24):
@@ -131,14 +151,14 @@ def _calendar_specs_for_interval(interval_minutes: int) -> List[str]:
     return specs
 
 
-def _timer_text(description: str, service_name: str, interval_minutes: int) -> str:
+def _timer_text(description: str, service_name: str, interval_minutes: int, start_minutes: int = 0) -> str:
     lines = [
         "[Unit]",
         f"Description={description}",
         "",
         "[Timer]",
     ]
-    for spec in _calendar_specs_for_interval(interval_minutes):
+    for spec in _calendar_specs_for_interval(interval_minutes, start_minutes):
         lines.append(f"OnCalendar={spec}")
     lines.extend(
         [
@@ -509,6 +529,9 @@ def write_systemd_units(config: Dict[str, Any], config_path: str | Path, output_
             description=f"BumbleBox V2 {label} schedule",
             service_name=service_name,
             interval_minutes=interval,
+            # scheduling.start_time moves the recording and tracking slots; the
+            # fleet media jobs keep their own clock-aligned times.
+            start_minutes=schedule_start_minutes(config) if command_args is None else 0,
         )
         _write_unit(service_path, service_content, written)
         _write_unit(timer_path, timer_content, written)

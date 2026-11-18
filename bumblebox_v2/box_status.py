@@ -36,6 +36,7 @@ from .storage_guard import (
     containing_mount_point,
 )
 from .stream_writer import FRAME_BUFFER_STREAM, frame_buffer_mode, normalize_mp4_codec, resolve_mp4_preset
+from .time_units import describe_interval, describe_seconds, start_minutes
 from .systemd_units import _job_specs, write_systemd_units
 
 
@@ -704,19 +705,17 @@ def describe_schedule_plan(config: Dict[str, Any]) -> str:
     """One sentence saying what the schedule does, from the config."""
     capture = config.get("capture", {}) if isinstance(config.get("capture"), dict) else {}
     mode = str((config.get("pipeline") or {}).get("mode", "record_and_track"))
-    length = _format_seconds(capture.get("recording_seconds"))
-    record_every = capture.get("record_interval_minutes", "?")
-    track_every = capture.get("track_interval_minutes", "?")
+    length = describe_seconds(capture.get("recording_seconds"))
+    start = start_minutes(config)
+    record_when = describe_interval(capture.get("record_interval_minutes"), start)
+    track_when = describe_interval(capture.get("track_interval_minutes"), start)
     if mode == "track_only":
-        return f"Tracks tags for {length} every {track_every} min, without saving video."
+        return f"Tracks tags for {length} {track_when}, without saving video."
     if mode == "mixed_schedule":
-        return (
-            f"Records {length} every {record_every} min; "
-            f"also tracks without saving video every {track_every} min."
-        )
+        return f"Records {length} {record_when}; also tracks without saving video {track_when}."
     if mode == "record_only":
-        return f"Records {length} every {record_every} min."
-    return f"Records {length} every {record_every} min, then tracks."
+        return f"Records {length} {record_when}."
+    return f"Records {length} {record_when}, then tracks."
 
 
 def _unit_names(config: Dict[str, Any]) -> List[Tuple[str, str, str]]:

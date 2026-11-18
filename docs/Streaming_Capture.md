@@ -13,6 +13,11 @@ choice is `capture.frame_buffer` in the config.
 
 Use `ram` for short, fast bursts. Use `stream` for anything long.
 
+A stream recording longer than `capture.chunk_minutes` (default 10) is saved
+as consecutive files with no gap between them, and a long recording that
+fails or stalls is started again for the time left. See
+`docs/Long_Recordings.md`.
+
 ## Choosing an encoder
 
 Stream mode only works if the encoder is at least as fast as the camera. Measure

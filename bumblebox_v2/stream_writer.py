@@ -16,6 +16,7 @@ rate.
 from __future__ import annotations
 
 import collections
+import queue
 import shutil
 import subprocess
 import tempfile
@@ -23,7 +24,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 FRAME_BUFFER_RAM = "ram"
 FRAME_BUFFER_STREAM = "stream"
@@ -106,6 +107,23 @@ def stream_queue_bytes(config: Dict[str, Any]) -> int:
     return int(megabytes * 1024 * 1024)
 
 
+DEFAULT_CHUNK_MINUTES = 10.0
+
+
+def stream_chunk_frames(config: Dict[str, Any]) -> int:
+    """Frames per video file for a split recording; 0 means one file (capture.chunk_minutes)."""
+    capture = config.get("capture", {}) if isinstance(config.get("capture"), dict) else {}
+    camera = config.get("camera", {}) if isinstance(config.get("camera"), dict) else {}
+    try:
+        minutes = float(capture.get("chunk_minutes", DEFAULT_CHUNK_MINUTES))
+        fps = float(camera.get("fps_target", 0))
+    except (TypeError, ValueError):
+        return 0
+    if minutes <= 0 or fps <= 0:
+        return 0
+    return max(1, int(round(minutes * 60.0 * fps)))
+
+
 @dataclass
 class StreamStats:
     encoder: str
@@ -131,6 +149,21 @@ class StreamStats:
 
 
 @dataclass
+class StreamChunk:
+    """One video file of a recording that is split into consecutive files."""
+
+    index: int  # 1 for the first file
+    first_frame: int  # number, within the whole recording, of this file's first frame
+    capture_path: Path
+    final_path: Path
+    frame_count: int = 0
+    video_path: Optional[Path] = None  # set once the file is in its final form
+    container_fps: Optional[float] = None
+    records: List[Any] = field(default_factory=list)  # what the caller passed to add(), one per frame
+    warning: Optional[str] = None
+
+
+@dataclass
 class StreamedVideo:
     video_path: Path
     recording_codec: str
@@ -138,6 +171,14 @@ class StreamedVideo:
     preview_frame: Any
     stats: StreamStats
     warnings: List[str] = field(default_factory=list)
+    # Empty for a recording kept as one file; otherwise every file, in order.
+    chunks: List[StreamChunk] = field(default_factory=list)
+
+    @property
+    def video_paths(self) -> List[Path]:
+        if self.chunks:
+            return [chunk.video_path for chunk in self.chunks if chunk.video_path is not None]
+        return [self.video_path]
 
 
 class StreamingVideoWriter:
@@ -161,7 +202,21 @@ class StreamingVideoWriter:
         preview_frame_index: int = 0,
         ffmpeg_bin: Optional[str] = None,
         lossless: bool = False,
+        chunk_frames: int = 0,
+        on_chunk_closed: Optional[Callable[[StreamChunk], None]] = None,
     ) -> None:
+        # chunk_frames > 0 starts a new video file every that many frames,
+        # without pausing capture: frames keep queueing while one encoder
+        # closes and the next opens. Each finished file is put in its final
+        # form straight away and reported through on_chunk_closed (called on
+        # a background thread), so a recording that fails later still leaves
+        # every earlier file complete.
+        self.chunk_frames = max(0, int(chunk_frames))
+        self._on_chunk_closed = on_chunk_closed
+        self._chunks: List[StreamChunk] = []
+        self._chunk: Optional[StreamChunk] = None
+        self._finalize_queue: "queue.Queue[Optional[StreamChunk]]" = queue.Queue()
+        self._finalize_thread: Optional[threading.Thread] = None
         self.output_dir = Path(output_dir)
         self.stem = str(stem)
         self.fps = float(fps) if float(fps) > 0 else 1.0
@@ -187,6 +242,7 @@ class StreamingVideoWriter:
         self.monochrome_output = bool(monochrome_output)
         self.max_queue_bytes = max(1, int(max_queue_bytes))
         self.preview_frame_index = max(0, int(preview_frame_index))
+        self._final_suffix = final_suffix
         self.capture_path = self.output_dir / f"{self.stem}.capture.mkv"
         self.final_path = self.output_dir / f"{self.stem}{final_suffix}"
 
@@ -223,8 +279,13 @@ class StreamingVideoWriter:
     # ------------------------------------------------------------------
     # Capture side
     # ------------------------------------------------------------------
-    def add(self, frame: Any) -> None:
-        """Queue one frame. Returns at once unless the memory budget is full."""
+    def add(self, frame: Any, record: Any = None) -> None:
+        """Queue one frame. Returns at once unless the memory budget is full.
+
+        ``record`` is anything the caller wants back with the frame's file in
+        ``StreamChunk.records``, typically its timestamp record. If it has a
+        ``time_s`` attribute, that sets each file's frame rate.
+        """
         nbytes = int(frame.nbytes)
         with self._cond:
             if self._closing or self._closed:
@@ -243,7 +304,7 @@ class StreamingVideoWriter:
                 self.stats.capture_stall_seconds += time.perf_counter() - stalled_from
             self._raise_if_failed()
 
-            self._queue.append(frame)
+            self._queue.append((frame, record))
             self._queued_bytes += nbytes
             self.stats.peak_queue_frames = max(self.stats.peak_queue_frames, len(self._queue))
             self.stats.peak_queue_mb = max(self.stats.peak_queue_mb, self._queued_bytes / (1024 * 1024))
@@ -284,6 +345,21 @@ class StreamingVideoWriter:
                 "rate or resolution, or raise capture.stream_queue_mb."
             )
 
+        if self.chunk_frames:
+            self._finish_chunks(actual_fps, finalize=finalize)
+            warnings.extend(chunk.warning for chunk in self._chunks if chunk.warning)
+            paths = [chunk.video_path or chunk.capture_path for chunk in self._chunks]
+            self.stats.encoded_megabytes = sum(path.stat().st_size for path in paths if path.exists()) / 1e6
+            return StreamedVideo(
+                video_path=paths[0],
+                recording_codec=self.recording_codec,
+                frame_count=self.stats.frames_written,
+                preview_frame=self._preview_frame,
+                stats=self.stats,
+                warnings=warnings,
+                chunks=list(self._chunks),
+            )
+
         video_path = self.capture_path
         if finalize:
             video_path, finalize_warning = self._finalize(actual_fps)
@@ -300,6 +376,24 @@ class StreamingVideoWriter:
             warnings=warnings,
         )
 
+    def _finish_chunks(self, fallback_fps: Optional[float], *, finalize: bool = True) -> None:
+        """Wait for earlier files to reach their final form, then do the last one."""
+        if self._finalize_thread is not None:
+            self._finalize_queue.put(None)
+            self._finalize_thread.join()
+            self._finalize_thread = None
+        last = self._chunk
+        if last is not None and last.video_path is None and last.frame_count > 0:
+            if finalize:
+                self._finalize_chunk(last, fallback_fps)
+            else:
+                last.video_path = last.capture_path
+
+    @property
+    def chunks(self) -> List[StreamChunk]:
+        """Files started so far, in order (empty unless the recording is split)."""
+        return list(self._chunks)
+
     def abort(self) -> None:
         """Stop after a failed capture, keeping what was captured so far.
 
@@ -311,6 +405,13 @@ class StreamingVideoWriter:
             self._drain_and_close_encoder()
         except Exception:
             pass
+        if self.chunk_frames:
+            # Finished files are already final. Put the one that was being
+            # written in the same form if its encoder closed cleanly.
+            try:
+                self._finish_chunks(None, finalize=self._error is None)
+            except Exception:
+                pass
 
     def _drain_and_close_encoder(self) -> None:
         with self._cond:
@@ -339,9 +440,10 @@ class StreamingVideoWriter:
                 )
             if return_code != 0 and self._error is None:
                 self._set_error(
-                    f"ffmpeg failed while encoding '{self.capture_path.name}' with encoder "
+                    f"ffmpeg failed while encoding '{self._encoding_path().name}' with encoder "
                     f"'{self.encoder}': {self._read_encoder_stderr() or f'exit code {return_code}'}"
                 )
+            self._process = None
         if self._stderr_file is not None:
             try:
                 self._stderr_file.close()
@@ -356,36 +458,121 @@ class StreamingVideoWriter:
     def _finalize(self, actual_fps: Optional[float]) -> tuple[Path, Optional[str]]:
         """Copy the capture file into its final container with the measured frame rate."""
         measured = float(actual_fps) if actual_fps and float(actual_fps) > 0 else self.fps
+        path, warning = self._remux(self.capture_path, self.final_path, measured)
+        if warning is None:
+            self.stats.container_fps = round(measured, 6)
+        return path, warning
+
+    def _remux(self, capture_path: Path, final_path: Path, measured: float) -> tuple[Path, Optional[str]]:
         cmd: List[str] = [str(self._ffmpeg_bin), "-y", "-hide_banner", "-loglevel", "error"]
         if self.recording_codec == "mjpeg":
             # AVI is constant-rate: restating the input rate is exact.
-            cmd += ["-r", f"{measured:.6f}", "-i", str(self.capture_path), "-c", "copy", str(self.final_path)]
+            cmd += ["-r", f"{measured:.6f}", "-i", str(capture_path), "-c", "copy", str(final_path)]
         else:
             ratio = self.fps / measured
             if abs(ratio - 1.0) > FRAME_RATE_CORRECTION_TOLERANCE:
                 cmd += ["-itsscale", f"{ratio:.9f}"]
-            cmd += ["-i", str(self.capture_path), "-c", "copy", "-movflags", "+faststart", str(self.final_path)]
+            cmd += ["-i", str(capture_path), "-c", "copy", "-movflags", "+faststart", str(final_path)]
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=ENCODER_EXIT_TIMEOUT_SECONDS)
             failure = result.stderr.strip() if result.returncode != 0 else ""
         except Exception as exc:  # timeout or launch failure
             failure = str(exc)
-        if failure or not self.final_path.exists() or self.final_path.stat().st_size < 1024:
+        if failure or not final_path.exists() or final_path.stat().st_size < 1024:
             try:
-                self.final_path.unlink(missing_ok=True)
+                final_path.unlink(missing_ok=True)
             except Exception:
                 pass
-            return self.capture_path, (
-                f"Could not write the final {self.final_path.suffix} file ({failure or 'empty output'}); "
-                f"the recording was kept as {self.capture_path.name} at the nominal {self.fps:.3f} FPS."
+            return capture_path, (
+                f"Could not write the final {final_path.suffix} file ({failure or 'empty output'}); "
+                f"the recording was kept as {capture_path.name} at the nominal {self.fps:.3f} FPS."
             )
-        self.stats.container_fps = round(measured, 6)
         try:
-            self.capture_path.unlink()
+            capture_path.unlink()
         except Exception:
             pass
-        return self.final_path, None
+        return final_path, None
+
+    # ------------------------------------------------------------------
+    # Splitting a recording into consecutive files
+    # ------------------------------------------------------------------
+    def _encoding_path(self) -> Path:
+        return self._chunk.capture_path if self._chunk is not None else self.capture_path
+
+    def _new_chunk(self) -> StreamChunk:
+        index = len(self._chunks) + 1
+        name = f"{self.stem}_part{index:03d}"
+        chunk = StreamChunk(
+            index=index,
+            first_frame=self.stats.frames_written,
+            capture_path=self.output_dir / f"{name}.capture.mkv",
+            final_path=self.output_dir / f"{name}{self._final_suffix}",
+        )
+        self._chunks.append(chunk)
+        return chunk
+
+    def _close_chunk_encoder(self) -> None:
+        """Let the current file's encoder finish, then hand the file on. Writer thread only."""
+        process, chunk = self._process, self._chunk
+        if process is None or chunk is None:
+            return
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            return_code = process.wait(timeout=ENCODER_EXIT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise RuntimeError(
+                f"ffmpeg did not finish '{chunk.capture_path.name}' within {ENCODER_EXIT_TIMEOUT_SECONDS:.0f}s."
+            )
+        if return_code != 0:
+            raise RuntimeError(self._read_encoder_stderr() or f"ffmpeg exit code {return_code}")
+        self._process = None
+        if self._stderr_file is not None:
+            try:
+                self._stderr_file.close()
+            except Exception:
+                pass
+            self._stderr_file = None
+        if self._finalize_thread is None:
+            self._finalize_thread = threading.Thread(
+                target=self._finalize_loop, name="bbx-stream-finalizer", daemon=True
+            )
+            self._finalize_thread.start()
+        self._finalize_queue.put(chunk)
+
+    def _finalize_loop(self) -> None:
+        while True:
+            chunk = self._finalize_queue.get()
+            if chunk is None:
+                return
+            self._finalize_chunk(chunk, None)
+
+    def _finalize_chunk(self, chunk: StreamChunk, fallback_fps: Optional[float]) -> None:
+        """Give one file its measured frame rate and final container, then report it."""
+        measured = self._chunk_fps(chunk) or (
+            float(fallback_fps) if fallback_fps and float(fallback_fps) > 0 else self.fps
+        )
+        chunk.video_path, chunk.warning = self._remux(chunk.capture_path, chunk.final_path, measured)
+        if chunk.warning is None:
+            chunk.container_fps = round(measured, 6)
+        if self._on_chunk_closed is not None:
+            try:
+                self._on_chunk_closed(chunk)
+            except Exception as exc:  # a bookkeeping failure must not stop the recording
+                note = f"Could not save the details of {chunk.final_path.name}: {exc}"
+                chunk.warning = f"{chunk.warning} {note}" if chunk.warning else note
+
+    @staticmethod
+    def _chunk_fps(chunk: StreamChunk) -> Optional[float]:
+        """Frame rate over one file, from the capture times of its first and last frames."""
+        times = [getattr(record, "time_s", None) for record in (chunk.records[:1] + chunk.records[-1:])]
+        if len(chunk.records) < 2 or any(value is None for value in times):
+            return None
+        span = float(times[1]) - float(times[0])
+        return (len(chunk.records) - 1) / span if span > 0 else None
 
     # ------------------------------------------------------------------
     # Encoder side (background thread)
@@ -398,10 +585,20 @@ class StreamingVideoWriter:
                         self._cond.wait(timeout=0.25)
                     if not self._queue:
                         return
-                    frame = self._queue.popleft()
-                if self._process is None:
+                    frame, record = self._queue.popleft()
+                if self.chunk_frames:
+                    if self._chunk is not None and self._chunk.frame_count >= self.chunk_frames:
+                        self._close_chunk_encoder()
+                    if self._process is None:
+                        self._chunk = self._new_chunk()
+                        self._start_encoder(frame)
+                elif self._process is None:
                     self._start_encoder(frame)
                 self._write_frame(frame)
+                if self._chunk is not None:
+                    self._chunk.frame_count += 1
+                    if record is not None:
+                        self._chunk.records.append(record)
                 with self._cond:
                     self._queued_bytes = max(0, self._queued_bytes - int(frame.nbytes))
                     self.stats.frames_written += 1
@@ -488,7 +685,7 @@ class StreamingVideoWriter:
             cmd += ["-q:v", "2", "-pix_fmt", "yuv420p"]
         else:
             cmd += ["-pix_fmt", "yuv420p"]
-        cmd += ["-f", "matroska", str(self.capture_path)]
+        cmd += ["-f", "matroska", str(self._encoding_path())]
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._stderr_file = tempfile.TemporaryFile()

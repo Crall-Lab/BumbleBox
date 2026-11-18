@@ -25,6 +25,7 @@ from .camera_controls import (
 from .hardware_profiles import hardware_profile_choices, normalize_hardware_profile
 from .storage_guard import normalize_require_mounted_storage
 from .camera_select import SESSION_TAG_PATTERN
+from .time_units import DEFAULT_START_TIME, parse_time_of_day
 from .stream_writer import VALID_FRAME_BUFFERS, VALID_MP4_PRESETS
 
 try:
@@ -737,6 +738,22 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ConfigError("capture.record_interval_minutes must be > 0")
     if track_interval <= 0:
         raise ConfigError("capture.track_interval_minutes must be > 0")
+    chunk_minutes = config["capture"].get("chunk_minutes", 10)
+    if not _is_number(chunk_minutes) or chunk_minutes < 0:
+        raise ConfigError("capture.chunk_minutes must be a number of minutes, 0 or more (0 keeps one file)")
+    restart = config["capture"].get("restart_on_failure", "auto")
+    if not isinstance(restart, bool) and str(restart).strip().lower() != "auto":
+        raise ConfigError("capture.restart_on_failure must be auto, true or false")
+    stall_seconds = config["capture"].get("stall_seconds", 120)
+    if not _is_number(stall_seconds) or stall_seconds < 10:
+        raise ConfigError("capture.stall_seconds must be a number of seconds, 10 or more")
+    max_restarts = config["capture"].get("max_restarts", 5)
+    if isinstance(max_restarts, bool) or not isinstance(max_restarts, int) or max_restarts < 0:
+        raise ConfigError("capture.max_restarts must be a whole number, 0 or more")
+    try:
+        parse_time_of_day(config["scheduling"].get("start_time", DEFAULT_START_TIME))
+    except ValueError as exc:
+        raise ConfigError(f"scheduling.start_time: {exc}") from exc
 
     frame_buffer = str(config["capture"].get("frame_buffer", "ram")).strip().lower()
     if frame_buffer not in VALID_FRAME_BUFFERS:

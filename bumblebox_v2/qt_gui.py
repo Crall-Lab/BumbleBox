@@ -24,6 +24,7 @@ try:
         QStandardPaths,
         QThreadPool,
         Qt,
+        QTime,
         QTimer,
         QUrl,
         pyqtSignal,
@@ -60,6 +61,7 @@ try:
         QTableWidget,
         QTableWidgetItem,
         QTextEdit,
+        QTimeEdit,
         QVBoxLayout,
         QWidget,
         QWizard,
@@ -91,6 +93,7 @@ from .box_status import (
     benchmark_matches_camera,
     benchmark_result_for,
     describe_days,
+    describe_schedule_plan,
     estimate_storage,
     explain_failure,
     format_bytes,
@@ -131,6 +134,16 @@ from .multi_camera import (
 from .schedule_check import run_schedule_check
 from .status_history import list_recent_run_records, load_run_summary
 from .stream_writer import FRAME_BUFFER_STREAM, frame_buffer_mode
+from .time_units import (
+    DEFAULT_START_TIME,
+    DURATION_UNITS,
+    INTERVAL_UNITS,
+    MINUTES_PER_DAY,
+    best_unit,
+    describe_interval,
+    parse_time_of_day,
+    to_base,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -157,6 +170,8 @@ MP4_PRESET_CHOICES = (
     ("medium", "Medium"),
     ("slow", "Slow (smallest files, most CPU)"),
 )
+# Settings page choice -> capture.restart_on_failure
+RESTART_CHOICES = {"auto": "auto", "always": True, "never": False}
 FRAME_BUFFER_HINTS = {
     "ram": (
         "Every frame is kept in memory until the recording ends, then encoded. Gives the "
@@ -410,23 +425,27 @@ QPushButton#Primary:disabled, QPushButton#Accent:disabled, QPushButton#Quiet:dis
     color: #a4aaa6;
     border-color: #e2e5e1;
 }
-QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTimeEdit {
     background: #ffffff;
     border: 1px solid #ccd3ce;
     border-radius: 9px;
     padding: 8px 10px;
     selection-background-color: #b9d9cf;
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTimeEdit:focus {
     border: 2px solid #4d8b7d;
     padding: 7px 9px;
 }
-QSpinBox, QDoubleSpinBox { min-width: 96px; }
-QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled { background: #f1f3f0; color: #8d9692; }
+QSpinBox, QDoubleSpinBox, QTimeEdit { min-width: 96px; }
+QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled, QTimeEdit:disabled {
+    background: #f1f3f0;
+    color: #8d9692;
+}
 /* The styled step buttons have no arrow images and render as blank bars, so
    they are hidden; values are typed, or changed with the arrow keys. */
 QSpinBox::up-button, QSpinBox::down-button,
-QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; border: none; }
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button,
+QTimeEdit::up-button, QTimeEdit::down-button { width: 0; border: none; }
 QComboBox::drop-down { border: none; width: 24px; }
 QCheckBox { spacing: 9px; color: #40524e; }
 QCheckBox:disabled { color: #9aa39f; }
@@ -593,6 +612,138 @@ class _WheelOnlyWhenFocused(QObject):
             event.ignore()
             return True
         return super().eventFilter(watched, event)
+
+
+UNIT_NAMES = {"s": ("second", "seconds"), "min": ("minute", "minutes"), "h": ("hour", "hours"), "day": ("day", "days")}
+
+
+class _TrimmedDoubleSpinBox(QDoubleSpinBox):
+    """Shows 2 rather than 2.00, and 1.5 rather than 1.50."""
+
+    def textFromValue(self, value: float) -> str:
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+class _UnitValueEdit(QWidget):
+    """A number with its unit beside it, such as "2 hours".
+
+    The config keeps a recording length in seconds and intervals in minutes;
+    ``value()`` and ``setValue()`` speak that base unit, while the person
+    types whichever unit suits. Choosing another unit keeps the number as
+    typed ("2", then "hours", means two hours).
+
+    Any number can be typed in any unit, because the number is usually typed
+    before the unit is chosen: "12" must be allowed while the unit still says
+    days. A value outside the allowed range is reported by ``problem()``
+    instead of being quietly changed.
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(
+        self,
+        units: tuple[tuple[str, float], ...],
+        *,
+        minimum: float,
+        maximum: float,
+        whole: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._units = units
+        self._minimum = float(minimum)
+        self._maximum = float(maximum)
+        self._whole = bool(whole)  # the base value must be a whole number (whole minutes)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self.number = _TrimmedDoubleSpinBox()
+        self.number.setDecimals(2)
+        self.unit = QComboBox()
+        for name, _size in units:
+            self.unit.addItem(UNIT_NAMES.get(name, (name, name))[1], name)
+        layout.addWidget(self.number)
+        layout.addWidget(self.unit)
+        layout.addStretch(1)
+        self._apply_range()
+        self.number.valueChanged.connect(self._number_changed)
+        self.unit.currentIndexChanged.connect(self._unit_changed)
+
+    def _apply_range(self) -> None:
+        self.number.setRange(0.01, 1_000_000.0)
+        self._name_units()
+
+    def _name_units(self) -> None:
+        """Say "1 day" and "2 days"."""
+        one = abs(self.number.value() - 1.0) < 1e-9
+        for index in range(self.unit.count()):
+            names = UNIT_NAMES.get(str(self.unit.itemData(index)))
+            if names is not None:
+                self.unit.setItemText(index, names[0] if one else names[1])
+
+    def _number_changed(self) -> None:
+        self._name_units()
+        self.changed.emit()
+
+    def _unit_changed(self) -> None:
+        self._apply_range()
+        self.changed.emit()
+
+    def value(self) -> float | int:
+        """The amount in the base unit (the first unit given)."""
+        amount = to_base(self.number.value(), str(self.unit.currentData()), self._units)
+        if self._whole or abs(amount - round(amount)) < 1e-9:
+            return int(round(amount))
+        return round(amount, 3)
+
+    def clamped_value(self) -> float | int:
+        """``value()`` brought inside the allowed range."""
+        amount = min(self._maximum, max(self._minimum, self.value()))
+        return int(amount) if float(amount).is_integer() else amount
+
+    def problem(self) -> str | None:
+        """Why the typed value cannot be used, in the largest sensible unit, or ``None``."""
+        amount = to_base(self.number.value(), str(self.unit.currentData()), self._units)
+        if amount > self._maximum + 1e-9:
+            number, unit = best_unit(self._maximum, self._units)
+            return f"at most {_TrimmedDoubleSpinBox.textFromValue(self.number, number)} {UNIT_NAMES[unit][0 if number == 1 else 1]}"
+        if amount < self._minimum - 1e-9:
+            number, unit = best_unit(self._minimum, self._units)
+            return f"at least {_TrimmedDoubleSpinBox.textFromValue(self.number, number)} {UNIT_NAMES[unit][0 if number == 1 else 1]}"
+        return None
+
+    def setValue(self, amount: Any) -> None:
+        """Show ``amount`` (in the base unit) in the largest unit that keeps it a whole number."""
+        number, unit = best_unit(amount, self._units)
+        blocked = self.blockSignals(True)
+        self.number.blockSignals(True)
+        self.unit.blockSignals(True)
+        try:
+            index = self.unit.findData(unit)
+            self.unit.setCurrentIndex(index if index >= 0 else 0)
+            self._apply_range()
+            self.number.setValue(number)
+            self._name_units()
+        finally:
+            self.number.blockSignals(False)
+            self.unit.blockSignals(False)
+            self.blockSignals(blocked)
+        self.changed.emit()
+
+    def fields(self) -> tuple[QWidget, QWidget]:
+        return self.number, self.unit
+
+
+def _time_edit(value: Any) -> QTimeEdit:
+    """A 24-hour HH:MM field holding ``value`` (or midnight if it is not a time)."""
+    edit = QTimeEdit()
+    edit.setDisplayFormat("HH:mm")
+    try:
+        minutes = parse_time_of_day(value)
+    except ValueError:
+        minutes = 0
+    edit.setTime(QTime(minutes // 60, minutes % 60))
+    return edit
 
 
 class _FitScrollArea(QScrollArea):
@@ -1117,17 +1268,20 @@ class ExperimentPage(QWizardPage):
         ):
             self.mode.addItem(label, value)
         _set_combo_data(self.mode, str(config.get("pipeline", {}).get("mode", "record_and_track")))
-        self.recording_seconds = QSpinBox()
-        self.recording_seconds.setRange(1, 86400)
-        self.recording_seconds.setValue(int(config.get("capture", {}).get("recording_seconds", 20)))
-        self.interval_minutes = QSpinBox()
-        self.interval_minutes.setRange(1, 1440)
-        self.interval_minutes.setValue(int(config.get("capture", {}).get("record_interval_minutes", 30)))
+        self.recording_seconds = _UnitValueEdit(DURATION_UNITS, minimum=1, maximum=86400)
+        self.recording_seconds.setValue(config.get("capture", {}).get("recording_seconds", 20))
+        self.interval_minutes = _UnitValueEdit(INTERVAL_UNITS, minimum=1, maximum=MINUTES_PER_DAY, whole=True)
+        self.interval_minutes.setValue(config.get("capture", {}).get("record_interval_minutes", 30))
+        self.start_time = _time_edit(config.get("scheduling", {}).get("start_time", DEFAULT_START_TIME))
+        self.start_time.setToolTip(
+            "Recordings are counted from this time of day. For one recording a day, this is when it starts."
+        )
         form.addRow("Colony ID", self.colony)
         form.addRow("Data folder", path_row)
         form.addRow("Default run mode", self.mode)
-        form.addRow("Recording duration (seconds)", self.recording_seconds)
-        form.addRow("Recording interval (minutes)", self.interval_minutes)
+        form.addRow("Record for", self.recording_seconds)
+        form.addRow("Record every", self.interval_minutes)
+        form.addRow("Starting at", self.start_time)
 
     def _browse(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Choose BumbleBox data folder", self.data_root.text())
@@ -1307,8 +1461,9 @@ class BumbleBoxSetupWizard(QWizard):
         updated.setdefault("system", {})["colony_id"] = self.experiment_page.colony.text().strip() or "01"
         updated["system"]["data_root"] = self.experiment_page.data_root.text().strip()
         updated.setdefault("pipeline", {})["mode"] = str(self.experiment_page.mode.currentData())
-        updated.setdefault("capture", {})["recording_seconds"] = self.experiment_page.recording_seconds.value()
-        updated["capture"]["record_interval_minutes"] = self.experiment_page.interval_minutes.value()
+        updated.setdefault("capture", {})["recording_seconds"] = self.experiment_page.recording_seconds.clamped_value()
+        updated["capture"]["record_interval_minutes"] = int(self.experiment_page.interval_minutes.clamped_value())
+        updated.setdefault("scheduling", {})["start_time"] = self.experiment_page.start_time.time().toString("HH:mm")
         setup = updated.setdefault("setup", {})
         setup["completed"] = True
         setup["hardware_profile"] = profile_key
@@ -2043,19 +2198,26 @@ class BumbleBoxQtGUI(QMainWindow):
             ("track_only", "Track only (no video saved)"),
         ):
             self.settings_mode.addItem(label, value)
-        self.settings_recording_seconds = QSpinBox()
-        self.settings_recording_seconds.setRange(1, 86400)
-        self.settings_recording_seconds.setSuffix(" s")
-        self.settings_record_interval = QSpinBox()
-        self.settings_record_interval.setRange(1, 1440)
-        self.settings_record_interval.setSuffix(" min")
-        self.settings_track_interval = QSpinBox()
-        self.settings_track_interval.setRange(1, 1440)
-        self.settings_track_interval.setSuffix(" min")
+        # Lengths and intervals are typed in whichever unit suits; the config
+        # still stores seconds and minutes.
+        self.settings_recording_seconds = _UnitValueEdit(DURATION_UNITS, minimum=1, maximum=86400)
+        self.settings_record_interval = _UnitValueEdit(
+            INTERVAL_UNITS, minimum=1, maximum=MINUTES_PER_DAY, whole=True
+        )
+        self.settings_track_interval = _UnitValueEdit(
+            INTERVAL_UNITS, minimum=1, maximum=MINUTES_PER_DAY, whole=True
+        )
+        self.settings_start_time = _time_edit(DEFAULT_START_TIME)
+        self.settings_start_hint = hint()
+        start_row = QHBoxLayout()
+        start_row.setSpacing(12)
+        start_row.addWidget(self.settings_start_time)
+        start_row.addWidget(self.settings_start_hint, 1)
         self._settings_track_interval_label = row_label("Track every")
         schedule_form.addRow(row_label("Run mode"), self.settings_mode)
         schedule_form.addRow(row_label("Record for"), self.settings_recording_seconds)
         schedule_form.addRow(row_label("Record every"), self.settings_record_interval)
+        schedule_form.addRow(row_label("Starting at"), start_row)
         schedule_form.addRow(self._settings_track_interval_label, self.settings_track_interval)
         content_layout.addWidget(schedule_box)
 
@@ -2113,8 +2275,31 @@ class BumbleBoxQtGUI(QMainWindow):
         benchmark_row.setSpacing(8)
         benchmark_row.addWidget(self.settings_benchmark_label)
         benchmark_row.addWidget(self.settings_benchmark_button, 0, Qt.AlignLeft)
+        self.settings_chunk_minutes = _TrimmedDoubleSpinBox()
+        self.settings_chunk_minutes.setRange(0.0, 1440.0)
+        self.settings_chunk_minutes.setDecimals(1)
+        self.settings_chunk_minutes.setSuffix(" min")
+        self.settings_chunk_minutes.setSpecialValueText("Never (one file)")
+        self.settings_chunk_hint = hint(
+            "Long recordings are saved as a row of files with no gap between them, so a failure "
+            "costs at most the file being written. A shorter recording stays one file."
+        )
+        self._settings_chunk_label = row_label("New video file every")
+        self.settings_restart = QComboBox()
+        # Text keys, not True/False: Qt treats the text "auto" and the value
+        # True as equal when it searches the list.
+        self.settings_restart.addItem("Start again for the time left (recordings of 2 min or more)", "auto")
+        self.settings_restart.addItem("Always start again for the time left", "always")
+        self.settings_restart.addItem("Do not start again", "never")
+        self.settings_restart.setToolTip(
+            "If the recorder crashes, or stops making progress, it is stopped and a new recording "
+            "is started for the rest of the session."
+        )
         video_form.addRow(row_label("Frame handling"), self.settings_frame_buffer)
         video_form.addRow(row_label(), self.settings_frame_buffer_hint)
+        video_form.addRow(self._settings_chunk_label, self.settings_chunk_minutes)
+        video_form.addRow(row_label(), self.settings_chunk_hint)
+        video_form.addRow(row_label("If a recording fails"), self.settings_restart)
         video_form.addRow(row_label("Format"), self.settings_codec)
         video_form.addRow(self._settings_preset_label, self.settings_preset)
         video_form.addRow(row_label("Encode benchmark"), benchmark_row)
@@ -2169,17 +2354,25 @@ class BumbleBoxQtGUI(QMainWindow):
         layout.addLayout(bar)
 
         self._wheel_guard = _WheelOnlyWhenFocused(self)
-        for spin in (
-            self.settings_recording_seconds,
-            self.settings_record_interval,
-            self.settings_track_interval,
-            self.settings_fps,
-            self.settings_min_free,
-        ):
+        unit_fields = (self.settings_recording_seconds, self.settings_record_interval, self.settings_track_interval)
+        for unit_field in unit_fields:
+            unit_field.changed.connect(self._settings_changed)
+        self.settings_start_time.timeChanged.connect(lambda *_: self._settings_changed())
+        for spin in (self.settings_fps, self.settings_min_free, self.settings_chunk_minutes):
             spin.valueChanged.connect(lambda *_: self._settings_changed())
-            spin.setFocusPolicy(Qt.StrongFocus)
-            spin.installEventFilter(self._wheel_guard)
-        for combo in (self.settings_mode, self.settings_frame_buffer, self.settings_codec, self.settings_preset):
+        guarded = [self.settings_fps, self.settings_min_free, self.settings_start_time, self.settings_chunk_minutes]
+        for unit_field in unit_fields:
+            guarded.extend(unit_field.fields())
+        for field in guarded:
+            field.setFocusPolicy(Qt.StrongFocus)
+            field.installEventFilter(self._wheel_guard)
+        for combo in (
+            self.settings_mode,
+            self.settings_frame_buffer,
+            self.settings_codec,
+            self.settings_preset,
+            self.settings_restart,
+        ):
             combo.currentIndexChanged.connect(lambda *_: self._settings_changed())
             # Shrink with the window instead of forcing the page wider than it is.
             combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -2209,17 +2402,27 @@ class BumbleBoxQtGUI(QMainWindow):
     def _settings_values(self) -> dict[str, Any]:
         return {
             "pipeline.mode": self.settings_mode.currentData(),
-            "capture.recording_seconds": int(self.settings_recording_seconds.value()),
+            "capture.recording_seconds": self.settings_recording_seconds.value(),
             "capture.record_interval_minutes": int(self.settings_record_interval.value()),
             "capture.track_interval_minutes": int(self.settings_track_interval.value()),
+            "scheduling.start_time": self.settings_start_time.time().toString("HH:mm"),
             "camera.fps_target": round(float(self.settings_fps.value()), 2),
             "camera.monochrome_output": bool(self.settings_monochrome.isChecked()),
             "camera.codec": self.settings_codec.currentData(),
             "camera.mp4_preset": self.settings_preset.currentData(),
             "capture.frame_buffer": self.settings_frame_buffer.currentData(),
+            "capture.chunk_minutes": round(float(self.settings_chunk_minutes.value()), 1),
+            "capture.restart_on_failure": RESTART_CHOICES.get(str(self.settings_restart.currentData()), "auto"),
             "system.min_free_space_gb": round(float(self.settings_min_free.value()), 1),
             "camera.profile": self._settings_profile_key(),
         }
+
+    def _settings_field_problems(self) -> list[str]:
+        """Values typed on the Settings page that the recorder cannot use."""
+        fields = [("Record for", self.settings_recording_seconds), ("Record every", self.settings_record_interval)]
+        if not self.settings_track_interval.isHidden():
+            fields.append(("Track every", self.settings_track_interval))
+        return [f"{label}: {field.problem()}." for label, field in fields if field.problem()]
 
     def _settings_dirty(self) -> bool:
         return self._settings_saved_values is not None and self._settings_values() != self._settings_saved_values
@@ -2241,14 +2444,26 @@ class BumbleBoxQtGUI(QMainWindow):
         try:
             self._settings_profile_override = None
             _set_combo_data(self.settings_mode, str(_get_nested(config, "pipeline.mode", "record_and_track")))
-            self.settings_recording_seconds.setValue(int(_get_nested(config, "capture.recording_seconds", 20) or 20))
+            self.settings_recording_seconds.setValue(_get_nested(config, "capture.recording_seconds", 20) or 20)
             self.settings_record_interval.setValue(int(_get_nested(config, "capture.record_interval_minutes", 30) or 30))
             self.settings_track_interval.setValue(int(_get_nested(config, "capture.track_interval_minutes", 5) or 5))
+            try:
+                start = parse_time_of_day(_get_nested(config, "scheduling.start_time", DEFAULT_START_TIME))
+            except ValueError:
+                start = 0
+            self.settings_start_time.setTime(QTime(start // 60, start % 60))
             self.settings_fps.setValue(float(_get_nested(config, "camera.fps_target", 5.0) or 5.0))
             self.settings_monochrome.setChecked(bool(_get_nested(config, "camera.monochrome_output", False)))
             _set_combo_data(self.settings_codec, str(_get_nested(config, "camera.codec", "mp4")).lower())
             _set_combo_data(self.settings_preset, str(_get_nested(config, "camera.mp4_preset", "auto")).lower())
             _set_combo_data(self.settings_frame_buffer, frame_buffer_mode(config))
+            try:
+                self.settings_chunk_minutes.setValue(float(_get_nested(config, "capture.chunk_minutes", 10)))
+            except (TypeError, ValueError):
+                self.settings_chunk_minutes.setValue(10.0)
+            restart = _get_nested(config, "capture.restart_on_failure", "auto")
+            restart_key = ("always" if restart else "never") if isinstance(restart, bool) else "auto"
+            self.settings_restart.setCurrentIndex(max(0, self.settings_restart.findData(restart_key)))
             self.settings_min_free.setValue(float(_get_nested(config, "system.min_free_space_gb", 1.0) or 0.0))
         finally:
             self._settings_loading = False
@@ -2262,10 +2477,24 @@ class BumbleBoxQtGUI(QMainWindow):
         tracks_separately = mode in {"mixed_schedule", "track_only"}
         self._settings_track_interval_label.setVisible(tracks_separately)
         self.settings_track_interval.setVisible(tracks_separately)
+        start_text = self.settings_start_time.time().toString("HH:mm")
+        interval = int(
+            self.settings_track_interval.value() if mode == "track_only" else self.settings_record_interval.value()
+        )
+        if interval >= MINUTES_PER_DAY:
+            self.settings_start_hint.setText("It starts at this time every day.")
+        else:
+            self.settings_start_hint.setText(
+                f"Falls on {start_text} and {describe_interval(interval)} after it, around the clock."
+            )
         is_mp4 = self.settings_codec.currentData() == "mp4"
         self._settings_preset_label.setEnabled(is_mp4)
         self.settings_preset.setEnabled(is_mp4)
         self.settings_frame_buffer_hint.setText(FRAME_BUFFER_HINTS.get(self.settings_frame_buffer.currentData(), ""))
+        # Splitting into files only exists when encoding while recording.
+        splits = self.settings_frame_buffer.currentData() == "stream"
+        for widget in (self._settings_chunk_label, self.settings_chunk_minutes, self.settings_chunk_hint):
+            widget.setVisible(splits)
 
         fixed = self._settings_profile_fixed()
         self.settings_fps.setEnabled("camera.fps_target" not in fixed)
@@ -2310,7 +2539,7 @@ class BumbleBoxQtGUI(QMainWindow):
 
     def _refresh_settings_preview(self) -> None:
         candidate = self._settings_candidate()
-        problems: list[str] = []
+        problems: list[str] = self._settings_field_problems()
         warnings: list[str] = []
         try:
             validate_config(candidate)
@@ -2340,7 +2569,7 @@ class BumbleBoxQtGUI(QMainWindow):
         )
         streaming = frame_buffer_mode(candidate) == FRAME_BUFFER_STREAM
 
-        lines: list[str] = []
+        lines: list[str] = [describe_schedule_plan(candidate)]
         per_day = recordings_per_day(candidate)
         lines.append(
             f"Recordings per day: {per_day}" if per_day else "Recordings per day: none (track-only mode saves no video)."
@@ -2500,6 +2729,12 @@ class BumbleBoxQtGUI(QMainWindow):
         self.run_bbx_command(arguments)
 
     def _save_settings(self, *, offer_apply: bool) -> bool:
+        field_problems = self._settings_field_problems()
+        if field_problems:
+            QMessageBox.critical(
+                self, "Settings not saved", "These values cannot be used:\n" + "\n".join(field_problems)
+            )
+            return False
         try:
             config = load_config(self.config_path) if self.config_path.exists() else copy.deepcopy(self.config)
             schedule_before = schedule_values(config)
@@ -2804,6 +3039,9 @@ class BumbleBoxQtGUI(QMainWindow):
             f"RGB: {int(payload.get('frames_captured', 0) or 0)} frames at "
             f"{self._format_optional_fps(payload.get('actual_fps'))} fps",
         ]
+        parts = payload.get("video_parts") or []
+        if len(parts) > 1:
+            lines.append(f"Video: {len(parts)} files, one after the other (open the session folder to see them all)")
         if "thermal" in hardware:
             lines.append(f"Thermal: {thermal_status}")
         if "realsense" in hardware:
