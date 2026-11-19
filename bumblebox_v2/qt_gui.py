@@ -74,6 +74,7 @@ except ImportError as exc:  # pragma: no cover - depends on desktop runtime
     ) from exc
 
 from .box_status import (
+    DRIVE_NOT_MOUNTED,
     LEVEL_FAIL,
     LEVEL_OFF,
     LEVEL_OK,
@@ -110,6 +111,7 @@ from .box_status import (
 from .camera_profiles import CAMERA_PROFILES, apply_camera_profile
 from .camera_select import DetectedCamera, detect_cameras
 from .config import DEFAULT_USER_CONFIG_PATH, load_config, load_defaults, save_config, validate_config
+from .data_drive import capture_in_progress, save_drive_choice
 from .hardware_profiles import HARDWARE_PROFILES, apply_hardware_profile
 from .multimodal_calibration import (
     MANIFEST_NAME as CALIBRATION_MANIFEST_NAME,
@@ -131,6 +133,7 @@ from .multi_camera import (
     schedules_match,
     suggest_second_colony_id,
 )
+from .qt_data_drive import DataDriveDialog
 from .recording_options import recording_is_grayscale, set_recording_grayscale
 from .schedule_check import run_schedule_check
 from .status_history import list_recent_run_records, load_run_summary
@@ -1739,6 +1742,15 @@ class BumbleBoxQtGUI(QMainWindow):
         self.thermal_card = self._status_card("Thermal", "", tone="sun")
         self.realsense_card = self._status_card("RealSense", "", tone="sky")
         self.storage_card = self._status_card("Data storage", "", tone="mint")
+        self.data_drive_button = QPushButton("Data Drive...")
+        self.data_drive_button.setObjectName("Quiet")
+        self.data_drive_button.setToolTip(
+            "Mount a drive at the data folder, choose whether it is mounted again after a restart, "
+            "or remove it safely."
+        )
+        self.data_drive_button.clicked.connect(self._open_data_drive)
+        # Above the stretch that ends the card, so it sits under the status text.
+        self.storage_card.layout().insertWidget(self.storage_card.layout().count() - 1, self.data_drive_button, 0, Qt.AlignLeft)
         for column, card in enumerate((self.camera_card, self.thermal_card, self.realsense_card, self.storage_card)):
             cards.addWidget(card, 0, column)
             cards.setColumnStretch(column, 1)
@@ -3933,6 +3945,55 @@ class BumbleBoxQtGUI(QMainWindow):
             if estimate.level == LEVEL_WARN and level == LEVEL_OK:
                 level = LEVEL_WARN
         self._set_card(self.storage_card, storage.headline, detail, _LEVEL_CARD_TONES.get(level, "neutral"))
+        missing = storage.headline == DRIVE_NOT_MOUNTED
+        name = "Accent" if missing else "Quiet"
+        self.data_drive_button.setText("Mount Data Drive..." if missing else "Data Drive...")
+        if self.data_drive_button.objectName() != name:
+            self.data_drive_button.setObjectName(name)
+            self._repolish(self.data_drive_button)
+
+    # -- Data drive ---------------------------------------------------------------
+
+    def _drive_busy_reason(self) -> str | None:
+        """Why the data drive must not be changed right now, if a recording is using it."""
+        if self.process.state() != QProcess.NotRunning:
+            return "A BumbleBox command is running. Wait for it to finish, or cancel it on the Run page."
+        for status in self._camera_statuses.values():
+            if any(timer.running for timer in status.schedule.timers):
+                return "A scheduled recording is running. Wait for it to finish before changing the data drive."
+        try:
+            if capture_in_progress(entry.config for entry in self.cameras):
+                return "A recording is in progress. Wait for it to finish before changing the data drive."
+        except Exception:
+            pass
+        return None
+
+    def _open_data_drive(self) -> None:
+        dialog = DataDriveDialog(
+            self,
+            config_path=self.config_path,
+            config=self.config,
+            on_choice=self._save_drive_choice,
+            camera_label=self._active_camera().label if len(self.cameras) > 1 else "",
+            busy_reason=self._drive_busy_reason,
+        )
+        dialog.exec_()
+        self.refresh_box_status()
+
+    def _save_drive_choice(self, data_folder: str | None, require_drive: bool) -> dict[str, Any]:
+        """Record what the Data Drive window did, for this camera and one sharing its folder."""
+        old_folder = str(self.config.get("system", {}).get("data_root", "") or "")
+        paths = [self.config_path]
+        other = self._other_camera()
+        if other is not None and old_folder:
+            other_folder = str(other.config.get("system", {}).get("data_root", "") or "")
+            if other_folder and os.path.abspath(other_folder) == os.path.abspath(old_folder):
+                paths.append(other.path)
+        save_drive_choice(paths, require_drive=require_drive, data_folder=data_folder)
+        self._adopt_config(load_config(self.config_path))
+        if data_folder and os.path.abspath(data_folder) != os.path.abspath(old_folder or data_folder):
+            self.refresh_results()
+        return self.config
 
     @staticmethod
     def _parse_run_start(value: Any) -> datetime | None:
@@ -4427,11 +4488,18 @@ class BumbleBoxQtGUI(QMainWindow):
         self._show_failure_dialog(explanation)
 
     def _show_failure_dialog(self, explanation: FailureExplanation) -> None:
-        QMessageBox.warning(
-            self,
-            explanation.title,
-            f"{explanation.reason}\n\nThe full output is under Command output on the Run page.",
-        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(explanation.title)
+        box.setText(f"{explanation.reason}\n\nThe full output is under Command output on the Run page.")
+        # A missing drive is the one failure this window can fix on the spot.
+        mount = None
+        if explanation.title == DRIVE_NOT_MOUNTED:
+            mount = box.addButton("Mount Data Drive...", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Ok)
+        box.exec_()
+        if mount is not None and box.clickedButton() is mount:
+            self._open_data_drive()
 
 
 def _single_instance_lock() -> QLockFile:

@@ -45,6 +45,9 @@ LEVEL_WARN = "warn"
 LEVEL_FAIL = "fail"
 LEVEL_OFF = "off"
 
+# Headline for a missing data drive; the GUI offers to mount one when it sees this.
+DRIVE_NOT_MOUNTED = "Data drive not mounted"
+
 LOW_FREE_SPACE_WARNING_GB = 10.0
 COMMAND_TIMEOUT_SECONDS = 5.0
 JOURNAL_LINES = 80
@@ -136,8 +139,8 @@ def storage_status(
     if readiness.mounted is False:
         return StatusLine(
             LEVEL_FAIL,
-            "Data drive not mounted",
-            f"{path} is on the system disk. Recording is refused until the drive is connected.",
+            DRIVE_NOT_MOUNTED,
+            f"{path} is on the system disk. Recording is refused until a drive is mounted there.",
         )
 
     free_gb = readiness.free_gb
@@ -515,7 +518,7 @@ COMMAND_LABELS: Dict[str, str] = {
 
 # Checked in order against the reason text; the first match names the problem.
 _REASON_TITLES: Tuple[Tuple[str, str], ...] = (
-    (r"data drive is not mounted", "Data drive not mounted"),
+    (r"data drive is not mounted", DRIVE_NOT_MOUNTED),
     (r"GB is free where|is required to start a recording", "Data drive is nearly full"),
     (r"data_root is not set", "No data folder set"),
     (r"another bumblebox capture is using the camera", "Camera is busy"),

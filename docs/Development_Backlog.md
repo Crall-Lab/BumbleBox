@@ -45,7 +45,12 @@ See `docs/RealSense_Camera.md` for hardware validation and `docs/Multimodal_Cali
 - [x] Make PyQt the default GUI and retain `bbx gui --legacy` as a migration bridge.
 - [x] Add single-instance protection to reduce conflicting operator sessions.
 - [x] Add profile-aware setup wizard, overview, run controls, and conditional hardware checks.
-- [ ] Port storage setup and mount-status interactions from Tk.
+- [x] Port storage setup and mount-status interactions from Tk: the Data Drive
+      window on Overview mounts a drive at the data folder, keeps it after a
+      restart or not, and removes it safely. See `docs/Storage_Setup.md`.
+- [ ] Mount, keep, forget and remove a real drive through the Data Drive window
+      on a Raspberry Pi (exFAT and ext4), including a restart with and without
+      the drive connected.
 - [ ] Port the full config editor with Basic and Advanced sections.
 - [ ] Port calibration and thermal registration interfaces.
 - [ ] Port tracking optimization and candidate-review interfaces.

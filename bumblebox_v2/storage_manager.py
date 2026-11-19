@@ -13,6 +13,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 _LSBLK_COLUMNS = "NAME,PATH,TYPE,FSTYPE,UUID,LABEL,SIZE,MOUNTPOINT,RM,MODEL"
+# Asked for as well when this lsblk knows them; they only make drives easier to recognise.
+_LSBLK_EXTRA_COLUMNS = "PKNAME,TRAN,HOTPLUG,PARTTYPE"
+_FSTAB_PATH = Path("/etc/fstab")
+_MARKER_BEGIN = "# >>> BumbleBox storage >>>"
+_MARKER_END = "# <<< BumbleBox storage <<<"
 _KEYVAL_RE = re.compile(r'([A-Z0-9_]+)="([^"]*)"')
 _WINDOWS_LIKE_FSTYPES = {"vfat", "exfat", "ntfs", "fuseblk"}
 _NON_DATA_FSTYPES = {"swap", "linux_raid_member", "lvm2_member", "crypto_luks"}
@@ -30,6 +35,10 @@ class StorageDevice:
     mountpoint: str
     removable: bool
     model: str
+    parent: str = ""  # kernel name of the disk a partition is on
+    transport: str = ""  # usb, nvme, sata, mmc ...
+    hotplug: bool = False
+    part_type: str = ""
 
     @property
     def has_filesystem(self) -> bool:
@@ -93,9 +102,33 @@ class StorageMountResult:
     notes: List[str]
 
 
-def _run_command(args: List[str]) -> Optional[subprocess.CompletedProcess[str]]:
+@dataclass
+class StorageUnmountResult:
+    mount_point: str
+    was_mounted: bool
+    unmounted: bool
+    source: Optional[str]
+    message: str
+    notes: List[str]
+
+
+@dataclass
+class StorageForgetResult:
+    mount_point: str
+    fstab_updated: bool
+    removed_entries: List[str]
+    fstab_backup_path: Optional[str]
+    message: str
+    notes: List[str]
+
+
+# Looking at drives must not hang a window when a failing drive stops answering.
+_QUERY_TIMEOUT_SECONDS = 10.0
+
+
+def _run_command(args: List[str], timeout: Optional[float] = None) -> Optional[subprocess.CompletedProcess[str]]:
     try:
-        return subprocess.run(args, capture_output=True, text=True, check=False)
+        return subprocess.run(args, capture_output=True, text=True, check=False, timeout=timeout)
     except FileNotFoundError:
         return None
     except Exception:
@@ -109,13 +142,10 @@ def _parse_keyval_line(line: str) -> Dict[str, str]:
     return payload
 
 
-def discover_storage_devices() -> List[StorageDevice]:
-    proc = _run_command(["lsblk", "-P", "-o", _LSBLK_COLUMNS])
-    if proc is None or proc.returncode != 0:
-        return []
-
+def parse_lsblk_output(output: str) -> List[StorageDevice]:
+    """Devices from ``lsblk -P`` output. A partition takes the model of the disk it is on."""
     devices: List[StorageDevice] = []
-    for raw_line in proc.stdout.splitlines():
+    for raw_line in str(output or "").splitlines():
         line = raw_line.strip()
         if not line:
             continue
@@ -128,29 +158,76 @@ def discover_storage_devices() -> List[StorageDevice]:
                 dev_type=str(row.get("TYPE", "")).strip(),
                 fstype=str(row.get("FSTYPE", "")).strip(),
                 uuid=str(row.get("UUID", "")).strip(),
-                label=str(row.get("LABEL", "")).strip(),
+                label=_unescape_pairs_value(row.get("LABEL", "")).strip(),
                 size=str(row.get("SIZE", "")).strip(),
-                mountpoint=str(row.get("MOUNTPOINT", "")).strip(),
+                mountpoint=_unescape_pairs_value(row.get("MOUNTPOINT", "")).strip(),
                 removable=rm_text == "1",
                 model=str(row.get("MODEL", "")).strip(),
+                parent=str(row.get("PKNAME", "")).strip(),
+                transport=str(row.get("TRAN", "")).strip().lower(),
+                hotplug=str(row.get("HOTPLUG", "0")).strip() == "1",
+                part_type=str(row.get("PARTTYPE", "")).strip().lower(),
             )
         )
+    by_name = {device.name: device for device in devices if device.name}
+    for device in devices:
+        disk = by_name.get(device.parent)
+        if disk is None:
+            continue
+        device.model = device.model or disk.model
+        device.transport = device.transport or disk.transport
+        device.hotplug = device.hotplug or disk.hotplug
+        device.removable = device.removable or disk.removable
     return devices
+
+
+def discover_storage_devices() -> List[StorageDevice]:
+    proc = _run_command(
+        ["lsblk", "-P", "-o", f"{_LSBLK_COLUMNS},{_LSBLK_EXTRA_COLUMNS}"], timeout=_QUERY_TIMEOUT_SECONDS
+    )
+    if proc is None or proc.returncode != 0:
+        # An older lsblk refuses columns it does not know; the basic set is enough to work.
+        proc = _run_command(["lsblk", "-P", "-o", _LSBLK_COLUMNS], timeout=_QUERY_TIMEOUT_SECONDS)
+    if proc is None or proc.returncode != 0:
+        return []
+    return parse_lsblk_output(proc.stdout)
 
 
 def _findmnt_target(path: Path) -> Optional[Tuple[str, str]]:
     proc = _run_command(
-        ["findmnt", "--noheadings", "--output", "SOURCE,TARGET", "--target", str(path)]
+        ["findmnt", "--pairs", "--output", "SOURCE,TARGET", "--target", str(path)],
+        timeout=_QUERY_TIMEOUT_SECONDS,
     )
     if proc is None or proc.returncode != 0:
         return None
-    text = (proc.stdout or "").strip()
-    if not text:
+    lines = [line for line in (proc.stdout or "").splitlines() if line.strip()]
+    if not lines:
         return None
-    fields = text.split()
-    if len(fields) < 2:
+    # Pairs output keeps a folder name with spaces in one piece.
+    row = _parse_keyval_line(lines[-1])
+    source = _unescape_pairs_value(row.get("SOURCE", ""))
+    target = _unescape_pairs_value(row.get("TARGET", ""))
+    if not source or not target:
         return None
-    return fields[0], fields[1]
+    return source, target
+
+
+def _unescape_pairs_value(value: str) -> str:
+    """Undo the ``\\xNN`` escapes util-linux uses in ``--pairs`` output."""
+    return re.sub(r"\\x([0-9a-fA-F]{2})", lambda match: chr(int(match.group(1), 16)), str(value))
+
+
+def _fstab_escape(path_text: str) -> str:
+    """A path as fstab wants it: a space or tab inside a field is written as an octal escape."""
+    return str(path_text).replace("\\", "\\134").replace(" ", "\\040").replace("\t", "\\011")
+
+
+def _fstab_unescape(field: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), str(field))
+
+
+def _same_mount_path(first: str, second: str) -> bool:
+    return _normalize_mount_path(first) == _normalize_mount_path(second)
 
 
 def _normalize_mount_path(path_text: str) -> str:
@@ -164,7 +241,7 @@ def _is_exact_mount_target(resolved_target: Optional[str], expected_target: str)
 
 
 def _read_fstab() -> str:
-    fstab_path = Path("/etc/fstab")
+    fstab_path = _FSTAB_PATH
     if not fstab_path.exists():
         return ""
     try:
@@ -173,8 +250,8 @@ def _read_fstab() -> str:
         return ""
 
 
-def _fstab_entry_for_mount(mount_point: str) -> Optional[str]:
-    text = _read_fstab()
+def _fstab_entry_for_mount(mount_point: str, fstab_text: Optional[str] = None) -> Optional[str]:
+    text = _read_fstab() if fstab_text is None else fstab_text
     if not text:
         return None
     for raw in text.splitlines():
@@ -184,8 +261,22 @@ def _fstab_entry_for_mount(mount_point: str) -> Optional[str]:
         fields = line.split()
         if len(fields) < 2:
             continue
-        if fields[1] == mount_point:
+        if _same_mount_path(_fstab_unescape(fields[1]), mount_point):
             return line
+    return None
+
+
+def fstab_source_uuid(fstab_line: Optional[str]) -> Optional[str]:
+    """The UUID an fstab line mounts, when it names its drive that way."""
+    fields = str(fstab_line or "").split()
+    if not fields:
+        return None
+    source = fields[0]
+    if source.upper().startswith("UUID="):
+        return source[5:].strip('"') or None
+    prefix = "/dev/disk/by-uuid/"
+    if source.startswith(prefix):
+        return source[len(prefix):] or None
     return None
 
 
@@ -387,51 +478,106 @@ def build_fstab_entry(device: StorageDevice, mount_point: str, *, uid: int, gid:
     if not device.fstype:
         raise ValueError("Selected storage device has no filesystem type (FSTYPE).")
 
+    if not str(mount_point).startswith("/") or any(ch in str(mount_point) for ch in "\n\r#"):
+        # A line break or a comment sign in this field would corrupt the file.
+        raise ValueError(f"This folder name cannot be written to /etc/fstab: {mount_point!r}")
+
     options = _fstab_options(device.fstype, uid, gid)
     passno = "0" if device.fstype.lower() in _WINDOWS_LIKE_FSTYPES else "2"
-    return f"UUID={device.uuid} {mount_point} {device.fstype} {options} 0 {passno}"
+    return f"UUID={device.uuid} {_fstab_escape(mount_point)} {device.fstype} {options} 0 {passno}"
+
+
+def _rewrite_fstab_text(
+    current_text: str,
+    *,
+    mount_point: str,
+    device_uuid: Optional[str] = None,
+    new_entry: Optional[str] = None,
+) -> Tuple[str, List[str]]:
+    """Take the lines for ``mount_point`` (and for ``device_uuid``) out of fstab text.
+
+    ``new_entry``, when given, replaces them. Entries BumbleBox wrote for other
+    folders are kept, so two cameras recording to two drives each keep theirs;
+    everything BumbleBox manages ends up in one marked block at the end.
+    Returns the new text and the lines that were removed.
+    """
+
+    def is_target(stripped: str) -> bool:
+        fields = stripped.split()
+        if len(fields) < 2:
+            return False
+        if _same_mount_path(_fstab_unescape(fields[1]), mount_point):
+            return True
+        return bool(device_uuid) and fstab_source_uuid(stripped) == device_uuid
+
+    output: List[str] = []
+    managed: List[str] = []
+    removed: List[str] = []
+    in_marker_block = False
+    for raw in current_text.splitlines():
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+        if stripped == _MARKER_BEGIN:
+            in_marker_block = True
+            continue
+        if stripped == _MARKER_END:
+            in_marker_block = False
+            continue
+        is_entry = bool(stripped) and not stripped.startswith("#")
+        if is_entry and is_target(stripped):
+            removed.append(stripped)
+            continue
+        if in_marker_block:
+            if is_entry:
+                managed.append(stripped)
+            continue
+        output.append(line)
+
+    if new_entry:
+        managed.append(new_entry)
+    while output and not output[-1].strip():
+        output.pop()
+    if managed:
+        if output:
+            output.append("")
+        output.extend([_MARKER_BEGIN, *managed, _MARKER_END])
+    new_text = "\n".join(output) + "\n" if output else ""
+    return new_text, removed
 
 
 def _update_fstab_text(current_text: str, *, mount_point: str, device_uuid: str, new_entry: str) -> Tuple[str, bool]:
-    lines = current_text.splitlines()
-    output: List[str] = []
-    changed = False
-    in_marker_block = False
+    new_text, _removed = _rewrite_fstab_text(
+        current_text, mount_point=mount_point, device_uuid=device_uuid, new_entry=new_entry
+    )
+    return new_text, new_text != current_text
 
-    for raw in lines:
-        line = raw.rstrip("\n")
-        stripped = line.strip()
-        if stripped == "# >>> BumbleBox storage >>>":
-            in_marker_block = True
-            changed = True
-            continue
-        if stripped == "# <<< BumbleBox storage <<<":
-            in_marker_block = False
-            continue
-        if in_marker_block:
-            continue
-        if stripped and not stripped.startswith("#"):
-            fields = stripped.split()
-            if len(fields) >= 2:
-                source = fields[0]
-                target = fields[1]
-                if target == mount_point or source == f"UUID={device_uuid}":
-                    changed = True
-                    continue
-        output.append(line)
 
-    marker_block = [
-        "# >>> BumbleBox storage >>>",
-        new_entry,
-        "# <<< BumbleBox storage <<<",
-    ]
-    if output and output[-1].strip():
-        output.append("")
-    output.extend(marker_block)
-    new_text = "\n".join(output).rstrip() + "\n"
-    if new_text != current_text:
-        changed = True
-    return new_text, changed
+def _write_fstab(new_text: str) -> Optional[str]:
+    """Replace /etc/fstab, keeping a dated copy of the old one. Returns the copy's path."""
+    fstab_path = _FSTAB_PATH
+    backup_path: Optional[str] = None
+    if fstab_path.exists():
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = fstab_path.with_name(f"fstab.bumblebox.bak.{stamp}")
+        shutil.copy2(fstab_path, backup)
+        backup_path = str(backup)
+    # Written beside the file and moved into place, so a power cut cannot leave half a file.
+    temporary = fstab_path.with_name(f"{fstab_path.name}.bumblebox.tmp")
+    temporary.write_text(new_text)
+    if fstab_path.exists():
+        shutil.copymode(fstab_path, temporary)
+    os.replace(temporary, fstab_path)
+    return backup_path
+
+
+def _reload_systemd(notes: List[str]) -> None:
+    """Tell systemd that fstab changed, so it does not act on the mounts it read at boot."""
+    proc = _run_command(["systemctl", "daemon-reload"])
+    if proc is None:
+        return  # no systemd here
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or "unknown error"
+        notes.append(f"systemctl daemon-reload did not succeed ({detail}); a restart will apply the change.")
 
 
 def _device_name_for_message(device: Optional[StorageDevice], source: Optional[str]) -> str:
@@ -546,7 +692,8 @@ def setup_storage_auto_mount(
         )
 
     mount_dir = Path(mount_point)
-    mount_dir.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        mount_dir.mkdir(parents=True, exist_ok=True)
 
     old_text = _read_fstab()
     new_text, changed = _update_fstab_text(
@@ -557,13 +704,8 @@ def setup_storage_auto_mount(
     )
     fstab_backup_path: Optional[str] = None
     if changed and not dry_run:
-        fstab_path = Path("/etc/fstab")
-        if fstab_path.exists():
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup = fstab_path.with_name(f"fstab.bumblebox.bak.{stamp}")
-            shutil.copy2(fstab_path, backup)
-            fstab_backup_path = str(backup)
-        fstab_path.write_text(new_text)
+        fstab_backup_path = _write_fstab(new_text)
+        _reload_systemd(notes)
 
     mounted_now = False
     current = _findmnt_target(mount_dir)
@@ -623,7 +765,14 @@ def mount_storage_device_now(
     uid: Optional[int] = None,
     gid: Optional[int] = None,
     dry_run: bool = False,
+    forget_startup: bool = False,
 ) -> StorageMountResult:
+    """Mount a drive at ``mount_point`` until the next restart.
+
+    ``forget_startup`` also removes any /etc/fstab entry for the folder first.
+    Without that, an entry naming a different drive makes systemd unmount the
+    drive again straight away, because it still expects the other one there.
+    """
     mount_point = str(mount_point).strip() or "/mnt/bumblebox/data"
     devices = discover_storage_devices()
     selected = choose_storage_device(devices, mount_point=mount_point, device_path=device_path)
@@ -641,7 +790,15 @@ def mount_storage_device_now(
         raise PermissionError("Mounting storage needs root privileges.")
 
     mount_dir = Path(mount_point)
-    mount_dir.mkdir(parents=True, exist_ok=True)
+    if forget_startup and _fstab_entry_for_mount(mount_point):
+        if dry_run:
+            notes.append(f"Dry run: would remove the /etc/fstab entry for {mount_point}.")
+        else:
+            forgotten = remove_storage_auto_mount(mount_point)
+            notes.append(forgotten.message)
+            notes.extend(forgotten.notes)
+    if not dry_run:
+        mount_dir.mkdir(parents=True, exist_ok=True)
 
     current = _findmnt_target(mount_dir)
     current_exact = current is not None and _is_exact_mount_target(current[1], mount_point)
@@ -725,6 +882,120 @@ def mount_storage_device_now(
         message=message,
         notes=notes,
     )
+
+
+def remove_storage_auto_mount(mount_point: str, *, dry_run: bool = False) -> StorageForgetResult:
+    """Stop mounting a drive at ``mount_point`` at startup. A drive mounted there now stays mounted."""
+    mount_point = str(mount_point).strip() or "/mnt/bumblebox/data"
+    notes: List[str] = []
+    old_text = _read_fstab()
+    new_text, removed = _rewrite_fstab_text(old_text, mount_point=mount_point)
+    if not removed:
+        return StorageForgetResult(
+            mount_point=mount_point,
+            fstab_updated=False,
+            removed_entries=[],
+            fstab_backup_path=None,
+            message=f"/etc/fstab has no entry for {mount_point}; nothing is mounted there at startup.",
+            notes=notes,
+        )
+    if dry_run:
+        notes.append("Dry run: no files were changed.")
+        backup_path: Optional[str] = None
+    else:
+        if not _is_root_user():
+            raise PermissionError("Changing what is mounted at startup needs root privileges to edit /etc/fstab.")
+        backup_path = _write_fstab(new_text)
+        _reload_systemd(notes)
+    return StorageForgetResult(
+        mount_point=mount_point,
+        fstab_updated=not dry_run,
+        removed_entries=removed,
+        fstab_backup_path=backup_path,
+        message=f"No drive will be mounted at {mount_point} at startup.",
+        notes=notes,
+    )
+
+
+def unmount_storage(mount_point: str, *, dry_run: bool = False) -> StorageUnmountResult:
+    """Unmount the drive at ``mount_point`` so that it can be unplugged."""
+    mount_point = str(mount_point).strip() or "/mnt/bumblebox/data"
+    notes: List[str] = []
+    current = _findmnt_target(Path(mount_point))
+    if current is None or not _is_exact_mount_target(current[1], mount_point):
+        return StorageUnmountResult(
+            mount_point=mount_point,
+            was_mounted=False,
+            unmounted=False,
+            source=None,
+            message=f"No drive is mounted at {mount_point}.",
+            notes=notes,
+        )
+    source = current[0]
+    if dry_run:
+        notes.append("Dry run: nothing was unmounted.")
+        return StorageUnmountResult(
+            mount_point=mount_point,
+            was_mounted=True,
+            unmounted=False,
+            source=source,
+            message=f"Would unmount {source} from {mount_point}.",
+            notes=notes,
+        )
+    if not _is_root_user():
+        raise PermissionError("Unmounting storage needs root privileges.")
+    proc = _run_command(["umount", mount_point])
+    if proc is None:
+        raise RuntimeError("Could not run umount.")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or "umount failed"
+        if "busy" in detail.lower():
+            raise RuntimeError(
+                f"The drive at {mount_point} is in use, so it was not unmounted. Wait for any recording "
+                "or tracking to finish, close file-manager windows showing the drive, and try again. "
+                f"({detail})"
+            )
+        raise RuntimeError(detail)
+    return StorageUnmountResult(
+        mount_point=mount_point,
+        was_mounted=True,
+        unmounted=True,
+        source=source,
+        message=f"Unmounted {source} from {mount_point}. The drive can be unplugged.",
+        notes=notes,
+    )
+
+
+def format_storage_forget_result(result: StorageForgetResult) -> str:
+    lines = [
+        "Storage At Startup",
+        "------------------",
+        f"Mount point: {result.mount_point}",
+        f"/etc/fstab updated: {result.fstab_updated}",
+    ]
+    for entry in result.removed_entries:
+        lines.append(f"Removed line: {entry}")
+    if result.fstab_backup_path:
+        lines.append(f"/etc/fstab backup: {result.fstab_backup_path}")
+    lines.append(result.message)
+    for note in result.notes:
+        lines.append(f"- {note}")
+    return "\n".join(lines)
+
+
+def format_storage_unmount_result(result: StorageUnmountResult) -> str:
+    lines = [
+        "Storage Unmount",
+        "---------------",
+        f"Mount point: {result.mount_point}",
+        f"Unmounted: {result.unmounted}",
+    ]
+    if result.source:
+        lines.append(f"Device: {result.source}")
+    lines.append(result.message)
+    for note in result.notes:
+        lines.append(f"- {note}")
+    return "\n".join(lines)
 
 
 def format_storage_status_report(report: StorageStatusReport) -> str:

@@ -116,7 +116,7 @@ sudo apt install python3-pyqt5 labelme
 - systemd lifecycle actions (`systemd-install`, `systemd-enable`, `systemd-disable`, `systemd-status`)
 - ArUco parameter optimization with Pi/Desktop execution targets, tag-size defaults, and early stop (`optimize-tracking`)
 - schedule viability + RAM/timing risk analysis with fix suggestions (`schedule-check`)
-- UUID-based storage status/setup helpers for boot-time auto-mount at `system.data_root` (`storage status|setup|set-mount-point`)
+- UUID-based storage helpers for mounting the data drive at `system.data_root`, with or without boot-time auto-mount (`storage status|setup|mount|forget|unmount|set-mount-point`); see `docs/Storage_Setup.md`
 - optional queen/worker fleet orchestration + SSH worker health checks (`fleet`)
 - queen-side split latest-media workflow: pull latest worker videos separately from hourly latest tracked videos (`fleet queen-pull-latest`, `fleet queen-track-latest`)
 - queen-side latest-state matrix + LAN discovery (`fleet latest-status`, `fleet discover`) for offline worker warnings
@@ -135,7 +135,7 @@ sudo apt install python3-pyqt5 labelme
 
 The current Qt pages are:
 
-- `Overview`: profile, camera, optional-device, and storage status
+- `Overview`: profile, camera, optional-device, and storage status; `Data Drive...` mounts a drive at the data folder, keeps it after a restart or not, and removes it safely
 - `Run`: four-camera live monitor, one-shot runs, start/stop controls for automated recordings, and optional two-Pi readiness checks
 - `Results`: asynchronous run history with RGB, thermal, RealSense, distributed-node status, timing analysis, and direct artifact access
 - `Hardware`: only the checks relevant to the selected hardware profile and assigned capture node

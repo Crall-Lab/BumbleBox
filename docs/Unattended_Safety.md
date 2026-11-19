@@ -28,6 +28,11 @@ The rule is set by `system.require_mounted_storage`:
 `bbx storage setup` writes the `/etc/fstab` entry, so a box set up that way is
 protected without further changes.
 
+The Data Drive window (Overview page, `docs/Storage_Setup.md`) mounts a drive
+at the data folder and sets the value to `true`, so the box stays protected
+even when the drive is not kept after a restart. When a run is refused for a
+missing drive, the window that reports it offers **Mount Data Drive...**.
+
 A run is also refused when less than `system.min_free_space_gb` (default 1 GB)
 is free. Set it to `0` to turn that off.
 
@@ -42,7 +47,9 @@ with the reason. The storage alert in the GUI uses the same check, so it now
 reports a failure when the drive is missing.
 
 If you record to the SD card on purpose with `data_root` under `/mnt` or
-`/media`, set `system.require_mounted_storage: false`.
+`/media`, set `system.require_mounted_storage: false`. In the Data Drive
+window, **Record to the System Disk Instead...** does this and moves the data
+folder to one you can write to.
 
 ## 2. Only one run uses the camera at a time
 

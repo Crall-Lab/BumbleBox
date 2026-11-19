@@ -155,12 +155,17 @@ from .tracking_compression_check import (
 from .storage_manager import (
     build_storage_mount_sudo_command,
     build_storage_setup_sudo_command,
+    format_storage_forget_result,
     format_storage_mount_result,
     format_storage_setup_result,
     format_storage_status_report,
+    format_storage_unmount_result,
+    fstab_source_uuid,
     get_storage_status,
     mount_storage_device_now,
+    remove_storage_auto_mount,
     setup_storage_auto_mount,
+    unmount_storage,
 )
 from .systemd_units import (
     format_systemd_action_result,
@@ -625,7 +630,17 @@ def _cmd_storage_setup(args: argparse.Namespace) -> int:
         mount_point = "/mnt/bumblebox/data"
 
     status = get_storage_status(config=config, mount_point=mount_point)
-    if status.mounted and status.writable:
+    startup_set_for_this_drive = bool(
+        status.fstab_entry_present
+        and status.device_uuid
+        and fstab_source_uuid(status.fstab_entry) == status.device_uuid
+    )
+    if (
+        status.mounted
+        and status.writable
+        and startup_set_for_this_drive
+        and (not args.device or status.device_path == args.device)
+    ):
         print(format_storage_status_report(status))
         return 0
 
@@ -676,9 +691,13 @@ def _cmd_storage_mount(args: argparse.Namespace) -> int:
     if not mount_point:
         mount_point = "/mnt/bumblebox/data"
 
+    forget_startup = bool(getattr(args, "forget", False))
     status = get_storage_status(config=config, mount_point=mount_point)
-    if status.mounted and status.writable and (
-        not args.device or status.device_path == args.device
+    if (
+        status.mounted
+        and status.writable
+        and (not args.device or status.device_path == args.device)
+        and not (forget_startup and status.fstab_entry_present)
     ):
         print(format_storage_status_report(status))
         if args.apply_config and not args.dry_run:
@@ -697,6 +716,7 @@ def _cmd_storage_mount(args: argparse.Namespace) -> int:
             mount_point=mount_point,
             device_path=args.device,
             dry_run=bool(args.dry_run),
+            forget_startup=forget_startup,
         )
     except PermissionError as exc:
         print(f"Storage mount needs elevated privileges: {exc}")
@@ -725,6 +745,60 @@ def _cmd_storage_mount(args: argparse.Namespace) -> int:
             return 1
         print(f"\nUpdated config data_root: {config_path}")
     return 0 if result.mounted_now or args.dry_run else 1
+
+
+def _storage_mount_point_from_args(args: argparse.Namespace) -> Optional[str]:
+    """The folder a storage command acts on: ``--mount-point``, else the config's data folder."""
+    try:
+        config = _load_or_defaults(Path(args.config))
+    except (FileNotFoundError, ConfigError, RuntimeError) as exc:
+        print(f"Config error: {exc}")
+        return None
+    mount_point = str(args.mount_point or config.get("system", {}).get("data_root") or "").strip()
+    return mount_point or "/mnt/bumblebox/data"
+
+
+def _privileged_storage_hint(action: str, args: argparse.Namespace, mount_point: str) -> str:
+    bbx_path = Path(__file__).resolve().parents[1] / "bbx.py"
+    parts = ["sudo", "python3", str(bbx_path), "storage", action, "--config", str(args.config)]
+    parts.extend(["--mount-point", mount_point])
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _cmd_storage_unmount(args: argparse.Namespace) -> int:
+    mount_point = _storage_mount_point_from_args(args)
+    if mount_point is None:
+        return 1
+    try:
+        result = unmount_storage(mount_point, dry_run=bool(args.dry_run))
+    except PermissionError as exc:
+        print(f"Unmounting needs elevated privileges: {exc}")
+        print("\nRun this command on the Pi:")
+        print(_privileged_storage_hint("unmount", args, mount_point))
+        return 1
+    except Exception as exc:
+        print(f"Storage unmount failed: {exc}")
+        return 1
+    print(format_storage_unmount_result(result))
+    return 0 if result.unmounted or not result.was_mounted or args.dry_run else 1
+
+
+def _cmd_storage_forget(args: argparse.Namespace) -> int:
+    mount_point = _storage_mount_point_from_args(args)
+    if mount_point is None:
+        return 1
+    try:
+        result = remove_storage_auto_mount(mount_point, dry_run=bool(args.dry_run))
+    except PermissionError as exc:
+        print(f"Changing startup mounting needs elevated privileges: {exc}")
+        print("\nRun this command on the Pi:")
+        print(_privileged_storage_hint("forget", args, mount_point))
+        return 1
+    except Exception as exc:
+        print(f"Storage forget failed: {exc}")
+        return 1
+    print(format_storage_forget_result(result))
+    return 0
 
 
 def _cmd_camera_preview(args: argparse.Namespace) -> int:
@@ -4470,8 +4544,37 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also save mount point into system.data_root in config.",
     )
+    storage_mount.add_argument(
+        "--forget",
+        action="store_true",
+        help="Also remove any /etc/fstab entry for the mount point, so nothing is mounted there at startup.",
+    )
     storage_mount.add_argument("--dry-run", action="store_true", help="Show actions without running mount.")
     storage_mount.set_defaults(func=_cmd_storage_mount)
+
+    storage_unmount = storage_sub.add_parser(
+        "unmount",
+        help="Unmount the drive at the mount point so it can be unplugged.",
+    )
+    _add_common_config_arg(storage_unmount)
+    storage_unmount.add_argument(
+        "--mount-point",
+        help="Mount point to unmount (default: system.data_root from config).",
+    )
+    storage_unmount.add_argument("--dry-run", action="store_true", help="Show what would be unmounted.")
+    storage_unmount.set_defaults(func=_cmd_storage_unmount)
+
+    storage_forget = storage_sub.add_parser(
+        "forget",
+        help="Stop mounting a drive at the mount point at startup (removes its /etc/fstab entry).",
+    )
+    _add_common_config_arg(storage_forget)
+    storage_forget.add_argument(
+        "--mount-point",
+        help="Mount point to stop mounting at startup (default: system.data_root from config).",
+    )
+    storage_forget.add_argument("--dry-run", action="store_true", help="Show the change without editing /etc/fstab.")
+    storage_forget.set_defaults(func=_cmd_storage_forget)
 
     storage_setup = storage_sub.add_parser(
         "setup",

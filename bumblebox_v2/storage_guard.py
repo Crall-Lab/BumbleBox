@@ -177,8 +177,8 @@ def check_storage_ready(
             readiness.problem = (
                 f"The data drive is not mounted: /etc/fstab lists a drive for {expected}, but nothing "
                 f"is mounted there. Recording was refused so that data is not written to the system "
-                f"disk under {target}. Check that the drive is connected, then run "
-                "`bbx storage status`. To record to the system disk anyway, set "
+                f"disk under {target}. Connect the drive and mount it there (Data Drive on the "
+                "Overview page, or `bbx storage setup`). To record to the system disk anyway, set "
                 "system.require_mounted_storage: false."
             )
     elif setting is True or target.startswith(EXTERNAL_DRIVE_ROOTS):
@@ -194,9 +194,9 @@ def check_storage_ready(
             readiness.problem = (
                 f"The data drive is not mounted: {why}, but {target} is on the system disk (no "
                 "drive is mounted at that folder or above it). Recording was refused so that data "
-                "is not written to the system disk. Connect and mount the data drive "
-                "(`bbx storage setup`), or set system.require_mounted_storage: false to record to "
-                "the system disk on purpose."
+                "is not written to the system disk. Connect and mount the data drive (Data Drive "
+                "on the Overview page, or `bbx storage setup`), or set "
+                "system.require_mounted_storage: false to record to the system disk on purpose."
             )
 
     if readiness.problem is None and min_free_gb > 0:

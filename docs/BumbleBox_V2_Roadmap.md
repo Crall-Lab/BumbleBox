@@ -26,10 +26,11 @@ Confirm:
 - required Python packages installed
 - data storage path writable
 
-If storage is not mounted where BumbleBox expects it, run:
+If storage is not mounted where BumbleBox expects it, open the BumbleBox window and
+press `Mount Data Drive...` on the Overview page (`docs/Storage_Setup.md`), or run:
 
 ```bash
-python3 /Users/aec/Desktop/BumbleBox/bbx.py storage setup --apply-config
+sudo python3 /Users/aec/Desktop/BumbleBox/bbx.py storage setup --apply-config
 ```
 
 Then run camera setup checks:
