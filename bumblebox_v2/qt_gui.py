@@ -113,6 +113,7 @@ from .camera_select import DetectedCamera, detect_cameras
 from .config import DEFAULT_USER_CONFIG_PATH, load_config, load_defaults, save_config, validate_config
 from .data_drive import capture_in_progress, save_drive_choice
 from .hardware_profiles import HARDWARE_PROFILES, apply_hardware_profile
+from . import image_controls
 from .multimodal_calibration import (
     MANIFEST_NAME as CALIBRATION_MANIFEST_NAME,
     add_calibration_session,
@@ -2275,6 +2276,83 @@ class BumbleBoxQtGUI(QMainWindow):
         camera_form.addRow(self._settings_profile_row_label, self._settings_profile_row)
         content_layout.addWidget(camera_box)
 
+        picture_box, picture_form = form_box("Picture", "peach")
+
+        def gain_spin(low: float, high: float, value: float) -> _TrimmedDoubleSpinBox:
+            spin = _TrimmedDoubleSpinBox()
+            spin.setRange(low, high)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.1)
+            spin.setValue(value)
+            spin.setMaximumWidth(110)
+            return spin
+
+        def auto_or_fixed() -> QComboBox:
+            combo = QComboBox()
+            combo.addItem("Automatic", "auto")
+            combo.addItem("Fixed", "fixed")
+            return combo
+
+        def field_row(*widgets: QWidget) -> QWidget:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+            for widget in widgets:
+                row_layout.addWidget(widget)
+            row_layout.addStretch(1)
+            return row
+
+        self.settings_gain_mode = auto_or_fixed()
+        self.settings_gain = gain_spin(*image_controls.GAIN_RANGE, 2.0)
+        self.settings_gain.setToolTip("How much the sensor amplifies the picture. Higher is brighter and noisier.")
+        self.settings_wb_mode = auto_or_fixed()
+        self.settings_red_gain = gain_spin(*image_controls.COLOUR_GAIN_RANGE, 1.0)
+        self.settings_blue_gain = gain_spin(*image_controls.COLOUR_GAIN_RANGE, 1.0)
+        self._settings_red_label = QLabel("red")
+        self._settings_blue_label = QLabel("blue")
+        self.settings_contrast = gain_spin(0.5, 2.0, image_controls.DEFAULT_CONTRAST)
+        self.settings_contrast.setSingleStep(0.05)
+        self.settings_contrast.setToolTip(
+            "1 is the camera's own picture. Higher makes darks darker and brights brighter, "
+            "and is saved into the recording."
+        )
+        self.settings_noise_reduction = QComboBox()
+        for label, value in (
+            ("Off", "Off"),
+            ("Camera's own setting (minimal)", "Auto"),
+            ("Fast", "Fast"),
+            ("High quality", "HighQuality"),
+        ):
+            if value == image_controls.DEFAULT_NOISE_REDUCTION:
+                label += " (default)"
+            self.settings_noise_reduction.addItem(label, value)
+        self.settings_noise_reduction.setToolTip(
+            "High quality removes the most noise. It can lower the frame rate the camera reaches: "
+            "if recordings come out slower than the frame rate set above, choose Fast."
+        )
+        self.settings_picture_hint = hint(
+            "These are applied inside the camera, so they change recordings, the live monitor and what "
+            "the tag detector sees. To choose fixed values: leave gain and white balance on Automatic, "
+            "open the Live Camera Monitor, and copy the numbers shown under the picture once they "
+            "settle. Save here before opening the monitor to see a change."
+        )
+        picture_form.addRow(row_label("Sensor gain"), field_row(self.settings_gain_mode, self.settings_gain))
+        picture_form.addRow(
+            row_label("White balance"),
+            field_row(
+                self.settings_wb_mode,
+                self._settings_red_label,
+                self.settings_red_gain,
+                self._settings_blue_label,
+                self.settings_blue_gain,
+            ),
+        )
+        picture_form.addRow(row_label("Contrast"), field_row(self.settings_contrast))
+        picture_form.addRow(row_label("Noise reduction"), self.settings_noise_reduction)
+        picture_form.addRow(row_label(), self.settings_picture_hint)
+        content_layout.addWidget(picture_box)
+
         video_box, video_form = form_box("Video", "sky")
         self.settings_frame_buffer = QComboBox()
         self.settings_frame_buffer.addItem("Hold frames in memory, encode afterwards", "ram")
@@ -2383,9 +2461,16 @@ class BumbleBoxQtGUI(QMainWindow):
         for unit_field in unit_fields:
             unit_field.changed.connect(self._settings_changed)
         self.settings_start_time.timeChanged.connect(lambda *_: self._settings_changed())
-        for spin in (self.settings_fps, self.settings_min_free, self.settings_chunk_minutes):
+        picture_spins = (self.settings_gain, self.settings_red_gain, self.settings_blue_gain, self.settings_contrast)
+        for spin in (self.settings_fps, self.settings_min_free, self.settings_chunk_minutes, *picture_spins):
             spin.valueChanged.connect(lambda *_: self._settings_changed())
-        guarded = [self.settings_fps, self.settings_min_free, self.settings_start_time, self.settings_chunk_minutes]
+        guarded = [
+            self.settings_fps,
+            self.settings_min_free,
+            self.settings_start_time,
+            self.settings_chunk_minutes,
+            *picture_spins,
+        ]
         for unit_field in unit_fields:
             guarded.extend(unit_field.fields())
         for field in guarded:
@@ -2397,6 +2482,7 @@ class BumbleBoxQtGUI(QMainWindow):
             self.settings_codec,
             self.settings_preset,
             self.settings_restart,
+            self.settings_noise_reduction,
         ):
             combo.currentIndexChanged.connect(lambda *_: self._settings_changed())
             # Shrink with the window instead of forcing the page wider than it is.
@@ -2407,6 +2493,10 @@ class BumbleBoxQtGUI(QMainWindow):
             combo.setFocusPolicy(Qt.StrongFocus)
             combo.installEventFilter(self._wheel_guard)
         self.settings_monochrome.toggled.connect(lambda *_: self._settings_changed())
+        for combo in (self.settings_gain_mode, self.settings_wb_mode):
+            combo.currentIndexChanged.connect(lambda *_: self._settings_changed())
+            combo.setFocusPolicy(Qt.StrongFocus)
+            combo.installEventFilter(self._wheel_guard)
         return page
 
     # -- Settings page ---------------------------------------------------------
@@ -2433,6 +2523,18 @@ class BumbleBoxQtGUI(QMainWindow):
             "scheduling.start_time": self.settings_start_time.time().toString("HH:mm"),
             "camera.fps_target": round(float(self.settings_fps.value()), 2),
             "camera.monochrome_output": bool(self.settings_monochrome.isChecked()),
+            "camera.analogue_gain": (
+                round(float(self.settings_gain.value()), 2)
+                if self.settings_gain_mode.currentData() == "fixed"
+                else image_controls.AUTO
+            ),
+            "camera.colour_gains": (
+                [round(float(self.settings_red_gain.value()), 2), round(float(self.settings_blue_gain.value()), 2)]
+                if self.settings_wb_mode.currentData() == "fixed"
+                else image_controls.AUTO
+            ),
+            "camera.contrast": round(float(self.settings_contrast.value()), 2),
+            "camera.noise_reduction": self.settings_noise_reduction.currentData(),
             "camera.codec": self.settings_codec.currentData(),
             "camera.mp4_preset": self.settings_preset.currentData(),
             "capture.frame_buffer": self.settings_frame_buffer.currentData(),
@@ -2490,6 +2592,7 @@ class BumbleBoxQtGUI(QMainWindow):
             self.settings_start_time.setTime(QTime(start // 60, start % 60))
             self.settings_fps.setValue(float(_get_nested(config, "camera.fps_target", 5.0) or 5.0))
             self.settings_monochrome.setChecked(bool(_get_nested(config, "camera.monochrome_output", False)))
+            self._load_picture_settings(config)
             _set_combo_data(self.settings_codec, str(_get_nested(config, "camera.codec", "mp4")).lower())
             _set_combo_data(self.settings_preset, str(_get_nested(config, "camera.mp4_preset", "auto")).lower())
             _set_combo_data(self.settings_frame_buffer, frame_buffer_mode(config))
@@ -2506,9 +2609,40 @@ class BumbleBoxQtGUI(QMainWindow):
         self._settings_saved_values = self._settings_values()
         self._settings_changed()
 
+    def _load_picture_settings(self, config: dict[str, Any]) -> None:
+        """Show the camera's picture settings. A value the recorder could not use shows as the default."""
+
+        def read(getter: Any, fallback: Any) -> Any:
+            try:
+                return getter(config)
+            except image_controls.ImageSettingError:
+                return fallback
+
+        gain = read(image_controls.analogue_gain, None)
+        _set_combo_data(self.settings_gain_mode, "auto" if gain is None else "fixed")
+        if gain is not None:
+            self.settings_gain.setValue(gain)
+        gains = read(image_controls.colour_gains, None)
+        _set_combo_data(self.settings_wb_mode, "auto" if gains is None else "fixed")
+        if gains is not None:
+            self.settings_red_gain.setValue(gains[0])
+            self.settings_blue_gain.setValue(gains[1])
+        self.settings_contrast.setValue(read(image_controls.contrast, image_controls.DEFAULT_CONTRAST))
+        _set_combo_data(self.settings_noise_reduction, read(image_controls.noise_reduction, "Auto"))
+
     def _settings_changed(self) -> None:
         if self._settings_loading:
             return
+        fixed_gain = self.settings_gain_mode.currentData() == "fixed"
+        self.settings_gain.setEnabled(fixed_gain)
+        fixed_balance = self.settings_wb_mode.currentData() == "fixed"
+        for widget in (
+            self.settings_red_gain,
+            self.settings_blue_gain,
+            self._settings_red_label,
+            self._settings_blue_label,
+        ):
+            widget.setEnabled(fixed_balance)
         mode = self.settings_mode.currentData()
         tracks_separately = mode in {"mixed_schedule", "track_only"}
         self._settings_track_interval_label.setVisible(tracks_separately)
@@ -2619,6 +2753,10 @@ class BumbleBoxQtGUI(QMainWindow):
         lines.append(f"Storage: {estimate.headline}.")
         if estimate.detail:
             lines.append(estimate.detail)
+        try:
+            lines.append(f"Picture: {image_controls.describe_settings(candidate)}.")
+        except image_controls.ImageSettingError:
+            pass  # reported with the other config problems
         if estimate.level == LEVEL_WARN and estimate.days_left is not None:
             warnings.append(
                 f"Storage: at this rate the drive is full in {describe_days(estimate.days_left)}, "

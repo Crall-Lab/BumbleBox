@@ -27,6 +27,7 @@ from .camera_profiles import (
 )
 from .qt_env import sanitize_current_qt_env
 from .camera_select import picamera2_camera_kwargs
+from .image_controls import apply_image_controls
 from .tuning import inspect_camera_tuning_resolution, resolve_camera_tuning_file
 
 
@@ -589,15 +590,7 @@ def _apply_camera_controls(config: dict[str, Any], picam2: Any, notes: list[str]
         except Exception:
             notes.append("Could not apply camera.monochrome_output.")
 
-    noise_reduction = str(camera_cfg.get("noise_reduction", "Auto"))
-    if noise_reduction != "Auto":
-        try:
-            from libcamera import controls
-
-            mode = getattr(controls.draft.NoiseReductionModeEnum, noise_reduction)
-            picam2.set_controls({"NoiseReductionMode": mode})
-        except Exception:
-            notes.append(f"Could not apply noise_reduction='{noise_reduction}'.")
+    apply_image_controls(config, picam2, notes=notes)
 
     digital_zoom = camera_cfg.get("digital_zoom")
     digital_zoom_applied = False

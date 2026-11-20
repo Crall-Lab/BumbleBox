@@ -195,6 +195,7 @@ def capture_calibration_image(
     )
     from .camera_profiles import apply_camera_profile, validate_camera_ir_compatibility
     from .camera_select import picamera2_camera_kwargs
+    from .image_controls import apply_image_controls
 
     config = apply_camera_profile(config)
     ir_error = validate_camera_ir_compatibility(config)
@@ -216,7 +217,6 @@ def capture_calibration_image(
     width = int(camera_cfg.get("width", 4056))
     height = int(camera_cfg.get("height", 3040))
     shutter_us = int(camera_cfg.get("shutter_us", 2500))
-    noise_reduction = str(camera_cfg.get("noise_reduction", "Auto"))
     digital_zoom = camera_cfg.get("digital_zoom")
     warmup_s = float(runtime_cfg.get("camera_warmup_seconds", 2.0))
 
@@ -292,12 +292,9 @@ def capture_calibration_image(
             except Exception:
                 pass
 
-        if noise_reduction != "Auto":
-            try:
-                mode = getattr(controls.draft.NoiseReductionModeEnum, noise_reduction)
-                picam2.set_controls({"NoiseReductionMode": mode})
-            except Exception:
-                pass
+        # The calibration picture is taken with the same gain, white balance,
+        # contrast and noise reduction as recordings.
+        apply_image_controls(config, picam2, controls)
 
         if isinstance(digital_zoom, (list, tuple)) and len(digital_zoom) == 4:
             try:

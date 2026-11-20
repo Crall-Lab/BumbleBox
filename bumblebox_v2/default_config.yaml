@@ -50,7 +50,17 @@ camera:
   codec: "mp4"
   infrared: true
   monochrome_output: false
-  noise_reduction: "Auto"
+  # Picture settings applied inside the camera (docs/Frame_Processing.md).
+  # noise_reduction: "HighQuality" removes the most noise and can lower the
+  #   frame rate the camera reaches; "Fast", "Minimal" and "Off" do less.
+  #   "Auto" sends nothing and leaves the camera's own setting (Minimal).
+  # analogue_gain: "auto", or a fixed sensor gain (1.0 and up).
+  # colour_gains: "auto", or a fixed white balance as [red, blue] gains.
+  # contrast: 1.0 is the camera's own picture; higher is more contrast.
+  noise_reduction: "HighQuality"
+  analogue_gain: "auto"
+  colour_gains: "auto"
+  contrast: 1.0
   preview_window: "QT"
   tuning_file: null
   digital_zoom: null

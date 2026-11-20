@@ -375,5 +375,140 @@ class EncodeBenchmarkTests(unittest.TestCase):
         self.assertIn("mjpeg", output.getvalue())
 
 
+def _brightness_ramp(width: int = 512, height: int = 64) -> np.ndarray:
+    """A YUV420 frame as the camera delivers it: brightness 0..255 across the width, no colour."""
+    frame = np.full((height * 3 // 2, width), 128, dtype=np.uint8)
+    frame[:height] = np.repeat(np.arange(256, dtype=np.uint8), width // 256)[None, :]
+    return frame
+
+
+def _decoded_levels(video_path: Path, levels: tuple[int, ...], width: int = 512) -> list[float]:
+    """The brightness a recording of ``_brightness_ramp`` plays back at each camera level."""
+    frames, _fps = _read_video(video_path)
+    row = frames[0][frames[0].shape[0] // 2].astype(float).mean(axis=1)
+    step = width // 256
+    return [float(row[level * step : (level + 1) * step].mean()) for level in levels]
+
+
+class GrayscaleLevelTests(unittest.TestCase):
+    """A grayscale recording is the camera's brightness image, with nothing clipped.
+
+    The camera uses the whole 0-255 range. The colour conversion treats 16 as
+    black and 235 as white, so grayscale made from the colour picture lost the
+    darkest and brightest detail.
+    """
+
+    LEVELS = (0, 8, 16, 32, 128, 200, 235, 245, 255)
+
+    def test_grayscale_frame_is_the_brightness_plane(self) -> None:
+        frame = _brightness_ramp()
+        gray = run_engine._frame_to_bgr(frame, monochrome_output=True)
+        self.assertEqual(gray.shape, (64, 512, 3))
+        for channel in range(3):
+            np.testing.assert_array_equal(gray[:, :, channel], frame[:64])
+        np.testing.assert_array_equal(run_engine._frame_luma(frame), frame[:64])
+
+    def test_brightness_of_a_colour_picture(self) -> None:
+        bgr = np.zeros((4, 4, 3), dtype=np.uint8)
+        bgr[:, :] = (0, 255, 0)
+        self.assertEqual(run_engine._frame_luma(bgr).shape, (4, 4))
+        self.assertEqual(int(run_engine._frame_luma(bgr)[0, 0]), 150)
+
+    def test_colour_picture_keeps_the_dark_and_bright_ends(self) -> None:
+        bgr = run_engine._frame_to_bgr(_brightness_ramp())
+        row = bgr[10].astype(int)
+        for level in self.LEVELS:
+            for channel in range(3):
+                self.assertAlmostEqual(int(row[level * 2, channel]), level, delta=1, msg=f"camera level {level}")
+
+    def test_colours_follow_the_cameras_own_formula(self) -> None:
+        # Full-range ("JPEG") YUV to RGB, the matrix Picamera2 itself uses for this camera setup.
+        rng = np.random.default_rng(3)
+        height, width = 32, 32
+        frame = rng.integers(40, 216, (height * 3 // 2, width), dtype=np.uint8)
+        frame[:height] = np.repeat(np.repeat(frame[: height // 2, : width // 2], 2, axis=0), 2, axis=1)
+        y = frame[:height].astype(float)
+        u = frame[height : height + height // 4].reshape(height // 2, width // 2).astype(float) - 128.0
+        v = frame[height + height // 4 :].reshape(height // 2, width // 2).astype(float) - 128.0
+        u, v = (np.repeat(np.repeat(plane, 2, axis=0), 2, axis=1) for plane in (u, v))
+        expected = np.stack([y + 1.772 * u, y - 0.344 * u - 0.714 * v, y + 1.402 * v], axis=2).clip(0, 255)
+        got = run_engine._frame_to_bgr(frame).astype(float)
+        self.assertLess(float(np.abs(got - expected).mean()), 2.0)
+        self.assertLess(float(np.abs(got - expected).max()), 6.0)
+
+    def test_midframe_picture_keeps_the_dark_and_bright_ends(self) -> None:
+        import cv2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            png = run_engine._write_midpoint_preview_png([_brightness_ramp()], Path(tmp), "clip", monochrome_output=True)
+            image = cv2.imread(str(png), cv2.IMREAD_GRAYSCALE)
+        self.assertEqual([int(image[10, level * 2]) for level in self.LEVELS], list(self.LEVELS))
+
+    @needs_ffmpeg
+    def test_recordings_play_back_at_the_cameras_levels(self) -> None:
+        frames = [_brightness_ramp() for _ in range(5)]
+        cases = [
+            (buffered, codec, mp4_codec, monochrome)
+            for buffered in ("ram", "stream")
+            for codec, mp4_codec in (("mp4", "libx264"), ("mp4", "mpeg4"), ("mjpeg", "libx264"))
+            for monochrome in (True, False)
+        ]
+        for buffered, codec, mp4_codec, monochrome in cases:
+            if True:  # keeps the block below at one indent for both modes
+                with self.subTest(
+                    mode=buffered, codec=codec, mp4_codec=mp4_codec, grayscale=monochrome
+                ), tempfile.TemporaryDirectory() as tmp:
+                    if buffered == "ram":
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            video = run_engine._write_recording_video(
+                                frames, Path(tmp), "clip", 5.0, 512, 64, codec, mp4_codec, monochrome_output=monochrome
+                            )
+                    else:
+                        writer = StreamingVideoWriter(
+                            output_dir=Path(tmp),
+                            stem="clip",
+                            fps=5.0,
+                            recording_codec=codec,
+                            mp4_codec=mp4_codec,
+                            monochrome_output=monochrome,
+                        )
+                        for frame in frames:
+                            writer.add(frame)
+                        video = writer.finish(actual_fps=5.0).video_path
+                    played = _decoded_levels(video, self.LEVELS)
+                    for level, value in zip(self.LEVELS, played):
+                        # Before: 16 played back as 0 and 235 as 255.
+                        self.assertAlmostEqual(value, level, delta=3.0, msg=f"camera level {level}")
+
+    def test_h264_and_h265_store_the_cameras_values_and_mark_the_file_full_range(self) -> None:
+        from bumblebox_v2.stream_writer import full_range_output_format
+
+        self.assertEqual(full_range_output_format("libx264"), ["-pix_fmt", "yuvj420p", "-color_range", "pc"])
+        self.assertEqual(full_range_output_format("libx265"), ["-pix_fmt", "yuvj420p", "-color_range", "pc"])
+        self.assertEqual(full_range_output_format("mpeg4"), ["-pix_fmt", "yuv420p"])
+
+    @needs_ffmpeg
+    def test_colour_recording_is_the_cameras_frame_bit_for_bit_when_lossless(self) -> None:
+        # No RGB step and no level change: lossless H.264 gives back exactly what the camera delivered.
+        import subprocess
+
+        frames = _frames(4)
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = StreamingVideoWriter(output_dir=Path(tmp), stem="clip", fps=5.0, lossless=True)
+            for frame in frames:
+                writer.add(frame)
+            video = writer.finish(actual_fps=5.0).video_path
+            raw = subprocess.run(
+                [find_ffmpeg_binary(), "-v", "error", "-i", str(video), "-f", "rawvideo", "-pix_fmt", "yuvj420p", "-"],
+                capture_output=True,
+                check=True,
+            ).stdout
+        size = frames[0].size
+        self.assertEqual(len(raw), size * len(frames))
+        for index, frame in enumerate(frames):
+            decoded = np.frombuffer(raw[index * size : (index + 1) * size], dtype=np.uint8).reshape(frame.shape)
+            np.testing.assert_array_equal(decoded, frame)
+
+
 if __name__ == "__main__":
     unittest.main()

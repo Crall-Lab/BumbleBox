@@ -50,6 +50,9 @@ from .storage_guard import ensure_storage_ready
 from .stream_writer import (
     stream_chunk_frames,
     FRAME_BUFFER_STREAM,
+    COLOUR_INPUT_FORMAT,
+    GRAY_INPUT_FORMAT,
+    full_range_output_format,
     StreamedVideo,
     StreamingVideoWriter,
     find_ffmpeg_binary,
@@ -58,6 +61,7 @@ from .stream_writer import (
     resolve_mp4_preset,
     stream_queue_bytes,
 )
+from .image_controls import apply_image_controls
 from .thermal_camera import resolve_thermal_device_path, _set_v4l2_y16_format
 from .tracking_index import sync_run_summary_file
 from .tuning import resolve_camera_tuning_file
@@ -621,7 +625,7 @@ class _PicameraCaptureSession:
         self.shutter_us = int(config["camera"]["shutter_us"])
         self.digital_zoom = config["camera"].get("digital_zoom")
         self.monochrome_output = bool(config["camera"].get("monochrome_output", False))
-        self.noise_reduction = config["camera"].get("noise_reduction", "Auto")
+        self.image_control_notes: list[str] = []
         self.warmup_s = float(config["runtime"].get("camera_warmup_seconds", 2.0))
         self.resolved_tuning_file = resolve_camera_tuning_file(config)
         self.autofocus_notes: list[str] = []
@@ -718,12 +722,11 @@ class _PicameraCaptureSession:
             except Exception:
                 pass
 
-        if self.noise_reduction != "Auto":
-            try:
-                mode = getattr(self._controls.draft.NoiseReductionModeEnum, str(self.noise_reduction))
-                picam2.set_controls({"NoiseReductionMode": mode})
-            except Exception:
-                pass
+        # Sensor gain, white balance, contrast and noise reduction, where the
+        # config fixes them. A control this camera lacks is noted, not fatal.
+        apply_image_controls(self.config, picam2, self._controls, self.image_control_notes)
+        for note in self.image_control_notes:
+            print(f"[capture] {note}", flush=True)
 
         if isinstance(self.digital_zoom, (list, tuple)) and len(self.digital_zoom) == 4:
             picam2.set_controls({"ScalerCrop": tuple(self.digital_zoom)})
@@ -2295,6 +2298,8 @@ def _write_mp4_video_with_ffmpeg(
     monochrome_output: bool = False,
     mp4_preset: str = "auto",
 ) -> Path:
+    import numpy as np
+
     ffmpeg_bin = _find_ffmpeg_binary()
     if not ffmpeg_bin:
         raise RuntimeError(
@@ -2312,7 +2317,9 @@ def _write_mp4_video_with_ffmpeg(
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "bgr24",
+        # The same hand-over as stream mode: the camera's frame for colour, its
+        # brightness plane for grayscale, with no RGB step in between.
+        GRAY_INPUT_FORMAT if monochrome_output else COLOUR_INPUT_FORMAT,
         "-s:v",
         f"{width}x{height}",
         "-r",
@@ -2322,8 +2329,7 @@ def _write_mp4_video_with_ffmpeg(
         "-an",
         "-c:v",
         ffmpeg_codec,
-        "-pix_fmt",
-        "yuv420p",
+        *full_range_output_format(ffmpeg_codec),
     ]
     # Frames are already in memory here, so "auto" keeps the slower, smaller "fast" preset.
     preset = resolve_mp4_preset(mp4_preset, streaming=False)
@@ -2353,7 +2359,10 @@ def _write_mp4_video_with_ffmpeg(
         if process.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin for MP4 encoding.")
         for frame_index, frame in enumerate(frames, start=1):
-            process.stdin.write(_frame_to_bgr(frame, monochrome_output=monochrome_output).tobytes())
+            if monochrome_output:
+                process.stdin.write(_frame_luma(frame).tobytes())
+            else:
+                process.stdin.write(np.ascontiguousarray(frame).tobytes())
             progress.update(frame_index)
     except BrokenPipeError as exc:
         stderr_bytes = b""
@@ -2394,11 +2403,66 @@ def _frame_to_bgr(frame: Any, monochrome_output: bool = False) -> Any:
     except ImportError as exc:  # pragma: no cover - dependency/runtime
         raise RuntimeError("OpenCV is required for frame conversion.") from exc
 
-    bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
-    if not monochrome_output:
-        return bgr
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    if monochrome_output:
+        # Grayscale is the camera's own brightness plane, untouched. Going
+        # through the colour conversion below instead would clip it: that
+        # conversion treats brightness 16 as black and 235 as white, while the
+        # camera uses the whole 0-255 range (see docs/Frame_Processing.md).
+        return cv2.cvtColor(_frame_luma(frame), cv2.COLOR_GRAY2BGR)
+    return cv2.cvtColor(_full_range_to_video_levels(frame), cv2.COLOR_YUV2BGR_I420)
+
+
+def _video_level_tables() -> Tuple[Any, Any]:
+    """Lookup tables that squeeze full-range brightness and colour values into video levels."""
+    import numpy as np
+
+    values = np.arange(256, dtype=np.float64)
+    luma = np.rint(16.0 + values * 219.0 / 255.0).astype(np.uint8)
+    chroma = np.rint(128.0 + (values - 128.0) * 224.0 / 255.0).astype(np.uint8)
+    return luma, chroma
+
+
+_VIDEO_LEVEL_TABLES: Optional[Tuple[Any, Any]] = None
+
+
+def _full_range_to_video_levels(frame: Any) -> Any:
+    """Prepare a camera frame for OpenCV's YUV-to-BGR conversion.
+
+    OpenCV's conversion expects video levels (brightness 16-235) and stretches
+    them to 0-255. The camera delivers 0-255 already, so converting its frames
+    directly clips the darkest and brightest detail. Squeezing the frame into
+    video levels first makes the stretch land where it started.
+    """
+    import cv2
+    import numpy as np
+
+    global _VIDEO_LEVEL_TABLES
+    if _VIDEO_LEVEL_TABLES is None:
+        _VIDEO_LEVEL_TABLES = _video_level_tables()
+    luma, chroma = _VIDEO_LEVEL_TABLES
+    array = np.ascontiguousarray(frame)
+    height = int(array.shape[0]) * 2 // 3
+    adjusted = np.empty_like(array)
+    adjusted[:height] = cv2.LUT(array[:height], luma)
+    adjusted[height:] = cv2.LUT(array[height:], chroma)
+    return adjusted
+
+
+def _frame_luma(frame: Any) -> Any:
+    """The brightness image of a capture frame: what a grayscale view or recording shows.
+
+    A YUV420 capture frame is the brightness (Y) plane followed by the two
+    colour planes at half size, so the first two thirds of its rows are the
+    brightness image. A BGR frame is reduced to brightness the usual way.
+    """
+    import numpy as np
+
+    array = np.asarray(frame)
+    if array.ndim == 3:
+        import cv2
+
+        return cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
+    return np.ascontiguousarray(array[: int(array.shape[0]) * 2 // 3])
 
 
 def _capture_frame_to_bgr(frame: Any, monochrome_output: bool = False) -> Any:

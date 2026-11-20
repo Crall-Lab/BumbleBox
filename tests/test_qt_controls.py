@@ -342,6 +342,105 @@ class SettingsPageTests(QtControlTestCase):
             self.assertEqual(window.settings_recording_seconds.value(), 45)
             self.assertFalse(window._settings_dirty())
 
+    def test_picture_settings_start_on_automatic(self) -> None:
+        with self.window() as window:
+            self.assertEqual(window.settings_gain_mode.currentData(), "auto")
+            self.assertEqual(window.settings_wb_mode.currentData(), "auto")
+            self.assertFalse(window.settings_gain.isEnabled())
+            self.assertFalse(window.settings_red_gain.isEnabled())
+            self.assertFalse(window.settings_blue_gain.isEnabled())
+            self.assertEqual(window.settings_contrast.value(), 1.0)
+            self.assertEqual(window.settings_noise_reduction.currentData(), "HighQuality")
+            self.assertEqual(window.settings_noise_reduction.currentText(), "High quality (default)")
+            self.assertEqual(
+                [window.settings_noise_reduction.itemText(i) for i in range(window.settings_noise_reduction.count())],
+                ["Off", "Camera's own setting (minimal)", "Fast", "High quality (default)"],
+            )
+            self.assertFalse(window._settings_dirty())
+            window._refresh_settings_preview()
+            self.assertIn(
+                "Picture: sensor gain automatic; white balance automatic; noise reduction high quality.",
+                window.settings_effects_label.text(),
+            )
+
+    def test_a_box_set_up_earlier_shows_the_cameras_own_noise_reduction(self) -> None:
+        def earlier(config):
+            config["camera"]["noise_reduction"] = "Auto"
+
+        with self.window(earlier) as window:
+            self.assertEqual(window.settings_noise_reduction.currentData(), "Auto")
+            self.assertEqual(window.settings_noise_reduction.currentText(), "Camera's own setting (minimal)")
+            self.assertFalse(window._settings_dirty())
+            window._refresh_settings_preview()
+            self.assertIn("noise reduction left to the camera.", window.settings_effects_label.text())
+            # Saving something else does not move it to the new default.
+            window.settings_contrast.setValue(1.1)
+            self.assertTrue(window._save_settings(offer_apply=False))
+            self.assertEqual(load_config(window.config_path)["camera"]["noise_reduction"], "Auto")
+
+    def test_noise_reduction_is_kept_under_a_named_camera_profile(self) -> None:
+        def hq(config):
+            config["camera"]["profile"] = "hq_reference"
+            config["camera"]["noise_reduction"] = "Auto"
+
+        with self.window(hq) as window:
+            self.assertTrue(window.settings_noise_reduction.isEnabled())
+            window.settings_noise_reduction.setCurrentIndex(window.settings_noise_reduction.findData("HighQuality"))
+            self.assertTrue(window._save_settings(offer_apply=False))
+            saved = load_config(window.config_path)["camera"]
+            self.assertEqual(saved["profile"], "hq_reference")
+            self.assertEqual(saved["noise_reduction"], "HighQuality")
+
+    def test_fixing_gain_white_balance_and_noise_reduction(self) -> None:
+        with self.window() as window:
+            window.settings_gain_mode.setCurrentIndex(window.settings_gain_mode.findData("fixed"))
+            self.assertTrue(window.settings_gain.isEnabled())
+            window.settings_gain.setValue(4.0)
+            window.settings_wb_mode.setCurrentIndex(window.settings_wb_mode.findData("fixed"))
+            self.assertTrue(window.settings_red_gain.isEnabled())
+            window.settings_red_gain.setValue(1.9)
+            window.settings_blue_gain.setValue(1.45)
+            window.settings_contrast.setValue(1.15)
+            window.settings_noise_reduction.setCurrentIndex(window.settings_noise_reduction.findData("Fast"))
+            self.assertTrue(window._settings_dirty())
+            window._refresh_settings_preview()
+            self.assertIn(
+                "Picture: sensor gain fixed at 4; white balance fixed (red 1.9, blue 1.45); contrast 1.15; "
+                "noise reduction fast.",
+                window.settings_effects_label.text(),
+            )
+
+            self.assertTrue(window._save_settings(offer_apply=False))
+            saved = load_config(window.config_path)["camera"]
+            self.assertEqual(saved["analogue_gain"], 4.0)
+            self.assertEqual(saved["colour_gains"], [1.9, 1.45])
+            self.assertEqual(saved["contrast"], 1.15)
+            self.assertEqual(saved["noise_reduction"], "Fast")
+            self.assertFalse(window._settings_dirty())
+
+            # Back to automatic: the numbers stay in the boxes, but "auto" is what is saved.
+            window.settings_gain_mode.setCurrentIndex(window.settings_gain_mode.findData("auto"))
+            window.settings_wb_mode.setCurrentIndex(window.settings_wb_mode.findData("auto"))
+            self.assertFalse(window.settings_gain.isEnabled())
+            self.assertTrue(window._save_settings(offer_apply=False))
+            saved = load_config(window.config_path)["camera"]
+            self.assertEqual(saved["analogue_gain"], "auto")
+            self.assertEqual(saved["colour_gains"], "auto")
+            self.assertEqual(saved["noise_reduction"], "Fast")
+
+    def test_fixed_picture_settings_in_the_config_are_shown(self) -> None:
+        def fixed(config):
+            config["camera"].update(analogue_gain=6.5, colour_gains=[2.2, 1.1], contrast=1.3, noise_reduction="fast")
+
+        with self.window(fixed) as window:
+            self.assertEqual(window.settings_gain_mode.currentData(), "fixed")
+            self.assertEqual(window.settings_gain.value(), 6.5)
+            self.assertEqual(window.settings_wb_mode.currentData(), "fixed")
+            self.assertEqual((window.settings_red_gain.value(), window.settings_blue_gain.value()), (2.2, 1.1))
+            self.assertEqual(window.settings_contrast.value(), 1.3)
+            self.assertEqual(window.settings_noise_reduction.currentData(), "Fast")
+            self.assertFalse(window._settings_dirty())
+
     def test_profile_settings_are_locked_until_switched_to_custom(self) -> None:
         def hq(config):
             config["camera"]["profile"] = "hq_reference"

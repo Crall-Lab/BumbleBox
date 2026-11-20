@@ -48,6 +48,22 @@ See `docs/RealSense_Camera.md` for hardware validation and `docs/Multimodal_Cali
 - [x] Port storage setup and mount-status interactions from Tk: the Data Drive
       window on Overview mounts a drive at the data folder, keeps it after a
       restart or not, and removes it safely. See `docs/Storage_Setup.md`.
+- [x] Keep the camera's full brightness range in the monitor, the PNG and saved
+      video, in colour and grayscale; record straight from the camera's frame
+      with no RGB step; add Contrast Boost to the monitor. See
+      `docs/Frame_Processing.md`.
+- [ ] On a Pi: confirm recordings play back at the camera's levels, the recorded
+      frame width for a 4056-wide setting, and grayscale against colour for file
+      size and tag detection.
+- [x] Add sensor gain, white balance, contrast and noise reduction to the
+      Settings page (Picture), and show the camera's current gain and white
+      balance in the live monitor. See `docs/Frame_Processing.md`.
+- [x] Make `HighQuality` noise reduction the default for new setups, and stop
+      the named camera profiles putting `Auto` back on every save.
+- [ ] On a Pi: measure the frame rate reached with `HighQuality` noise
+      reduction at 4056x3040; fall back to `Fast` if it drops below the target.
+- [ ] On a Pi: try fixed sensor gain, fixed colour gains and contrast under
+      infrared and red light.
 - [ ] Mount, keep, forget and remove a real drive through the Data Drive window
       on a Raspberry Pi (exFAT and ext4), including a restart with and without
       the drive connected.

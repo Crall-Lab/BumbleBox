@@ -110,6 +110,28 @@ def stream_queue_bytes(config: Dict[str, Any]) -> int:
 DEFAULT_CHUNK_MINUTES = 10.0
 
 
+# How camera frames are handed to ffmpeg. The camera's brightness and colour
+# values use the full 0-255 range (Picamera2's preview configuration is
+# "sYCC"). ffmpeg assumes 16-235 unless told otherwise, and a player then
+# stretches the picture: everything at or below 16 turns black and everything
+# at or above 235 white. These names tell ffmpeg the truth.
+COLOUR_INPUT_FORMAT = "yuvj420p"  # the camera's YUV420 frame as it arrives, full range
+GRAY_INPUT_FORMAT = "gray"  # the brightness plane alone, one byte per pixel
+
+
+def full_range_output_format(encoder: str) -> List[str]:
+    """ffmpeg output options that keep the camera's levels.
+
+    H.264 and H.265 store the values unchanged and mark the file "full
+    range", so players and OpenCV show the same numbers the camera produced.
+    Encoders that cannot are given standard video levels, and ffmpeg squeezes
+    the range to fit; that loses a few levels but clips nothing.
+    """
+    if str(encoder) in {"libx264", "libx265"}:
+        return ["-pix_fmt", "yuvj420p", "-color_range", "pc"]
+    return ["-pix_fmt", "yuv420p"]
+
+
 def stream_chunk_frames(config: Dict[str, Any]) -> int:
     """Frames per video file for a split recording; 0 means one file (capture.chunk_minutes)."""
     capture = config.get("capture", {}) if isinstance(config.get("capture"), dict) else {}
@@ -262,7 +284,6 @@ class StreamingVideoWriter:
         self._thread: Optional[threading.Thread] = None
         self._process: Optional[subprocess.Popen] = None
         self._stderr_file: Optional[Any] = None
-        self._neutral_chroma: Optional[bytes] = None
         self._width = 0
         self._height = 0
         self._frames_added = 0
@@ -648,10 +669,11 @@ class StreamingVideoWriter:
             )
         self.stats.width = self._width
         self.stats.height = self._height
-        if self.monochrome_output:
-            # Grey video is the luma plane plus neutral chroma, so ffmpeg does
-            # no colour conversion and levels match the RAM-mode output.
-            self._neutral_chroma = bytes([128]) * (self._width * self._height // 2)
+        # Frames go to the encoder as the camera made them: the whole frame
+        # for colour, the brightness plane alone for grayscale. Nothing is
+        # converted to RGB on the way.
+        input_format = GRAY_INPUT_FORMAT if self.monochrome_output else COLOUR_INPUT_FORMAT
+        video_format = full_range_output_format(self.encoder)
 
         cmd: List[str] = [
             str(self._ffmpeg_bin),
@@ -662,7 +684,7 @@ class StreamingVideoWriter:
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "yuv420p",
+            input_format,
             "-s:v",
             f"{self._width}x{self._height}",
             "-r",
@@ -677,14 +699,14 @@ class StreamingVideoWriter:
             cmd += ["-q:v", "2", "-pix_fmt", "yuvj420p"]
         elif self.encoder == "libx264":
             quality = ["-qp", "0"] if self.lossless else ["-crf", "18"]
-            cmd += ["-preset", str(self.preset), *quality, "-pix_fmt", "yuv420p"]
+            cmd += ["-preset", str(self.preset), *quality, *video_format]
         elif self.encoder == "libx265":
             quality = ["-x265-params", "lossless=1"] if self.lossless else ["-crf", "20"]
-            cmd += ["-preset", str(self.preset), *quality, "-pix_fmt", "yuv420p"]
+            cmd += ["-preset", str(self.preset), *quality, *video_format]
         elif self.encoder == "mpeg4":
-            cmd += ["-q:v", "2", "-pix_fmt", "yuv420p"]
+            cmd += ["-q:v", "2", *video_format]
         else:
-            cmd += ["-pix_fmt", "yuv420p"]
+            cmd += video_format
         cmd += ["-f", "matroska", str(self._encoding_path())]
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -725,7 +747,6 @@ class StreamingVideoWriter:
         if self.monochrome_output:
             luma = np.ascontiguousarray(frame[: self._height])
             process.stdin.write(luma.reshape(-1).data)
-            process.stdin.write(self._neutral_chroma or b"")
         else:
             process.stdin.write(np.ascontiguousarray(frame).reshape(-1).data)
         self._last_write_monotonic = time.perf_counter()

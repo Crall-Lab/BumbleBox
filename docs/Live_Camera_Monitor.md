@@ -54,6 +54,10 @@ gets no panel. `--thermal`, `--no-thermal`, `--realsense` and `--no-realsense`
 change this for one session. On a Pi with two RGB cameras, the monitor shows
 the camera that is selected in the GUI.
 
+The line under the RGB camera's picture also shows the sensor gain and white
+balance the camera is using. Those are the numbers to copy when fixing them
+on the Settings page (`docs/Frame_Processing.md`).
+
 ## Full Screen
 
 Any feed can fill the screen:
@@ -74,6 +78,7 @@ different windows:
 | Control | Where | What it changes | Saved? |
 |---|---|---|---|
 | **Grayscale View** | This monitor, in the header | How the camera images are drawn here | No; it is for looking only |
+| **Contrast Boost** | This monitor, in the header | Brings out detail in dark and bright areas of the grayscale view | No; it is for looking only |
 | **Record in Grayscale** | Main window, top right of the **Run** page | Whether this camera's recordings are saved in grayscale (`camera.monochrome_output`) | Yes, straight away |
 
 The monitor only looks: it saves no images and changes no settings. You can
@@ -81,8 +86,14 @@ look in grayscale and record in colour, or the other way round.
 
 - **Grayscale View** applies to the RGB camera and the RealSense color feed.
   Thermal and depth keep their colour scale, which carries the measurement.
-  **G** toggles it, including in full screen. It shows the image's luma, which
-  is what a grayscale recording keeps.
+  **G** toggles it, including in full screen. For the RGB camera it shows the
+  camera's own brightness image, untouched, which is what a grayscale
+  recording keeps.
+- **Contrast Boost** applies the local contrast boost (CLAHE) that the tag
+  detector applies before it looks for tags, so the picture is close to what
+  the detector sees. It is a grayscale view: switching it on switches
+  Grayscale View on, and going back to colour switches it off. **C** toggles
+  it. See `docs/Frame_Processing.md` for what happens to a frame.
 - **Record in Grayscale** takes effect from the next recording, for the camera
   shown in the main window. A named camera profile fixes this setting, so
   switching it under such a profile moves the camera to the Custom profile,

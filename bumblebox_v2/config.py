@@ -23,6 +23,7 @@ from .camera_controls import (
     normalize_autofocus_speed,
 )
 from .hardware_profiles import hardware_profile_choices, normalize_hardware_profile
+from .image_controls import ImageSettingError, validate_image_settings
 from .storage_guard import normalize_require_mounted_storage
 from .camera_select import SESSION_TAG_PATTERN
 from .time_units import DEFAULT_START_TIME, parse_time_of_day
@@ -391,6 +392,10 @@ def validate_config(config: Dict[str, Any]) -> None:
     camera_monochrome_output = config["camera"].get("monochrome_output", False)
     if not isinstance(camera_monochrome_output, bool):
         raise ConfigError("camera.monochrome_output must be true or false")
+    try:
+        validate_image_settings(config)
+    except ImageSettingError as exc:
+        raise ConfigError(str(exc)) from exc
     ir_error = validate_camera_ir_compatibility(config)
     if ir_error:
         raise ConfigError(ir_error)

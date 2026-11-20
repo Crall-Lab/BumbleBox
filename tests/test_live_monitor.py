@@ -17,6 +17,7 @@ from bumblebox_v2.live_monitor import (
     LiveMonitorOptions,
     ThermalColorizer,
     bgr_to_gray,
+    boost_contrast,
     create_live_monitor_window,
     monitor_grid,
     monitor_streams,
@@ -295,6 +296,17 @@ class GrayscaleHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bgr_to_gray(np.zeros((4, 4), dtype=np.uint8))
 
+    def test_contrast_boost_brings_out_faint_detail(self) -> None:
+        # A dim picture with a faint pattern, as in a dark nest.
+        rng = np.random.default_rng(1)
+        faint = (40 + rng.integers(0, 12, (96, 128))).astype(np.uint8)
+        boosted = boost_contrast(faint)
+        self.assertEqual(boosted.shape, faint.shape)
+        self.assertEqual(boosted.dtype, np.uint8)
+        self.assertGreater(float(boosted.std()), 2.0 * float(faint.std()))
+        with self.assertRaises(ValueError):
+            boost_contrast(np.zeros((4, 4, 3), dtype=np.uint8))
+
     def test_recording_setting_is_saved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
@@ -386,6 +398,107 @@ class MonitorGrayscaleTests(unittest.TestCase):
         QTest.keyClick(window, Qt.Key_G)
         self.assertFalse(window.grayscale_view)
 
+    @staticmethod
+    def drawn(surface) -> np.ndarray:
+        """The picture on a surface, before it is scaled to the window, as gray values."""
+        image = surface._source.toImage()
+        return np.array(
+            [[image.pixelColor(x, y).red() for x in range(image.width())] for y in range(image.height())],
+            dtype=np.uint8,
+        )
+
+    @staticmethod
+    def camera_brightness() -> np.ndarray:
+        """A brightness image with values the colour conversion would clip (below 16, above 235)."""
+        gray = np.zeros((12, 16), dtype=np.uint8)
+        gray[:, :] = np.linspace(2, 250, 16, dtype=np.uint8)[None, :]
+        return gray
+
+    def test_grayscale_view_shows_the_cameras_brightness_image_untouched(self) -> None:
+        window = self.window()
+        surface = window.panels["rgb"].surface
+        gray = self.camera_brightness()
+        surface.set_bgr(self.colour_frame(), gray=gray)
+        window.gray_view_button.click()
+        np.testing.assert_array_equal(self.drawn(surface), gray)
+        # Without a brightness image the colour picture is reduced to gray instead.
+        surface.set_bgr(self.colour_frame())
+        np.testing.assert_array_equal(self.drawn(surface), bgr_to_gray(self.colour_frame()))
+        # One that does not fit the picture is ignored.
+        surface.set_bgr(self.colour_frame(), gray=np.zeros((3, 3), dtype=np.uint8))
+        np.testing.assert_array_equal(self.drawn(surface), bgr_to_gray(self.colour_frame()))
+
+    def test_the_camera_feed_carries_its_brightness_image(self) -> None:
+        from bumblebox_v2.live_monitor import LiveFramePacket
+        from bumblebox_v2.run_engine import _frame_luma
+        from bumblebox_v2.simulated_capture import simulated_rgb_yuv420_frame
+
+        config = load_defaults()
+        config["runtime"]["use_mock_camera"] = True
+        backend = LiveMonitorBackend(config, LiveMonitorOptions(rgb_width=64, rgb_height=48, display_fps=20.0))
+        backend.start()
+        deadline = time.monotonic() + 2.0
+        packet = None
+        while time.monotonic() < deadline and packet is None:
+            packet = backend.frame_store.snapshot().get("rgb")
+            time.sleep(0.02)
+        backend.stop()
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet.image_gray.shape, (48, 64))
+        self.assertEqual(packet.image_bgr.shape, (48, 64, 3))
+        frame = simulated_rgb_yuv420_frame(64, 48, 0.0, 4.0)
+        np.testing.assert_array_equal(_frame_luma(frame), frame[:48])
+        self.assertIsNone(LiveFramePacket("thermal", np.zeros((2, 2, 3)), 1, 0.0).image_gray)
+
+    def test_contrast_boost_is_a_grayscale_view(self) -> None:
+        window = self.window(depth=True)
+        surface = window.panels["rgb"].surface
+        gray = self.camera_brightness()
+        surface.set_bgr(self.colour_frame(), gray=gray)
+        self.assertEqual(window.boost_button.text(), "Contrast Boost: Off")
+
+        window.boost_button.click()  # turns the grayscale view on with it
+        self.assertTrue(window.contrast_boost and window.grayscale_view)
+        self.assertTrue(window.gray_view_button.isChecked())
+        self.assertEqual(window.boost_button.text(), "Contrast Boost: On")
+        self.assertEqual(window.gray_view_button.text(), "Grayscale View: On")
+        np.testing.assert_array_equal(self.drawn(surface), boost_contrast(gray))
+
+        window.boost_button.click()  # boost off: plain grayscale stays
+        self.assertFalse(window.contrast_boost)
+        self.assertTrue(window.grayscale_view)
+        np.testing.assert_array_equal(self.drawn(surface), gray)
+
+        window.boost_button.click()
+        window.gray_view_button.click()  # back to colour: the boost goes with it
+        self.assertFalse(window.contrast_boost or window.grayscale_view)
+        self.assertFalse(window.boost_button.isChecked())
+        self.assertEqual(window.boost_button.text(), "Contrast Boost: Off")
+        self.assertFalse(self.is_gray(surface))
+
+    def test_c_key_switches_the_boost_also_in_full_screen(self) -> None:
+        window = self.window()
+        window.panels["rgb"].surface.set_bgr(self.colour_frame(), gray=self.camera_brightness())
+        window.toggle_full_view("rgb")
+        QTest.keyClick(window, Qt.Key_C)
+        self.assertTrue(window.contrast_boost and window.grayscale_view)
+        QTest.keyClick(window, Qt.Key_C)
+        self.assertFalse(window.contrast_boost)
+        self.assertTrue(window.grayscale_view)
+
+    def test_the_camera_panel_shows_the_gain_and_white_balance_in_use(self) -> None:
+        from bumblebox_v2.live_monitor import LiveFramePacket
+
+        window = self.window()
+        panel = window.panels["rgb"]
+        now = time.perf_counter()
+        panel.set_packet(
+            LiveFramePacket("rgb", self.colour_frame(), 9001, now, info="sensor gain 3.81  |  white balance red 1.92, blue 1.45")
+        )
+        self.assertTrue(panel.status_label.text().endswith("sensor gain 3.81  |  white balance red 1.92, blue 1.45"))
+        panel.set_packet(LiveFramePacket("rgb", self.colour_frame(), 9002, now))
+        self.assertNotIn("sensor gain", panel.status_label.text())  # the mock camera reports none
+
     def test_monitor_only_looks_it_has_no_recording_controls(self) -> None:
         window = self.window()
         self.assertFalse(hasattr(window, "record_gray_button"))
@@ -404,6 +517,7 @@ class MonitorGrayscaleTests(unittest.TestCase):
         window = self.window(thermal=True, configure=thermal_only_here)
         self.assertEqual(list(window.panels), ["thermal"])
         self.assertTrue(window.gray_view_button.isHidden())
+        self.assertTrue(window.boost_button.isHidden())
 
 
 if __name__ == "__main__":

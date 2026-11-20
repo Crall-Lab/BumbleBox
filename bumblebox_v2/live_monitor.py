@@ -10,6 +10,8 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
+from .image_controls import camera_readout
+
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,12 @@ class LiveFramePacket:
     image_bgr: Any
     sequence: int
     captured_monotonic_s: float
+    # The camera's own brightness image, when the feed has one. The grayscale
+    # view shows this as it is, rather than working brightness back out of the
+    # colour picture.
+    image_gray: Any = None
+    # What the camera is using for this frame (sensor gain, white balance), in words.
+    info: str = ""
 
 
 class LatestFrameStore:
@@ -239,13 +247,17 @@ class LiveMonitorBackend:
             remaining = max(0.0, deadline - time.monotonic())
             thread.join(remaining)
 
-    def _put(self, stream: str, frame: Any, sequence: int, captured: float) -> None:
+    def _put(
+        self, stream: str, frame: Any, sequence: int, captured: float, gray: Any = None, info: str = ""
+    ) -> None:
         self.frame_store.put(
             LiveFramePacket(
                 stream=stream,
                 image_bgr=frame,
                 sequence=int(sequence),
                 captured_monotonic_s=float(captured),
+                image_gray=gray,
+                info=str(info or ""),
             )
         )
 
@@ -254,7 +266,7 @@ class LiveMonitorBackend:
             self._run_mock_rgb()
             return
 
-        from .run_engine import _PicameraCaptureSession, _frame_to_bgr
+        from .run_engine import _PicameraCaptureSession, _frame_luma, _frame_to_bgr
 
         preview_config = deepcopy(self.config)
         preview_config.setdefault("camera", {})["width"] = int(self.options.rgb_width)
@@ -271,7 +283,7 @@ class LiveMonitorBackend:
                 f"Live at {self.options.rgb_width} x {self.options.rgb_height}.",
             )
             while not self.stop_event.is_set():
-                frame = session.picam2.capture_array()
+                frame, metadata = capture_frame_and_metadata(session.picam2)
                 captured = time.perf_counter()
                 sequence += 1
                 self._put(
@@ -279,11 +291,15 @@ class LiveMonitorBackend:
                     _frame_to_bgr(frame, monochrome_output=monochrome),
                     sequence,
                     captured,
+                    gray=_frame_luma(frame),
+                    # The gain and white balance the camera is using: the
+                    # numbers to copy when fixing them on the Settings page.
+                    info=camera_readout(metadata),
                 )
                 self.stop_event.wait(interval)
 
     def _run_mock_rgb(self) -> None:
-        from .run_engine import _frame_to_bgr
+        from .run_engine import _frame_luma, _frame_to_bgr
         from .simulated_capture import simulated_rgb_yuv420_frame
 
         interval = 1.0 / float(self.options.display_fps)
@@ -300,7 +316,7 @@ class LiveMonitorBackend:
                 4.0,
             )
             sequence += 1
-            self._put("rgb", _frame_to_bgr(frame), sequence, captured)
+            self._put("rgb", _frame_to_bgr(frame), sequence, captured, gray=_frame_luma(frame))
             self.stop_event.wait(interval)
 
     def _run_thermal(self) -> None:
@@ -507,13 +523,52 @@ STREAM_TITLES = {
 }
 
 
+def capture_frame_and_metadata(picam2: Any) -> tuple[Any, Any]:
+    """One frame and what the camera reports about it (``None`` where it reports nothing)."""
+    capture_request = getattr(picam2, "capture_request", None)
+    if not callable(capture_request):
+        return picam2.capture_array(), None
+    request = capture_request()
+    try:
+        frame = request.make_array("main")
+        try:
+            metadata = request.get_metadata()
+        except Exception:
+            metadata = None
+    finally:
+        request.release()
+    return frame, metadata
+
+
 # Feeds that are real colour images. Thermal and depth are drawn with a false
 # colour scale that carries the measurement, so the grayscale view leaves them.
 COLOUR_STREAMS = {"rgb", "realsense_color"}
 
 
+# The contrast boost is the one the tag detector applies before it looks for
+# tags (tag_tracking_utils), so the boosted view is what the detector sees.
+CONTRAST_BOOST_CLIP_LIMIT = 2.0
+CONTRAST_BOOST_TILES = (8, 8)
+
+
+def boost_contrast(gray: Any) -> Any:
+    """Local contrast enhancement (CLAHE) of an 8-bit grayscale image."""
+    import cv2
+    import numpy as np
+
+    array = np.ascontiguousarray(gray)
+    if array.ndim != 2:
+        raise ValueError(f"Expected a grayscale image, got shape {array.shape}.")
+    clahe = cv2.createCLAHE(clipLimit=CONTRAST_BOOST_CLIP_LIMIT, tileGridSize=CONTRAST_BOOST_TILES)
+    return clahe.apply(array)
+
+
 def bgr_to_gray(frame: Any) -> Any:
-    """Luma of a BGR image as an 8-bit array: what a grayscale recording keeps."""
+    """Brightness of a BGR image as an 8-bit array.
+
+    For feeds that only arrive in colour (the depth camera's colour image).
+    The main camera supplies its own brightness image, which is used instead.
+    """
     import numpy as np
 
     array = np.asarray(frame)
@@ -611,7 +666,9 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             self._source: Optional[QPixmap] = None
             self._nearest = bool(nearest)
             self._frame: Any = None
+            self._gray: Any = None
             self._grayscale = False
+            self._contrast_boost = False
 
         def set_grayscale(self, enabled: bool) -> None:
             """Draw in grayscale or colour. Redraws the frame on screen, so it works while paused."""
@@ -619,14 +676,31 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             if self._frame is not None:
                 self._render()
 
-        def set_bgr(self, frame: Any) -> None:
+        def set_contrast_boost(self, enabled: bool) -> None:
+            """Boost local contrast in the grayscale view. Display only."""
+            self._contrast_boost = bool(enabled)
+            if self._frame is not None:
+                self._render()
+
+        def set_bgr(self, frame: Any, gray: Any = None) -> None:
+            """Show a frame. ``gray`` is the camera's own brightness image, if the feed has one."""
             import numpy as np
 
             array = np.asarray(frame)
             if array.ndim != 3 or array.shape[2] != 3:
                 raise ValueError(f"Monitor display expects BGR image data, got {array.shape}.")
+            if gray is not None:
+                gray = np.asarray(gray)
+                if gray.shape != array.shape[:2]:
+                    gray = None  # not the same picture; fall back to the colour one
             self._frame = array
+            self._gray = gray
             self._render()
+
+        def shown_gray(self) -> Any:
+            """The grayscale image as it is drawn: the camera's brightness, boosted if asked."""
+            gray = self._gray if self._gray is not None else bgr_to_gray(self._frame)
+            return boost_contrast(gray) if self._contrast_boost else gray
 
         def _render(self) -> None:
             import numpy as np
@@ -634,7 +708,7 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             array = self._frame
             height, width = int(array.shape[0]), int(array.shape[1])
             if self._grayscale:
-                gray = np.ascontiguousarray(bgr_to_gray(array))
+                gray = np.ascontiguousarray(self.shown_gray())
                 image = QImage(gray.data, width, height, int(gray.strides[0]), QImage.Format_Grayscale8).copy()
             else:
                 rgb = np.ascontiguousarray(array[:, :, ::-1])
@@ -688,6 +762,7 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             self.state = "starting"
             self.message = "Starting..."
             self.dimensions: Optional[tuple[int, int]] = None
+            self.info = ""
 
         def set_full_view(self, enabled: bool) -> None:
             """Restyle for filling the screen: dark surround, no card border, a way back."""
@@ -713,8 +788,9 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             self.last_captured = packet.captured_monotonic_s
             self.frame_times.append(packet.captured_monotonic_s)
             frame = packet.image_bgr
+            self.info = packet.info
             self.dimensions = (int(frame.shape[1]), int(frame.shape[0]))
-            self.surface.set_bgr(frame)
+            self.surface.set_bgr(frame, gray=packet.image_gray)
             self.state = "live"
             self.refresh_status()
 
@@ -729,9 +805,10 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
                 elapsed = self.frame_times[-1] - self.frame_times[0]
                 fps = (len(self.frame_times) - 1) / elapsed if elapsed > 0 else 0.0
             width, height = self.dimensions or (0, 0)
-            self.status_label.setText(
-                f"{width} x {height}  |  {fps:.1f} displayed FPS  |  {age_ms:.0f} ms old"
-            )
+            text = f"{width} x {height}  |  {fps:.1f} displayed FPS  |  {age_ms:.0f} ms old"
+            if self.info:
+                text += f"  |  {self.info}"
+            self.status_label.setText(text)
 
     class LiveMonitorWindow(QMainWindow):
         def __init__(self) -> None:
@@ -752,6 +829,7 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             self.resize(1420 if len(self.streams) > 1 else 1100, 900)
             self.paused = False
             self.grayscale_view = False
+            self.contrast_boost = False
             self.full_view: Optional[str] = None
             self._was_maximized = False
             self._build()
@@ -799,12 +877,22 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             )
             self.gray_view_button.toggled.connect(self.set_grayscale_view)
             self.gray_view_button.setVisible(has_colour_feed)
+            self.boost_button = QPushButton("Contrast Boost")
+            self.boost_button.setCheckable(True)
+            self.boost_button.setToolTip(
+                "Bring out detail in dark and bright areas, the way the tag detector sees the image. "
+                "Shown in grayscale. This only changes what you see here; recordings are not affected. "
+                "Shortcut: C."
+            )
+            self.boost_button.toggled.connect(self.set_contrast_boost)
+            self.boost_button.setVisible(has_colour_feed)
             self.pause_button = QPushButton("Pause Display")
             self.pause_button.clicked.connect(self._toggle_pause)
             close_button = QPushButton("Close Monitor")
             close_button.setObjectName("CloseButton")
             close_button.clicked.connect(self.close)
             header_layout.addWidget(self.gray_view_button)
+            header_layout.addWidget(self.boost_button)
             header_layout.addWidget(self.pause_button)
             header_layout.addWidget(close_button)
             outer.addWidget(header)
@@ -858,16 +946,37 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
         def _label_toggles(self) -> None:
             # The state is in the words as well as the colour.
             self.gray_view_button.setText(f"Grayscale View: {'On' if self.grayscale_view else 'Off'}")
+            self.boost_button.setText(f"Contrast Boost: {'On' if self.contrast_boost else 'Off'}")
+
+        def _apply_view(self) -> None:
+            """Push the two view choices to the buttons and the colour feeds."""
+            for button, state in (
+                (self.gray_view_button, self.grayscale_view),
+                (self.boost_button, self.contrast_boost),
+            ):
+                if button.isChecked() != state:
+                    button.blockSignals(True)
+                    button.setChecked(state)
+                    button.blockSignals(False)
+            for stream, panel in self.panels.items():
+                if stream in COLOUR_STREAMS:
+                    panel.surface.set_contrast_boost(self.contrast_boost)
+                    panel.surface.set_grayscale(self.grayscale_view)
+            self._label_toggles()
 
         def set_grayscale_view(self, enabled: bool) -> None:
             """Show the colour camera feeds in grayscale. Changes the display only."""
             self.grayscale_view = bool(enabled)
-            if self.gray_view_button.isChecked() != self.grayscale_view:
-                self.gray_view_button.setChecked(self.grayscale_view)
-            for stream, panel in self.panels.items():
-                if stream in COLOUR_STREAMS:
-                    panel.surface.set_grayscale(self.grayscale_view)
-            self._label_toggles()
+            if not self.grayscale_view:
+                self.contrast_boost = False  # the boost is a grayscale view
+            self._apply_view()
+
+        def set_contrast_boost(self, enabled: bool) -> None:
+            """Boost local contrast, in grayscale. Changes the display only."""
+            self.contrast_boost = bool(enabled)
+            if self.contrast_boost:
+                self.grayscale_view = True
+            self._apply_view()
 
         def toggle_full_view(self, stream: str) -> None:
             """Fill the screen with one feed, or go back to all of them."""
@@ -924,6 +1033,9 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
                 return
             if event.key() == Qt.Key_G and not self.gray_view_button.isHidden():
                 self.set_grayscale_view(not self.grayscale_view)
+                return
+            if event.key() == Qt.Key_C and not self.boost_button.isHidden():
+                self.set_contrast_boost(not self.contrast_boost)
                 return
             super().keyPressEvent(event)
 

@@ -94,6 +94,10 @@ CAMERA_MODEL_ALIASES = {
     "b0483": "owlsight_64mp",
 }
 
+# A profile overwrites every camera value it names each time the config is
+# loaded or saved. Picture settings (noise reduction, gain, white balance,
+# contrast) are left out on purpose, so that what is chosen on the Settings
+# page is kept under any profile.
 CAMERA_PROFILES: Dict[str, CameraProfile] = {
     "custom": CameraProfile(
         key="custom",
@@ -114,7 +118,6 @@ CAMERA_PROFILES: Dict[str, CameraProfile] = {
             "codec": "mp4",
             "infrared": True,
             "monochrome_output": False,
-            "noise_reduction": "Auto",
             "tuning_file": None,
             "digital_zoom": None,
             "autofocus_mode": "default",
@@ -146,7 +149,6 @@ CAMERA_PROFILES: Dict[str, CameraProfile] = {
             "codec": "mp4",
             "infrared": False,
             "monochrome_output": False,
-            "noise_reduction": "Auto",
             "tuning_file": None,
             "digital_zoom": None,
             "autofocus_mode": "continuous",
