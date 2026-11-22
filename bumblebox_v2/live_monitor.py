@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass
 import json
@@ -33,6 +34,14 @@ class LiveMonitorOptions:
     # The config file this monitor remembers its NoIR switch for. ``None``
     # remembers nothing.
     remember_key: Optional[str] = None
+    # On a Pi with two cameras: True or False starts the monitor showing both
+    # side by side, or only the selected one. ``None`` starts it as it was
+    # last left (remembered for ``box_key``), or with one if never used.
+    both_override: Optional[bool] = None
+    # The first camera's config file, which stands for the whole box.
+    box_key: Optional[str] = None
+    # What to call the selected camera's feed when the box has two.
+    rgb_title: Optional[str] = None
 
     def validate(self) -> None:
         if self.rgb_width <= 0 or self.rgb_height <= 0:
@@ -43,6 +52,24 @@ class LiveMonitorOptions:
             raise ValueError("Live-monitor display FPS must be greater than zero.")
         if self.duration_seconds < 0:
             raise ValueError("Live-monitor duration must be zero or greater.")
+
+
+@dataclass(frozen=True)
+class MonitorCamera:
+    """The other RGB camera of a two-camera Pi, for the side-by-side view."""
+
+    config: dict[str, Any]
+    title: str = "Camera 2"
+    # Whether it is camera 1. Camera 1 is always drawn on the left.
+    first: bool = False
+
+
+# The feed of the camera selected in the main window, and of the other one.
+RGB_STREAM = "rgb"
+OTHER_RGB_STREAM = "rgb2"
+# Two cameras that ask for different tuning files cannot both have theirs:
+# libcamera loads one for the whole program.
+TUNING_CONFLICT = "the two cameras need different tuning files, and one window can load only one"
 
 
 @dataclass(frozen=True)
@@ -190,10 +217,12 @@ class LiveMonitorBackend:
         options: LiveMonitorOptions,
         *,
         status_callback: Optional[MonitorStatusCallback] = None,
+        other_camera: Optional[MonitorCamera] = None,
     ) -> None:
         options.validate()
         self.config = deepcopy(config)
         self.options = options
+        self.other_camera = other_camera
         self.status_callback = status_callback
         self.frame_store = LatestFrameStore()
         self.sensor_names = resolve_local_monitor_sensors(
@@ -216,11 +245,69 @@ class LiveMonitorBackend:
             self.noir = self.recording_noir
         self._rgb_thread: Optional[threading.Thread] = None
         self._rgb_restart = threading.Event()
+        self._sequences: dict[str, int] = {}
+        # Both cameras side by side, on a Pi that has two. Starts as it was
+        # last left; one camera if it has never been used.
+        self.both = False
+        if self.can_show_both:
+            remembered_both = _remembered("both_cameras", options.box_key)
+            if options.both_override is not None:
+                self.both = bool(options.both_override)
+            elif remembered_both is not None:
+                self.both = remembered_both
+
+    @property
+    def can_show_both(self) -> bool:
+        """Whether this Pi has a second RGB camera to show beside the selected one."""
+        return self.other_camera is not None and RGB_STREAM in self.sensor_names
+
+    def rgb_streams(self) -> list[str]:
+        """The RGB feeds being shown now, camera 1 first."""
+        if RGB_STREAM not in self.sensor_names:
+            return []
+        if not (self.both and self.other_camera is not None):
+            return [RGB_STREAM]
+        return [OTHER_RGB_STREAM, RGB_STREAM] if self.other_camera.first else [RGB_STREAM, OTHER_RGB_STREAM]
+
+    def streams(self) -> list[str]:
+        """Every feed being shown now, in display order."""
+        return self.rgb_streams() + [stream for stream in monitor_streams(self.sensor_names) if stream != RGB_STREAM]
+
+    def _rgb_configs(self) -> list[tuple[str, dict[str, Any]]]:
+        configs = {RGB_STREAM: self.config}
+        if self.other_camera is not None:
+            configs[OTHER_RGB_STREAM] = self.other_camera.config
+        return [(stream, configs[stream]) for stream in self.rgb_streams()]
 
     @property
     def tuning_file_is_named(self) -> bool:
         """A tuning file named by hand in the config is used whatever the NoIR switch says."""
         return self.config.get("camera", {}).get("tuning_file") not in (None, "")
+
+    def _restart_rgb(self) -> None:
+        if RGB_STREAM not in self.sensor_names or self.stop_event.is_set():
+            return
+        self._rgb_restart.set()
+        if self._rgb_thread is not None and not self._rgb_thread.is_alive():
+            # The cameras stopped with an error; try again with the new choice.
+            self._launch_rgb()
+
+    def _launch_rgb(self) -> None:
+        streams = (RGB_STREAM, OTHER_RGB_STREAM) if self.other_camera is not None else (RGB_STREAM,)
+        self._launch("rgb", streams, self._run_rgb)
+
+    def set_both(self, enabled: bool) -> None:
+        """Show both cameras side by side, or only the selected one.
+
+        The cameras are closed and opened again: two cameras in one window
+        have to be opened together so that they share one tuning choice.
+        """
+        enabled = bool(enabled) and self.can_show_both
+        if enabled == self.both:
+            return
+        self.both = enabled
+        _remember("both_cameras", self.options.box_key, enabled)
+        self._restart_rgb()
 
     def set_noir(self, enabled: bool) -> None:
         """Switch the monitor's camera between its NoIR and its standard tuning.
@@ -233,12 +320,7 @@ class LiveMonitorBackend:
             return
         self.noir = enabled
         remember_noir(self.options.remember_key, enabled)
-        if "rgb" not in self.sensor_names or self.stop_event.is_set():
-            return
-        self._rgb_restart.set()
-        if self._rgb_thread is not None and not self._rgb_thread.is_alive():
-            # The camera stopped with an error; try again with the new choice.
-            self._launch("rgb", ("rgb",), self._run_rgb)
+        self._restart_rgb()
 
     def _status(self, stream: str, state: str, message: str) -> None:
         if self.status_callback is not None:
@@ -270,7 +352,7 @@ class LiveMonitorBackend:
         if self.threads:
             return
         if "rgb" in self.sensor_names:
-            self._launch("rgb", ("rgb",), self._run_rgb)
+            self._launch_rgb()
         else:
             self._status("rgb", "disabled", "Assigned to another Pi or disabled.")
         if "thermal" in self.sensor_names:
@@ -309,78 +391,136 @@ class LiveMonitorBackend:
         )
 
     def _run_rgb(self) -> None:
+        """Keep the RGB camera, or both of them, open and feeding frames.
+
+        Runs until the monitor closes. A switch that needs the cameras opened
+        differently (NoIR tuning, one camera or both) closes them and goes
+        round again.
+        """
         if bool(self.config.get("runtime", {}).get("use_mock_camera", False)):
             self._run_mock_rgb()
             return
 
-        from .run_engine import _PicameraCaptureSession, _frame_luma, _frame_to_bgr
+        from .camera_select import connected_camera_model
+        from .run_engine import _PicameraCaptureSession
+        from .tuning import resolve_camera_tuning_file
 
-        preview_config = deepcopy(self.config)
-        preview_config.setdefault("camera", {})["width"] = int(self.options.rgb_width)
-        preview_config["camera"]["height"] = int(self.options.rgb_height)
-        preview_config["camera"]["fps_target"] = float(self.options.display_fps)
-        monochrome = bool(preview_config["camera"].get("monochrome_output", False))
-        interval = 1.0 / float(self.options.display_fps)
-        sequence = 0
         while not self.stop_event.is_set():
             self._rgb_restart.clear()
             noir = self.noir
-            # The tuning file is chosen from the recording's own camera
-            # settings, not from the smaller size the monitor opens the camera
-            # at, with this monitor's NoIR switch in place of camera.infrared.
-            tuning_config = deepcopy(self.config)
-            tuning_config.setdefault("camera", {})["infrared"] = noir
-            with _PicameraCaptureSession(preview_config, tuning_config=tuning_config) as session:
-                session.start()
-                tuning = monitor_tuning_label(noir, getattr(session, "resolved_tuning_file", None))
-                self._status(
-                    "rgb",
-                    "live",
-                    f"Live at {self.options.rgb_width} x {self.options.rgb_height}, {tuning}.",
-                )
-                while not self.stop_event.is_set() and not self._rgb_restart.is_set():
-                    frame, metadata = capture_frame_and_metadata(session.picam2)
-                    captured = time.perf_counter()
-                    sequence += 1
-                    # The tuning in use, then the gain and white balance the
-                    # camera is using: the numbers to copy when fixing them on
-                    # the Settings page.
-                    readout = camera_readout(metadata)
-                    self._put(
-                        "rgb",
-                        _frame_to_bgr(frame, monochrome_output=monochrome),
-                        sequence,
-                        captured,
-                        gray=_frame_luma(frame),
-                        info=f"{tuning}  |  {readout}" if readout else tuning,
+            cameras = self._rgb_configs()
+            plans = []
+            for stream, config in cameras:
+                preview_config = deepcopy(config)
+                preview_config.setdefault("camera", {})["width"] = int(self.options.rgb_width)
+                preview_config["camera"]["height"] = int(self.options.rgb_height)
+                preview_config["camera"]["fps_target"] = float(self.options.display_fps)
+                # The tuning file is chosen from the recording's own camera
+                # settings, not from the smaller size the monitor opens the
+                # camera at, with this monitor's NoIR switch in place of
+                # camera.infrared.
+                tuning_config = deepcopy(config)
+                tuning_config.setdefault("camera", {})["infrared"] = noir
+                plans.append((stream, preview_config, tuning_config))
+
+            # One camera chooses its own tuning file. Two share libcamera's
+            # camera manager, which loads one tuning choice for both when it
+            # starts. If both want the same file they get it; if not, each is
+            # left on its own standard tuning, which always fits its sensor.
+            session_options: dict[str, Any] = {}
+            conflict = False
+            if len(plans) > 1:
+                wanted = {
+                    resolve_camera_tuning_file(tuning_config, detected_sensor=connected_camera_model(config))
+                    for (_, config), (_, _, tuning_config) in zip(cameras, plans)
+                }
+                conflict = len(wanted) > 1
+                session_options["tuning_file"] = None if conflict else next(iter(wanted))
+
+            with ExitStack() as stack:
+                workers: list[threading.Thread] = []
+                for stream, preview_config, tuning_config in plans:
+                    try:
+                        session = stack.enter_context(
+                            _PicameraCaptureSession(preview_config, tuning_config=tuning_config, **session_options)
+                        )
+                        session.start()
+                    except Exception as exc:
+                        # One camera that will not open does not take the other with it.
+                        self._status(stream, "error", str(exc))
+                        continue
+                    opened_with = getattr(session, "resolved_tuning_file", None)
+                    if "tuning_file" in session_options:
+                        # The first camera opened decides what the manager loaded.
+                        session_options["tuning_file"] = opened_with
+                    tuning = monitor_tuning_label(noir, opened_with, conflict=conflict)
+                    self._status(
+                        stream,
+                        "live",
+                        f"Live at {self.options.rgb_width} x {self.options.rgb_height}, {tuning}.",
                     )
-                    self.stop_event.wait(interval)
+                    monochrome = bool(preview_config["camera"].get("monochrome_output", False))
+                    worker = threading.Thread(
+                        target=self._feed_rgb,
+                        args=(stream, session, monochrome, tuning),
+                        name=f"bbx-monitor-{stream}-frames",
+                        daemon=True,
+                    )
+                    workers.append(worker)
+                    worker.start()
+                while not self.stop_event.is_set() and not self._rgb_restart.is_set():
+                    self.stop_event.wait(0.05)
+                for worker in workers:
+                    worker.join(timeout=2.0)
             if self._rgb_restart.is_set() and not self.stop_event.is_set():
-                self._status(
-                    "rgb",
-                    "starting",
-                    f"Opening the camera again with NoIR tuning {'on' if self.noir else 'off'}...",
+                for stream in self.rgb_streams():
+                    self._status(stream, "starting", "Opening the camera again...")
+
+    def _feed_rgb(self, stream: str, session: Any, monochrome: bool, tuning: str) -> None:
+        """Pass one open camera's frames to the display until told to stop."""
+        from .run_engine import _frame_luma, _frame_to_bgr
+
+        interval = 1.0 / float(self.options.display_fps)
+        try:
+            while not self.stop_event.is_set() and not self._rgb_restart.is_set():
+                frame, metadata = capture_frame_and_metadata(session.picam2)
+                captured = time.perf_counter()
+                self._sequences[stream] = self._sequences.get(stream, 0) + 1
+                # The tuning in use, then the gain and white balance the
+                # camera is using: the numbers to copy when fixing them on
+                # the Settings page.
+                readout = camera_readout(metadata)
+                self._put(
+                    stream,
+                    _frame_to_bgr(frame, monochrome_output=monochrome),
+                    self._sequences[stream],
+                    captured,
+                    gray=_frame_luma(frame),
+                    info=f"{tuning}  |  {readout}" if readout else tuning,
                 )
+                self.stop_event.wait(interval)
+        except Exception as exc:
+            self._status(stream, "error", str(exc))
 
     def _run_mock_rgb(self) -> None:
         from .run_engine import _frame_luma, _frame_to_bgr
         from .simulated_capture import simulated_rgb_yuv420_frame
 
         interval = 1.0 / float(self.options.display_fps)
-        sequence = 0
         started = time.perf_counter()
-        self._status("rgb", "live", "Simulated RGB stream.")
+        live: set[str] = set()
         while not self.stop_event.is_set():
             captured = time.perf_counter()
-            phase = (captured - started) % 4.0
-            frame = simulated_rgb_yuv420_frame(
-                self.options.rgb_width,
-                self.options.rgb_height,
-                phase,
-                4.0,
-            )
-            sequence += 1
-            self._put("rgb", _frame_to_bgr(frame), sequence, captured, gray=_frame_luma(frame))
+            streams = self.rgb_streams()
+            for stream in streams:
+                if stream not in live:
+                    self._status(stream, "live", "Simulated RGB stream.")
+                # The two simulated cameras are out of step, so they can be told apart.
+                phase = (captured - started + (2.0 if stream == OTHER_RGB_STREAM else 0.0)) % 4.0
+                frame = simulated_rgb_yuv420_frame(self.options.rgb_width, self.options.rgb_height, phase, 4.0)
+                self._sequences[stream] = self._sequences.get(stream, 0) + 1
+                self._put(stream, _frame_to_bgr(frame), self._sequences[stream], captured, gray=_frame_luma(frame))
+            live = set(streams)
             self.stop_event.wait(interval)
 
     def _run_thermal(self) -> None:
@@ -581,6 +721,7 @@ QFrame#VideoCard[fullView="true"] QLabel#VideoSurface { border-radius: 0; paddin
 
 STREAM_TITLES = {
     "rgb": "RGB camera",
+    "rgb2": "Second RGB camera",
     "thermal": "PureThermal / Lepton",
     "realsense_color": "RealSense Color",
     "realsense_depth": "RealSense Depth",
@@ -606,26 +747,36 @@ def _read_monitor_state() -> dict[str, Any]:
     return state if isinstance(state, dict) else {}
 
 
-def remembered_noir(key: Optional[str]) -> Optional[bool]:
-    """Where the NoIR switch was last left for this config file; ``None`` if it was never used."""
+def _remembered(switch: str, key: Optional[str]) -> Optional[bool]:
+    """Where a switch was last left for this config file; ``None`` if it was never used."""
     if not key:
         return None
-    saved = _read_monitor_state().get("noir")
+    saved = _read_monitor_state().get(switch)
     value = saved.get(str(key)) if isinstance(saved, dict) else None
     return value if isinstance(value, bool) else None
 
 
+def remembered_noir(key: Optional[str]) -> Optional[bool]:
+    """Where the NoIR switch was last left for this config file; ``None`` if it was never used."""
+    return _remembered("noir", key)
+
+
 def remember_noir(key: Optional[str], enabled: bool) -> None:
-    """Remember where the NoIR switch was left. Failing to write is not an error: the monitor carries on."""
+    """Remember where the NoIR switch was left."""
+    _remember("noir", key, enabled)
+
+
+def _remember(switch: str, key: Optional[str], enabled: bool) -> None:
+    """Remember where a switch was left. Failing to write is not an error: the monitor carries on."""
     if not key:
         return
     try:
         state = _read_monitor_state()
-        saved = state.get("noir")
+        saved = state.get(switch)
         if not isinstance(saved, dict):
             saved = {}
         saved[str(key)] = bool(enabled)
-        state["noir"] = saved
+        state[switch] = saved
         path = monitor_state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         scratch = path.with_name(f"{path.name}.{os.getpid()}.tmp")
@@ -635,8 +786,10 @@ def remember_noir(key: Optional[str], enabled: bool) -> None:
         pass
 
 
-def monitor_tuning_label(noir: bool, tuning_file: Any) -> str:
+def monitor_tuning_label(noir: bool, tuning_file: Any, conflict: bool = False) -> str:
     """The tuning the monitor's camera was opened with, in a few words."""
+    if conflict and not tuning_file:
+        return f"standard tuning ({TUNING_CONFLICT})"
     if tuning_file:
         name = Path(str(tuning_file)).name
         if name.endswith("_noir.json"):
@@ -671,7 +824,7 @@ PREVIEW_ONLY_NOTE = (
 
 # Feeds that are real colour images. Thermal and depth are drawn with a false
 # colour scale that carries the measurement, so the grayscale view leaves them.
-COLOUR_STREAMS = {"rgb", "realsense_color"}
+COLOUR_STREAMS = {"rgb", "rgb2", "realsense_color"}
 
 
 # The contrast boost is the one the tag detector applies before it looks for
@@ -725,15 +878,23 @@ def monitor_streams(sensor_names: set[str]) -> list[str]:
     return streams
 
 
-def monitor_grid(count: int) -> list[tuple[int, int, int, int]]:
+def monitor_grid(count: int, pair_first: bool = False) -> list[tuple[int, int, int, int]]:
     """Where each of ``count`` feeds goes: (row, column, rows spanned, columns spanned).
 
     One feed fills the window; two sit side by side; with three the first is
     large on the left and the other two are stacked beside it; four make a
     2 x 2 grid.
+
+    ``pair_first`` is for two cameras shown together: the first two feeds
+    share the top row, each half the width, and the rest sit in a row below.
     """
     if count <= 0:
         return []
+    if pair_first and count > 2:
+        below = count - 2
+        cells = [(0, 0, 1, below), (0, below, 1, below)]
+        cells.extend((1, 2 * index, 1, 2) for index in range(below))
+        return cells
     if count == 1:
         return [(0, 0, 1, 1)]
     if count == 2:
@@ -757,14 +918,16 @@ def rgb_stream_title(config: dict[str, Any]) -> str:
     return STREAM_TITLES["rgb"]
 
 
-def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptions) -> Any:
+def create_live_monitor_window(
+    config: dict[str, Any], options: LiveMonitorOptions, other_camera: Optional[MonitorCamera] = None
+) -> Any:
     """Build the monitor window. A ``QApplication`` must already exist.
 
     The monitor only looks: it saves no images and changes no settings.
     """
     options.validate()
     try:
-        from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
+        from PyQt5.QtCore import QObject, QSize, Qt, QTimer, pyqtSignal
         from PyQt5.QtGui import QImage, QPixmap
         from PyQt5.QtWidgets import (
             QFrame,
@@ -798,6 +961,23 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             self._gray: Any = None
             self._grayscale = False
             self._contrast_boost = False
+
+        def sizeHint(self) -> Any:
+            # A fixed request rather than the size of the picture last shown.
+            # The layout decides how large the picture is drawn; a label that
+            # asked for its picture's size would take the room that lets the
+            # rows of the grid be given different shares.
+            return QSize(300, 210)
+
+        def minimumSizeHint(self) -> Any:
+            return QSize(300, 210)
+
+        def forget(self) -> None:
+            """Drop the picture being shown, so an old frame is not left on screen."""
+            self._source = None
+            self._frame = None
+            self._gray = None
+            self.clear()
 
         def set_grayscale(self, enabled: bool) -> None:
             """Draw in grayscale or colour. Redraws the frame on screen, so it works while paused."""
@@ -893,6 +1073,17 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             self.dimensions: Optional[tuple[int, int]] = None
             self.info = ""
 
+        def reset(self) -> None:
+            """Back to how the panel is before its camera has delivered anything."""
+            self.surface.forget()
+            self.last_captured = None
+            self.frame_times.clear()
+            self.dimensions = None
+            self.info = ""
+            self.state = "starting"
+            self.message = "Starting camera..."
+            self.refresh_status()
+
         def set_full_view(self, enabled: bool) -> None:
             """Restyle for filling the screen: dark surround, no card border, a way back."""
             self.setProperty("fullView", "true" if enabled else "false")
@@ -952,9 +1143,11 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
                 status_callback=lambda stream, state, message: self.bridge.status.emit(
                     stream, state, message
                 ),
+                other_camera=other_camera,
             )
             # Only the feeds this setup uses get a panel.
-            self.streams = monitor_streams(self.backend.sensor_names)
+            self.streams = self.backend.streams()
+            self.both = self.backend.both
             self.resize(1420 if len(self.streams) > 1 else 1100, 900)
             self.paused = False
             self.grayscale_view = False
@@ -986,14 +1179,11 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             title_col = QVBoxLayout()
             title = QLabel("Live Camera Monitor")
             title.setObjectName("MonitorTitle")
-            feeds = len(self.streams)
-            showing = "no camera feeds" if not feeds else "1 camera feed" if feeds == 1 else f"{feeds} camera feeds"
-            subtitle = QLabel(
-                f"Showing {showing} for this setup. RGB preview {options.rgb_width} x {options.rgb_height}; "
-                f"display capped at {options.display_fps:g} FPS. Double-click a feed for full screen."
-            )
+            subtitle = QLabel()
             subtitle.setObjectName("MonitorSubtitle")
             subtitle.setWordWrap(True)
+            self.subtitle = subtitle
+            self._update_subtitle()
             title_col.addWidget(title)
             title_col.addWidget(subtitle)
             header_layout.addLayout(title_col, 1)
@@ -1029,17 +1219,28 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
                 self.noir_button.setToolTip(
                     "Open the camera with its NoIR tuning (for a camera with no infrared filter) or with "
                     "its standard tuning. The camera closes and opens again, which takes a few seconds. "
-                    "This only changes what you see here, and the monitor opens with it where you last "
-                    "left it. Recordings follow Infrared light on the Settings page of the main window. "
-                    "Shortcut: N."
+                    "With both cameras shown it applies to both. This only changes what you see here, and "
+                    "the monitor opens with it where you last left it. Recordings follow Infrared light on "
+                    "the Settings page of the main window. Shortcut: N."
                 )
             self.noir_button.toggled.connect(self.set_noir)
             self.noir_button.setVisible("rgb" in self.streams)
+            self.both_button = QPushButton("Both Cameras")
+            self.both_button.setCheckable(True)
+            self.both_button.setChecked(self.both)
+            self.both_button.setToolTip(
+                "Show the two cameras side by side, or only the one selected in the main window. "
+                "The cameras close and open again, which takes a few seconds. The monitor opens with "
+                "this where you last left it. Shortcut: B."
+            )
+            self.both_button.toggled.connect(self.set_both)
+            self.both_button.setVisible(self.backend.can_show_both)
             self.pause_button = QPushButton("Pause Display")
             self.pause_button.clicked.connect(self._toggle_pause)
             close_button = QPushButton("Close Monitor")
             close_button.setObjectName("CloseButton")
             close_button.clicked.connect(self.close)
+            header_layout.addWidget(self.both_button)
             header_layout.addWidget(self.noir_button)
             header_layout.addWidget(self.gray_view_button)
             header_layout.addWidget(self.boost_button)
@@ -1057,9 +1258,16 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             grid = QGridLayout()
             grid.setSpacing(12)
             self.grid = grid
-            titles = dict(STREAM_TITLES, rgb=rgb_stream_title(config))
+            titles = dict(STREAM_TITLES, rgb=options.rgb_title or rgb_stream_title(config))
+            # The second camera has a panel from the start, out of sight until
+            # Both Cameras is switched on.
+            panel_streams = list(self.streams)
+            if self.backend.can_show_both:
+                titles[OTHER_RGB_STREAM] = other_camera.title
+                if OTHER_RGB_STREAM not in panel_streams:
+                    panel_streams.append(OTHER_RGB_STREAM)
             self.panels = {
-                stream: VideoPanel(titles[stream], nearest=(stream == "thermal")) for stream in self.streams
+                stream: VideoPanel(titles[stream], nearest=(stream == "thermal")) for stream in panel_streams
             }
             for stream, panel in self.panels.items():
                 panel.full_view_requested.connect(lambda selected=stream: self.toggle_full_view(selected))
@@ -1078,23 +1286,36 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             for panel in self.panels.values():
                 self.grid.removeWidget(panel)
                 panel.setVisible(False)
-            for index in range(2):
+            for index in range(max(2, self.grid.rowCount())):
                 self.grid.setRowStretch(index, 0)
+            for index in range(max(2, self.grid.columnCount())):
                 self.grid.setColumnStretch(index, 0)
-            for stream, (row, column, row_span, column_span) in zip(streams, monitor_grid(len(streams))):
+            # Two cameras shown together share the top row and get most of the height.
+            pair = len([stream for stream in streams if stream in (RGB_STREAM, OTHER_RGB_STREAM)]) == 2
+            cells = monitor_grid(len(streams), pair_first=pair)
+            for stream, (row, column, row_span, column_span) in zip(streams, cells):
                 panel = self.panels[stream]
                 self.grid.addWidget(panel, row, column, row_span, column_span)
                 panel.setVisible(True)
                 for used_row in range(row, row + row_span):
-                    self.grid.setRowStretch(used_row, 1)
+                    self.grid.setRowStretch(used_row, 2 if pair and used_row == 0 and len(streams) > 2 else 1)
                 for used_column in range(column, column + column_span):
                     self.grid.setColumnStretch(used_column, 1)
+
+        def _update_subtitle(self) -> None:
+            feeds = len(self.streams)
+            showing = "no camera feeds" if not feeds else "1 camera feed" if feeds == 1 else f"{feeds} camera feeds"
+            self.subtitle.setText(
+                f"Showing {showing} for this setup. RGB preview {options.rgb_width} x {options.rgb_height}; "
+                f"display capped at {options.display_fps:g} FPS. Double-click a feed for full screen."
+            )
 
         def _label_toggles(self) -> None:
             # The state is in the words as well as the colour.
             self.gray_view_button.setText(f"Grayscale View: {'On' if self.grayscale_view else 'Off'}")
             self.boost_button.setText(f"Contrast Boost: {'On' if self.contrast_boost else 'Off'}")
             self.noir_button.setText(f"NoIR Tuning: {'On' if self.noir else 'Off'}")
+            self.both_button.setText(f"Both Cameras: {'On' if self.both else 'Off'}")
             # Say so when the picture here is not built the way a recording's is.
             text = PREVIEW_ONLY_NOTE
             if "rgb" in self.streams and not self.backend.tuning_file_is_named and self.noir != self.backend.recording_noir:
@@ -1127,6 +1348,27 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             if not self.grayscale_view:
                 self.contrast_boost = False  # the boost is a grayscale view
             self._apply_view()
+
+        def set_both(self, enabled: bool) -> None:
+            """Show the two cameras side by side, or only the selected one."""
+            self.backend.set_both(enabled)
+            self.both = self.backend.both
+            if self.both_button.isChecked() != self.both:
+                self.both_button.blockSignals(True)
+                self.both_button.setChecked(self.both)
+                self.both_button.blockSignals(False)
+            streams = self.backend.streams()
+            if self.full_view is not None and self.full_view not in streams:
+                self.exit_full_view()
+            for stream in (RGB_STREAM, OTHER_RGB_STREAM):
+                # The cameras are being opened again: no old frame is left showing.
+                if stream in self.panels:
+                    self.panels[stream].reset()
+            self.streams = streams
+            if self.full_view is None:
+                self._arrange(self.streams)
+            self._update_subtitle()
+            self._label_toggles()
 
         def set_noir(self, enabled: bool) -> None:
             """Open the camera with its NoIR or its standard tuning. Changes this monitor only."""
@@ -1207,6 +1449,9 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             if event.key() == Qt.Key_N and not self.noir_button.isHidden() and self.noir_button.isEnabled():
                 self.set_noir(not self.noir)
                 return
+            if event.key() == Qt.Key_B and self.backend.can_show_both:
+                self.set_both(not self.both)
+                return
             super().keyPressEvent(event)
 
         def _set_status(self, stream: str, state: str, message: str) -> None:
@@ -1236,7 +1481,9 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
     return LiveMonitorWindow()
 
 
-def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> int:
+def launch_live_monitor(
+    config: dict[str, Any], options: LiveMonitorOptions, other_camera: Optional[MonitorCamera] = None
+) -> int:
     options.validate()
     from .qt_env import sanitize_current_qt_env
 
@@ -1269,7 +1516,7 @@ def launch_live_monitor(config: dict[str, Any], options: LiveMonitorOptions) -> 
         )
         return 1
     app._bumblebox_live_monitor_lock = lock
-    window = create_live_monitor_window(config, options)
+    window = create_live_monitor_window(config, options, other_camera)
     window.show()
     if options.duration_seconds > 0:
         QTimer.singleShot(int(round(options.duration_seconds * 1000.0)), window.close)

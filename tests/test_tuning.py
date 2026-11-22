@@ -452,6 +452,18 @@ class CameraSessionTests(unittest.TestCase):
         self.assertEqual(len(session.tuning_notes), 1)
         self.assertNotIn("tuning", fake.call_args.kwargs)
 
+    def test_a_tuning_file_handed_in_is_used_as_it_is(self) -> None:
+        # The live monitor does this when it shows two cameras, which share one choice.
+        config = config_with(model="hq", infrared=True)
+        session, Picamera2 = self.session(config, tuning_file=None)
+        self.assertIsNone(session.resolved_tuning_file)  # its own standard tuning, whatever the config says
+        Picamera2.load_tuning_file.assert_not_called()
+        self.assertNotIn("tuning", Picamera2.call_args.kwargs)
+
+        session, Picamera2 = self.session(config_with(model="hq", infrared=False), tuning_file="imx477_noir.json")
+        self.assertEqual(session.resolved_tuning_file, "imx477_noir.json")
+        Picamera2.load_tuning_file.assert_called_once_with("imx477_noir.json")
+
     def test_the_monitors_choice_is_separate_from_the_recordings(self) -> None:
         recording = config_with(model="auto", infrared=True)
         preview = deepcopy(recording)

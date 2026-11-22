@@ -30,6 +30,7 @@ Useful overrides:
 ./bbx live-monitor --no-realsense
 ./bbx live-monitor --thermal --realsense
 ./bbx live-monitor --no-noir
+./bbx live-monitor --both-cameras
 ./bbx live-monitor --seconds 30
 ./bbx live-monitor --mock --seconds 10
 ```
@@ -53,7 +54,38 @@ The monitor shows only the feeds this setup uses:
 A sensor that is switched off, or assigned to another Pi in two-Pi capture,
 gets no panel. `--thermal`, `--no-thermal`, `--realsense` and `--no-realsense`
 change this for one session. On a Pi with two RGB cameras, the monitor shows
-the camera that is selected in the GUI.
+the camera that is selected in the GUI, or both (next section).
+
+## Two Cameras Side by Side
+
+On a Pi with a second camera set up, the header has a **Both Cameras** button
+(**B** toggles it).
+
+- **Off** shows the camera selected in the main window. **On** shows both,
+  camera 1 on the left and camera 2 on the right, each under its own name
+  ("Camera 1 (colony 01)").
+- Switching it closes the cameras and opens them again, which takes a few
+  seconds.
+- The monitor opens the way it was last left. `--both-cameras` and
+  `--one-camera` start it one way for a single session.
+- Each camera keeps its own picture settings, and its own line under the
+  picture with its tuning file, sensor gain and white balance.
+- Grayscale View and Contrast Boost apply to both. Either camera can fill
+  the screen: double-click it or press its **Full Screen** button.
+- If one camera cannot be opened, its panel says why and the other keeps
+  running.
+- With a thermal or depth camera as well, the two cameras share the top row
+  and the other feeds sit in a row below.
+
+**NoIR Tuning applies to both cameras at once.** libcamera loads one tuning
+choice for the whole program, so two cameras in one window cannot differ. If
+the two need different tuning files (two different camera models, or a file
+named by hand for one of them), both are opened with their own standard
+tuning and the line under each picture says so. To see such a camera with its
+own tuning file, switch Both Cameras off.
+
+Not yet tried on a Raspberry Pi: two cameras open at once in this window, and
+the frame rate the display reaches with two.
 
 The line under the RGB camera's picture also shows the tuning file the camera
 was opened with, then the sensor gain and white balance it is using. Those

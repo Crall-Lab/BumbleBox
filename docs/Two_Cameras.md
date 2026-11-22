@@ -160,5 +160,7 @@ exactly as before.
 - Frames from the two cameras are not synchronised.
 - `bbx export-bundle` and `bbx fps-sweep` pick the newest run in the data
   folder, which may be either camera's when they share it.
-- The live monitor shows one camera at a time (the one picked in the GUI).
+- The live monitor shows the camera picked in the GUI, or both side by side
+  with its **Both Cameras** button. With both shown they share one NoIR
+  tuning choice (`docs/Live_Camera_Monitor.md`).
 - More than two cameras are not supported.

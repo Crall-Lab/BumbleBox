@@ -608,14 +608,29 @@ def _capture_frames_from_started_picamera(
     return frames, timestamps, actual_fps, timestamp_records
 
 
+# "Choose the tuning file from the config", as opposed to a file handed in.
+_CHOOSE_TUNING_FILE: Any = object()
+
+
 class _PicameraCaptureSession:
-    def __init__(self, config: Dict[str, Any], *, tuning_config: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        *,
+        tuning_config: Optional[Dict[str, Any]] = None,
+        tuning_file: Any = _CHOOSE_TUNING_FILE,
+    ) -> None:
         """Open the camera ``config`` describes.
 
         ``tuning_config`` is the config whose camera section chooses the tuning
         file, when that is not ``config`` itself: the live monitor opens the
         camera at a smaller size than a recording does, and has its own NoIR
         switch.
+
+        ``tuning_file`` skips the choosing: the camera is opened with exactly
+        that file, or with its own standard tuning for ``None``. The live
+        monitor uses it when it shows two cameras, which have to share one
+        choice.
         """
         self.config = config
         try:
@@ -638,10 +653,13 @@ class _PicameraCaptureSession:
         # Ask the camera which sensor it is, so the right tuning file is found
         # whatever camera.model says and whatever size is being captured.
         self.detected_sensor = selected_camera_model(config, Picamera2)
-        self.resolved_tuning_file = resolve_camera_tuning_file(
-            tuning_config if tuning_config is not None else config,
-            detected_sensor=self.detected_sensor,
-        )
+        if tuning_file is not _CHOOSE_TUNING_FILE:
+            self.resolved_tuning_file = str(tuning_file) if tuning_file else None
+        else:
+            self.resolved_tuning_file = resolve_camera_tuning_file(
+                tuning_config if tuning_config is not None else config,
+                detected_sensor=self.detected_sensor,
+            )
         self.tuning_notes: list[str] = []
         self.autofocus_notes: list[str] = []
         self.picam2 = self._open_and_configure()

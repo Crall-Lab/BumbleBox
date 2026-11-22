@@ -74,6 +74,12 @@ See `docs/RealSense_Camera.md` for hardware validation and `docs/Multimodal_Cali
       manager that listing the cameras starts, and search only this Pi's
       tuning folder (`pisp` on a Pi 5, `vc4` on a Pi 4). See
       `docs/Frame_Processing.md`.
+- [x] Show both cameras of a two-camera Pi side by side in the live monitor
+      (**Both Cameras** button, key B, `--both-cameras`), remembered per box.
+      See `docs/Live_Camera_Monitor.md`.
+- [ ] On a Pi 5 with two cameras: open both in the monitor, switch between
+      one and both, switch NoIR Tuning with both shown, and note the display
+      frame rate.
 - [ ] On a Pi: confirm the NoIR file takes effect (the picture and the white
       balance numbers change when NoIR Tuning is switched in the monitor), on
       a Pi 4 and a Pi 5, and that recordings open the camera as before.

@@ -142,6 +142,7 @@ from .multi_camera import (
     create_second_camera,
     load_cameras,
     pin_cameras,
+    primary_config_path,
     remove_second_camera,
     schedules_match,
 )
@@ -846,6 +847,25 @@ def _cmd_live_monitor(args: argparse.Namespace) -> int:
     if bool(args.mock):
         config.setdefault("runtime", {})["use_mock_camera"] = True
 
+    # On a Pi with two cameras, the other camera's config is handed over too,
+    # so the monitor can show both side by side.
+    other_camera = None
+    rgb_title = None
+    primary_path = primary_config_path(config_path)
+    try:
+        from .live_monitor import MonitorCamera
+
+        cameras = load_cameras(primary_path, config if primary_path == config_path else None)
+        if len(cameras) == 2:
+            selected = next((entry for entry in cameras if entry.path == config_path), cameras[0])
+            other = next(entry for entry in cameras if entry is not selected)
+            rgb_title = selected.long_label
+            other_camera = MonitorCamera(
+                config=apply_camera_profile(other.config), title=other.long_label, first=other.index == 1
+            )
+    except Exception as exc:
+        print(f"Note: the other camera's config could not be read, so only one camera is shown: {exc}")
+
     try:
         from .live_monitor import LiveMonitorOptions, launch_live_monitor
 
@@ -859,8 +879,11 @@ def _cmd_live_monitor(args: argparse.Namespace) -> int:
             noir_override=getattr(args, "noir", None),
             # The simulated camera has no tuning, so it leaves the remembered choice alone.
             remember_key=None if bool(args.mock) else str(config_path.expanduser().resolve()),
+            both_override=getattr(args, "both_cameras", None),
+            box_key=None if bool(args.mock) else str(primary_path.expanduser().resolve()),
+            rgb_title=rgb_title,
         )
-        return launch_live_monitor(config, options)
+        return launch_live_monitor(config, options, other_camera)
     except Exception as exc:
         print(f"Live camera monitor failed: {exc}")
         return 1
@@ -4645,7 +4668,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     live_monitor_parser = subparsers.add_parser(
         "live-monitor",
-        help="Open a non-recording four-panel RGB, thermal, and RealSense monitor.",
+        help="Open a non-recording monitor of this Pi's cameras: RGB (one or both), thermal and RealSense.",
     )
     _add_common_config_arg(live_monitor_parser)
     live_monitor_parser.add_argument(
@@ -4714,6 +4737,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start the monitor with NoIR camera tuning off, whatever camera.infrared says.",
     )
     live_monitor_parser.set_defaults(noir=None)
+    both_monitor_group = live_monitor_parser.add_mutually_exclusive_group()
+    both_monitor_group.add_argument(
+        "--both-cameras",
+        dest="both_cameras",
+        action="store_true",
+        help="On a Pi with two cameras, start with both shown side by side.",
+    )
+    both_monitor_group.add_argument(
+        "--one-camera",
+        dest="both_cameras",
+        action="store_false",
+        help="On a Pi with two cameras, start with only this config's camera shown.",
+    )
+    live_monitor_parser.set_defaults(both_cameras=None)
     live_monitor_parser.add_argument(
         "--mock",
         action="store_true",

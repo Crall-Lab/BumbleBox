@@ -86,6 +86,21 @@ def has_second_camera(primary_path: str | Path) -> bool:
     return second_camera_config_path(primary_path).is_file()
 
 
+def primary_config_path(config_path: str | Path) -> Path:
+    """The first camera's config file, given the config file of either camera.
+
+    ``config.camera2.yaml`` -> ``config.yaml`` when that file is there; any
+    other path is its own first camera.
+    """
+    path = Path(config_path)
+    marker = f".{SECOND_CAMERA_FILE_PART}"
+    if path.stem.endswith(marker):
+        candidate = path.with_name(path.stem[: -len(marker)] + path.suffix)
+        if candidate.is_file():
+            return candidate
+    return path
+
+
 def load_cameras(primary_path: str | Path, primary_config: Optional[Dict[str, Any]] = None) -> List[CameraEntry]:
     """The camera configs of this box: one entry, or two when a second camera is set up."""
     primary_path = Path(primary_path)
