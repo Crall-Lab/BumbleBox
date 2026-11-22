@@ -23,12 +23,12 @@ from .camera_profiles import (
     apply_camera_profile,
     configured_profile_name,
     get_camera_model_info,
-    validate_camera_ir_compatibility,
+    infrared_filter_note,
 )
 from .qt_env import sanitize_current_qt_env
-from .camera_select import picamera2_camera_kwargs
+from .camera_select import picamera2_camera_kwargs, selected_camera_model
 from .image_controls import apply_image_controls
-from .tuning import inspect_camera_tuning_resolution, resolve_camera_tuning_file
+from .tuning import inspect_camera_tuning_resolution, open_picamera2, resolve_camera_tuning_file
 
 
 PREVIEW_WINDOWS = {"QTGL", "QT", "DRM"}
@@ -105,8 +105,6 @@ class CameraCheckResult:
     resolved_tuning_file: Optional[str]
     tuning_source: str
     tuning_resolved_path: Optional[str]
-    model_supports_infrared: Optional[bool]
-    ir_compatibility_error: Optional[str]
     picamera2_available: bool
     detected_cameras: list[dict[str, Any]]
     opened_camera_properties: dict[str, Any]
@@ -278,8 +276,10 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
     camera_model = str(camera_cfg.get("model", "auto"))
     model_info = get_camera_model_info(camera_model)
     tuning_info = inspect_camera_tuning_resolution(config)
-    ir_error = validate_camera_ir_compatibility(config)
     notes: list[str] = []
+    filter_note = infrared_filter_note(config)
+    if filter_note:
+        notes.append(filter_note)
     detected_cameras: list[dict[str, Any]] = []
     opened_camera_properties: dict[str, Any] = {}
     sensor_modes: list[dict[str, Any]] = []
@@ -304,13 +304,13 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
             notes.append(f"Could not read Picamera2.global_camera_info(): {exc}")
 
         try:
-            resolved_tuning_file = tuning_info.get("resolved")
+            # Now that the camera can be asked which sensor it is, choose the
+            # tuning file the way a recording does.
+            tuning_info = inspect_camera_tuning_resolution(
+                config, detected_sensor=selected_camera_model(config, Picamera2)
+            )
             camera_kwargs = picamera2_camera_kwargs(config, Picamera2)
-            if resolved_tuning_file:
-                tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
-                picam2 = Picamera2(tuning=tuning, **camera_kwargs)
-            else:
-                picam2 = Picamera2(**camera_kwargs)
+            picam2 = open_picamera2(Picamera2, tuning_info.get("resolved"), camera_kwargs)
             properties = getattr(picam2, "camera_properties", {})
             if isinstance(properties, dict):
                 opened_camera_properties = _jsonable(properties)
@@ -380,8 +380,6 @@ def run_camera_check(config: dict[str, Any]) -> CameraCheckResult:
         resolved_tuning_file=tuning_info.get("resolved"),
         tuning_source=str(tuning_info.get("source", "default")),
         tuning_resolved_path=tuning_info.get("resolved_path"),
-        model_supports_infrared=(model_info.supports_infrared if model_info is not None else None),
-        ir_compatibility_error=ir_error,
         picamera2_available=picamera2_available,
         detected_cameras=detected_cameras,
         opened_camera_properties=opened_camera_properties,
@@ -418,7 +416,6 @@ def format_camera_check_result(result: CameraCheckResult) -> str:
             "Autofocus controls advertised: "
             + (", ".join(result.autofocus_controls_available) or "none reported")
         ),
-        f"Model supports IR: {result.model_supports_infrared if result.model_supports_infrared is not None else 'unknown'}",
         f"Tuning source: {result.tuning_source}",
         f"Resolved tuning file: {result.resolved_tuning_file or 'default'}",
         f"Resolved tuning path: {result.tuning_resolved_path or 'none'}",
@@ -427,8 +424,6 @@ def format_camera_check_result(result: CameraCheckResult) -> str:
         f"Sensor modes reported: {len(result.sensor_modes)}",
         f"Connection status: {result.connection_status}",
     ]
-    if result.ir_compatibility_error:
-        lines.extend(["", "Errors", "------", f"- {result.ir_compatibility_error}"])
     if result.detected_cameras:
         lines.extend(["", "Detected Camera Info", "--------------------"])
         for idx, camera_info in enumerate(result.detected_cameras):
@@ -509,10 +504,7 @@ def _open_picamera2(
 
         try:
             camera_kwargs = picamera2_camera_kwargs(config, Picamera2)
-            if resolved_tuning_file:
-                tuning = Picamera2.load_tuning_file(str(resolved_tuning_file))
-                return Picamera2(tuning=tuning, **camera_kwargs)
-            return Picamera2(**camera_kwargs)
+            return open_picamera2(Picamera2, resolved_tuning_file, camera_kwargs)
         except IndexError as exc:
             raise RuntimeError(
                 "No camera detected by picamera2/libcamera (IndexError during camera open). "
@@ -527,7 +519,9 @@ def _open_picamera2(
                 ) from exc
             raise RuntimeError(f"Failed to open camera: {exc}") from exc
 
-    resolved_tuning_file = resolve_camera_tuning_file(config)
+    resolved_tuning_file = resolve_camera_tuning_file(
+        config, detected_sensor=selected_camera_model(config, Picamera2)
+    )
     picam2 = _construct_picamera2(resolved_tuning_file)
     try:
         from libcamera import controls
@@ -615,9 +609,6 @@ def run_camera_preview(
     height: Optional[int] = None,
 ) -> CameraPreviewResult:
     config = apply_camera_profile(config)
-    ir_error = validate_camera_ir_compatibility(config)
-    if ir_error:
-        raise ValueError(ir_error)
 
     if preview_seconds <= 0:
         raise ValueError("preview_seconds must be > 0")
@@ -737,9 +728,6 @@ def run_camera_tracking_test(
     window_title: str = "BumbleBox Live Tracking Test (ESC to stop)",
 ) -> CameraTrackingTestResult:
     config = apply_camera_profile(config)
-    ir_error = validate_camera_ir_compatibility(config)
-    if ir_error:
-        raise ValueError(ir_error)
 
     if test_seconds <= 0:
         raise ValueError("test_seconds must be > 0")

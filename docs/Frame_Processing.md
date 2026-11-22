@@ -22,7 +22,7 @@ at half size in each direction.
 | Exposure time | Fixed at `camera.shutter_us` | Set by BumbleBox |
 | Sensor gain | Automatic, unless `camera.analogue_gain` fixes it | The camera's auto-exposure adjusts it |
 | White balance | Automatic, unless `camera.colour_gains` fixes it | The camera estimates it from the picture |
-| Tuning file | The NoIR file when `camera.infrared` is true | `camera.tuning_file`, or chosen from the camera model |
+| Tuning file | The connected camera's NoIR file when `camera.infrared` is true, its standard file otherwise | **Infrared light** on the Settings page; `camera.tuning_file` names a file by hand |
 | Colour | Switched off in the camera when recording in grayscale | `Saturation: 0` |
 
 What the camera does with gain, white balance, the tuning file and `Saturation`
@@ -122,11 +122,67 @@ group of the Settings page; all can be set in the config.
 | `camera.shutter_us` | `ExposureTime` | Exposure time in microseconds |
 | `camera.monochrome_output` | `Saturation` 0 | Grayscale recording |
 | `camera.digital_zoom` | `ScalerCrop` | Record part of the sensor |
-| `camera.tuning_file`, `camera.infrared` | tuning file | How the camera builds the picture from the sensor |
+| `camera.infrared` | tuning file | **Infrared light** on the Settings page: the camera's NoIR tuning file, or its standard one |
+| `camera.tuning_file` | tuning file | A tuning file named by hand, used whatever `camera.infrared` says |
 
 A new setup sends one of the first four: `HighQuality` noise reduction. A
 control a camera does not offer is reported in the run's output and the
 others are still applied.
+
+### Infrared light and the tuning file
+
+A tuning file tells the camera how to build a picture from the sensor: white
+balance, colour, lens shading. Raspberry Pi supplies two for most sensors,
+for example `imx477.json` and `imx477_noir.json` for the HQ camera. The NoIR
+file is for a camera with no infrared filter: one sold as NoIR, or an
+ordinary one with its filter taken off.
+
+- **Infrared light** in the Picture group of the Settings page is
+  `camera.infrared`. Ticked, the camera is opened with its NoIR file;
+  unticked, with its standard file. A new setup has it ticked.
+- **It does not depend on the camera model.** `camera.model: "hq"` with
+  Infrared light ticked uses `imx477_noir.json`. Models sold with a filter
+  (Camera Module 3 Standard and Wide, OwlSight) are no longer refused; the
+  camera check adds a reminder that NoIR tuning suits them only with the
+  filter removed.
+- **The camera says which sensor it is.** When the camera is opened it is
+  asked for its sensor name, and that picks the file. `camera.model` can stay
+  on `auto`, and the size being captured no longer matters. Without a camera
+  to ask, the model and then the recording size are used as before.
+- **A camera with no NoIR file** (the OwlSight, for one) is opened with its
+  standard tuning. The health check warns about this; the recording is not
+  refused.
+- **A tuning file the camera will not open with** does not stop a recording
+  either. The camera is opened again with its standard tuning, the run's
+  output says "could not be opened with tuning file", and the run summary
+  shows `Resolved tuning file: default`.
+- **The named camera profiles set it.** HQ Reference switches it on, OwlSight
+  Reference off, and the checkbox is locked under either until **Use Custom
+  Camera Settings** is pressed.
+- **The live monitor has its own switch**, NoIR Tuning. It follows this
+  setting until it is used, and after that stays where it was last left
+  (`docs/Live_Camera_Monitor.md`).
+
+Three faults in how the tuning file reached the camera were corrected in
+November 2026:
+
+1. **The file was probably not used at all.** libcamera chooses a camera's
+   tuning file when its camera manager starts, and the manager starts the
+   first time the cameras are listed. BumbleBox lists the cameras before
+   opening one, and Picamera2 (0.3.39) keeps that manager, so the file named
+   at opening time arrived too late. The manager is now let go before the
+   camera is opened. This comes from reading the Picamera2 and libcamera
+   source; it has not been seen on a Pi. An older Picamera2 that does not keep
+   the manager would not have had the fault.
+2. **The live monitor chose no file** when `camera.model` was `auto`, because
+   it opens the camera at 1920 x 1440 and the file was guessed from the size.
+3. **A Pi 4 could be handed a Pi 5 file.** Both folders (`pisp` for the Pi 5,
+   `vc4` for earlier ones) are installed on a Pi, and the Pi 5 folder was
+   searched first. Only the folder for the Pi in use is searched now.
+
+If the first fault was real on a box, its recordings so far were made with
+the standard tuning even with `infrared: true`, and recordings from now on
+will be balanced differently. To keep the earlier look, untick Infrared light.
 
 ### Noise reduction
 
@@ -203,3 +259,8 @@ ranges (`picam2.camera_controls`):
 - That fixed gain, fixed white balance, contrast and each noise reduction mode
   are accepted by the cameras in use, and what they do to file size and tag
   detection.
+- That the NoIR tuning file takes effect: with the live monitor open, switch
+  NoIR Tuning off and on, and watch the picture and the white balance numbers
+  under it change. On a Pi 4 and a Pi 5.
+- That recordings, the preview and the camera check still open the camera
+  after the change to how it is opened.

@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -518,6 +519,353 @@ class MonitorGrayscaleTests(unittest.TestCase):
         self.assertEqual(list(window.panels), ["thermal"])
         self.assertTrue(window.gray_view_button.isHidden())
         self.assertTrue(window.boost_button.isHidden())
+
+
+
+class FakeCameraSession:
+    """Stands in for the camera session: records how each opening chose its tuning."""
+
+    openings: list = []
+
+    def __init__(self, config, *, tuning_config=None) -> None:
+        from bumblebox_v2.tuning import resolve_camera_tuning_file
+
+        self.size = (config["camera"]["width"], config["camera"]["height"])
+        # No camera to ask here, so the file comes from the config alone.
+        self.resolved_tuning_file = resolve_camera_tuning_file(tuning_config if tuning_config is not None else config)
+        self.picam2 = self
+        self.closed = False
+        FakeCameraSession.openings.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.closed = True
+
+    def start(self) -> None:
+        pass
+
+    def capture_array(self):
+        from bumblebox_v2.simulated_capture import simulated_rgb_yuv420_frame
+
+        return simulated_rgb_yuv420_frame(self.size[0], self.size[1], 0.0, 4.0)
+
+
+class MonitorNoirBackendTests(unittest.TestCase):
+    """The monitor's own NoIR switch reopens its camera; recordings are not touched."""
+
+    def setUp(self) -> None:
+        FakeCameraSession.openings = []
+        patcher = mock.patch("bumblebox_v2.run_engine._PicameraCaptureSession", FakeCameraSession)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.statuses: list[tuple[str, str, str]] = []
+
+    def backend(self, configure=None, **options) -> LiveMonitorBackend:
+        config = load_defaults()
+        if configure is not None:
+            configure(config)
+        self.config = config
+        backend = LiveMonitorBackend(
+            config,
+            LiveMonitorOptions(rgb_width=64, rgb_height=48, display_fps=50.0, **options),
+            status_callback=lambda *args: self.statuses.append(args),
+        )
+        self.addCleanup(backend.stop)
+        return backend
+
+    def wait(self, until, timeout: float = 3.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not until():
+            if time.monotonic() > deadline:
+                self.fail("timed out waiting for the monitor's camera")
+            time.sleep(0.01)
+
+    def test_the_monitor_uses_the_recordings_tuning_file_at_its_own_smaller_size(self) -> None:
+        # Camera model on auto: the file used to be guessed from the size the
+        # camera was opened at, and the monitor's size matched nothing.
+        backend = self.backend()
+        backend.start()
+        self.wait(lambda: backend.frame_store.snapshot().get("rgb") is not None)
+        opening = FakeCameraSession.openings[0]
+        self.assertEqual(opening.size, (64, 48))
+        self.assertEqual(opening.resolved_tuning_file, "imx477_noir.json")
+        packet = backend.frame_store.snapshot()["rgb"]
+        self.assertTrue(packet.info.startswith("NoIR tuning (imx477_noir.json)"), packet.info)
+        self.assertTrue(any("NoIR tuning (imx477_noir.json)" in message for _, state, message in self.statuses if state == "live"))
+
+    def test_switching_noir_off_and_on_reopens_the_camera(self) -> None:
+        backend = self.backend()
+        self.assertTrue(backend.noir)  # starts where recordings are
+        backend.start()
+        self.wait(lambda: len(FakeCameraSession.openings) == 1)
+
+        backend.set_noir(False)
+        self.wait(lambda: len(FakeCameraSession.openings) == 2)
+        self.assertTrue(FakeCameraSession.openings[0].closed)  # one camera cannot be open twice
+        self.assertEqual(FakeCameraSession.openings[1].resolved_tuning_file, "imx477.json")
+        self.wait(lambda: "tuning imx477.json" in backend.frame_store.snapshot()["rgb"].info)
+        self.assertTrue(any("NoIR tuning off" in message for _, state, message in self.statuses if state == "starting"))
+
+        backend.set_noir(True)
+        self.wait(lambda: len(FakeCameraSession.openings) == 3)
+        self.assertEqual(FakeCameraSession.openings[2].resolved_tuning_file, "imx477_noir.json")
+
+        backend.set_noir(True)  # no change: the camera is left running
+        time.sleep(0.1)
+        self.assertEqual(len(FakeCameraSession.openings), 3)
+
+    def test_the_switch_never_changes_the_recording_setting(self) -> None:
+        backend = self.backend()
+        backend.start()
+        self.wait(lambda: len(FakeCameraSession.openings) == 1)
+        backend.set_noir(False)
+        self.wait(lambda: len(FakeCameraSession.openings) == 2)
+        self.assertIs(backend.config["camera"]["infrared"], True)
+        self.assertIs(self.config["camera"]["infrared"], True)
+        self.assertTrue(backend.recording_noir)
+
+    def test_the_monitor_can_start_with_its_own_choice(self) -> None:
+        backend = self.backend(noir_override=False)
+        self.assertFalse(backend.noir)
+        self.assertTrue(backend.recording_noir)
+        backend.start()
+        self.wait(lambda: len(FakeCameraSession.openings) == 1)
+        self.assertEqual(FakeCameraSession.openings[0].resolved_tuning_file, "imx477.json")
+
+        def not_infrared(config):
+            config["camera"]["infrared"] = False
+
+        FakeCameraSession.openings = []
+        backend = self.backend(not_infrared, noir_override=True)
+        backend.start()
+        self.wait(lambda: len(FakeCameraSession.openings) == 1)
+        self.assertEqual(FakeCameraSession.openings[0].resolved_tuning_file, "imx477_noir.json")
+
+    def test_a_camera_that_failed_to_open_is_tried_again_on_the_next_switch(self) -> None:
+        attempts = []
+
+        class FailsWithNoir(FakeCameraSession):
+            def __init__(self, config, *, tuning_config=None) -> None:
+                attempts.append(tuning_config["camera"]["infrared"])
+                if tuning_config["camera"]["infrared"]:
+                    raise RuntimeError("Failed to open camera with tuning file 'imx477_noir.json'")
+                super().__init__(config, tuning_config=tuning_config)
+
+        with mock.patch("bumblebox_v2.run_engine._PicameraCaptureSession", FailsWithNoir):
+            backend = self.backend()
+            backend.start()
+            self.wait(lambda: any(state == "error" for _, state, _ in self.statuses))
+            self.wait(lambda: not backend._rgb_thread.is_alive())
+            backend.set_noir(False)
+            self.wait(lambda: backend.frame_store.snapshot().get("rgb") is not None)
+        self.assertEqual(attempts, [True, False])
+
+    def test_cli_flags(self) -> None:
+        parser = build_parser()
+        self.assertIsNone(parser.parse_args(["live-monitor"]).noir)
+        self.assertIs(parser.parse_args(["live-monitor", "--noir"]).noir, True)
+        self.assertIs(parser.parse_args(["live-monitor", "--no-noir"]).noir, False)
+
+
+class MonitorNoirWindowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def window(self, configure=None, **options):
+        config = load_defaults()
+        config["runtime"]["use_mock_camera"] = True
+        config["thermal"]["enabled"] = False
+        config["realsense"]["enabled"] = False
+        if configure is not None:
+            configure(config)
+        window = create_live_monitor_window(config, LiveMonitorOptions(rgb_width=64, rgb_height=48, **options))
+        self.addCleanup(window.close)
+        window.show()
+        return window
+
+    def test_the_switch_starts_where_recordings_are(self) -> None:
+        window = self.window()
+        self.assertFalse(window.noir_button.isHidden())
+        self.assertTrue(window.noir_button.isChecked())
+        self.assertEqual(window.noir_button.text(), "NoIR Tuning: On")
+        self.assertNotIn("for recordings", window.note.text())
+
+        def not_infrared(config):
+            config["camera"]["infrared"] = False
+
+        window = self.window(not_infrared)
+        self.assertFalse(window.noir_button.isChecked())
+        self.assertEqual(window.noir_button.text(), "NoIR Tuning: Off")
+
+    def test_button_and_n_key_switch_it_and_say_when_it_differs_from_recordings(self) -> None:
+        window = self.window()
+        window.noir_button.click()
+        self.assertFalse(window.noir)
+        self.assertFalse(window.backend.noir)
+        self.assertEqual(window.noir_button.text(), "NoIR Tuning: Off")
+        self.assertIn("NoIR tuning is off here and on for recordings", window.note.text())
+        self.assertIn("nothing here changes how recordings are made", window.note.text())
+
+        QTest.keyClick(window, Qt.Key_N)
+        self.assertTrue(window.noir)
+        self.assertTrue(window.backend.noir)
+        self.assertTrue(window.noir_button.isChecked())
+        self.assertNotIn("for recordings", window.note.text())
+
+        window.enter_full_view("rgb")
+        QTest.keyClick(window, Qt.Key_N)  # also in full screen, where the button is out of sight
+        self.assertFalse(window.backend.noir)
+
+    def test_starting_option_shows_in_the_button(self) -> None:
+        window = self.window(noir_override=False)
+        self.assertFalse(window.noir_button.isChecked())
+        self.assertIn("NoIR tuning is off here and on for recordings", window.note.text())
+
+    def test_a_tuning_file_named_by_hand_leaves_nothing_to_switch(self) -> None:
+        def named(config):
+            config["camera"]["tuning_file"] = "my_tuning.json"
+
+        window = self.window(named)
+        self.assertFalse(window.noir_button.isEnabled())
+        self.assertIn("camera.tuning_file", window.noir_button.toolTip())
+        QTest.keyClick(window, Qt.Key_N)
+        self.assertTrue(window.backend.noir)
+        self.assertNotIn("for recordings", window.note.text())
+
+    def test_no_switch_without_the_rgb_camera(self) -> None:
+        def thermal_only_here(config):
+            config["thermal"]["enabled"] = True
+            config["distributed_capture"]["enabled"] = True
+            config["distributed_capture"]["nodes"] = [
+                {"name": "this", "local": True, "host": "pi1.local", "sensors": ["thermal"]},
+                {"name": "other", "local": False, "host": "pi2.local", "sensors": ["rgb"]},
+            ]
+
+        window = self.window(thermal_only_here)
+        self.assertTrue(window.noir_button.isHidden())
+
+
+
+class MonitorNoirMemoryTests(unittest.TestCase):
+    """The monitor opens with its NoIR switch where it was last left, per config file."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        from bumblebox_v2 import live_monitor
+
+        self.live_monitor = live_monitor
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        patcher = mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.state_file = self.home / "BumbleBox" / "live_monitor.json"
+
+    def backend(self, key="/boxes/a/config.yaml", infrared=True, **options) -> LiveMonitorBackend:
+        config = load_defaults()
+        config["runtime"]["use_mock_camera"] = True
+        config["camera"]["infrared"] = infrared
+        return LiveMonitorBackend(config, LiveMonitorOptions(rgb_width=64, rgb_height=48, remember_key=key, **options))
+
+    def test_it_is_kept_next_to_the_other_per_computer_files(self) -> None:
+        self.assertEqual(self.live_monitor.monitor_state_path(), self.state_file)
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": ""}):
+            self.assertEqual(
+                self.live_monitor.monitor_state_path(), Path.home() / ".local" / "share" / "BumbleBox" / "live_monitor.json"
+            )
+
+    def test_a_switch_that_was_never_used_follows_the_recording_setting(self) -> None:
+        self.assertTrue(self.backend(infrared=True).noir)
+        self.assertFalse(self.backend(infrared=False).noir)
+        self.assertFalse(self.state_file.exists())  # looking writes nothing
+
+    def test_the_switch_comes_back_where_it_was_left(self) -> None:
+        self.backend().set_noir(False)
+        self.assertFalse(self.backend().noir)
+        # Its own setting: it stays there even when the recording setting says otherwise.
+        self.assertFalse(self.backend(infrared=True).noir)
+        self.backend().set_noir(True)
+        self.assertTrue(self.backend(infrared=False).noir)
+        self.assertTrue(self.backend(infrared=False).recording_noir is False)
+
+    def test_each_config_file_remembers_its_own(self) -> None:
+        self.backend(key="/boxes/a/config.yaml").set_noir(False)
+        self.assertFalse(self.backend(key="/boxes/a/config.yaml").noir)
+        self.assertTrue(self.backend(key="/boxes/a/config.camera2.yaml").noir)  # the second camera was not touched
+        self.assertTrue(self.backend(key=None).noir)
+
+    def test_a_starting_option_wins_for_one_session_and_is_not_remembered(self) -> None:
+        self.backend().set_noir(False)
+        self.assertTrue(self.backend(noir_override=True).noir)
+        self.assertFalse(self.backend().noir)
+
+    def test_the_config_file_is_never_written(self) -> None:
+        config_path = self.home / "config.yaml"
+        config = load_defaults()
+        save_config(config_path, config)
+        before = config_path.read_text()
+        backend = LiveMonitorBackend(
+            load_config(config_path), LiveMonitorOptions(rgb_width=64, rgb_height=48, remember_key=str(config_path))
+        )
+        backend.set_noir(False)
+        self.assertEqual(config_path.read_text(), before)
+        self.assertEqual(sorted(path.name for path in self.home.iterdir()), ["BumbleBox", "config.yaml"])
+
+    def test_a_damaged_or_unwritable_memory_never_stops_the_monitor(self) -> None:
+        self.state_file.parent.mkdir(parents=True)
+        for junk in ("not json", "[1, 2]", '{"noir": "yes"}', '{"noir": {"/boxes/a/config.yaml": "off"}}'):
+            with self.subTest(junk=junk):
+                self.state_file.write_text(junk)
+                self.assertTrue(self.backend().noir)  # falls back to the recording setting
+        self.backend().set_noir(False)  # and a damaged file is replaced by a good one
+        self.assertFalse(self.backend().noir)
+
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": "/proc/no-such-place"}):
+            backend = self.backend()
+            backend.set_noir(False)  # cannot be written: no error
+            self.assertFalse(backend.noir)
+
+    def test_the_window_remembers_what_its_button_was_left_on(self) -> None:
+        def window():
+            config = load_defaults()
+            config["runtime"]["use_mock_camera"] = True
+            config["thermal"]["enabled"] = False
+            config["realsense"]["enabled"] = False
+            opened = create_live_monitor_window(
+                config, LiveMonitorOptions(rgb_width=64, rgb_height=48, remember_key="/boxes/a/config.yaml")
+            )
+            self.addCleanup(opened.close)
+            opened.show()
+            return opened
+
+        first = window()
+        self.assertTrue(first.noir_button.isChecked())
+        first.noir_button.click()
+        first.close()
+
+        second = window()
+        self.assertFalse(second.noir_button.isChecked())
+        self.assertEqual(second.noir_button.text(), "NoIR Tuning: Off")
+        self.assertIn("NoIR tuning is off here and on for recordings", second.note.text())
+        self.assertIn("where you last left it", second.noir_button.toolTip())
+
+    def test_the_command_remembers_per_config_file_but_not_for_the_simulated_camera(self) -> None:
+        config_path = self.home / "config.yaml"
+        save_config(config_path, load_defaults())
+        seen = []
+        with mock.patch.object(self.live_monitor, "launch_live_monitor", lambda config, options: seen.append(options) or 0):
+            for extra in ([], ["--mock"]):
+                args = build_parser().parse_args(["live-monitor", "--config", str(config_path), *extra])
+                self.assertEqual(args.func(args), 0)
+        self.assertEqual(seen[0].remember_key, str(config_path.resolve()))
+        self.assertIsNone(seen[1].remember_key)
 
 
 if __name__ == "__main__":

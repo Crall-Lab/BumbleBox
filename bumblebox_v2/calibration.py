@@ -193,14 +193,11 @@ def capture_calibration_image(
         run_autofocus_preflight,
         start_autofocus_after_camera_start,
     )
-    from .camera_profiles import apply_camera_profile, validate_camera_ir_compatibility
-    from .camera_select import picamera2_camera_kwargs
+    from .camera_profiles import apply_camera_profile
+    from .camera_select import picamera2_camera_kwargs, selected_camera_model
     from .image_controls import apply_image_controls
 
     config = apply_camera_profile(config)
-    ir_error = validate_camera_ir_compatibility(config)
-    if ir_error:
-        raise ValueError(ir_error)
 
     try:
         from picamera2 import Picamera2
@@ -210,7 +207,7 @@ def capture_calibration_image(
             "picamera2/libcamera is required to capture calibration images on Pi."
         ) from exc
 
-    from .tuning import resolve_camera_tuning_file
+    from .tuning import open_picamera2, resolve_camera_tuning_file
 
     camera_cfg = config.get("camera", {})
     runtime_cfg = config.get("runtime", {})
@@ -240,10 +237,7 @@ def capture_calibration_image(
 
         try:
             camera_kwargs = picamera2_camera_kwargs(config, Picamera2)
-            if tuning_file:
-                tuning = Picamera2.load_tuning_file(str(tuning_file))
-                return Picamera2(tuning=tuning, **camera_kwargs)
-            return Picamera2(**camera_kwargs)
+            return open_picamera2(Picamera2, tuning_file, camera_kwargs)
         except IndexError as exc:
             raise RuntimeError(
                 "No camera detected by picamera2/libcamera (IndexError during camera open). "
@@ -258,7 +252,7 @@ def capture_calibration_image(
                 ) from exc
             raise RuntimeError(f"Failed to open camera: {exc}") from exc
 
-    tuning_file = resolve_camera_tuning_file(config)
+    tuning_file = resolve_camera_tuning_file(config, detected_sensor=selected_camera_model(config, Picamera2))
     picam2 = _construct_picamera2(tuning_file)
 
     started = False

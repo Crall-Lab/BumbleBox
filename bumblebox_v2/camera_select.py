@@ -145,3 +145,29 @@ def capture_lock_suffix(config: Dict[str, Any]) -> str:
     """Distinguishes the capture locks of two cameras; empty for the first camera."""
     num = configured_camera_num(config)
     return f"cam{num}" if num > 0 else ""
+
+
+def selected_camera_model(config: Dict[str, Any], picamera2_class: Any) -> Optional[str]:
+    """The sensor name libcamera reports for the camera ``config`` opens, for example ``imx477``.
+
+    ``None`` when the cameras cannot be listed or the configured one is not
+    there (opening it then reports the real problem).
+    """
+    try:
+        cameras = parse_camera_info(picamera2_class.global_camera_info())
+        num = resolve_camera_num(config, cameras)
+    except Exception:
+        return None
+    for camera in cameras:
+        if camera.num == num:
+            return camera.model or None
+    return None
+
+
+def connected_camera_model(config: Dict[str, Any]) -> Optional[str]:
+    """As ``selected_camera_model``, where the camera library has not been imported yet."""
+    try:
+        from picamera2 import Picamera2
+    except Exception:
+        return None
+    return selected_camera_model(config, Picamera2)

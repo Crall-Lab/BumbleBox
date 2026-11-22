@@ -25,7 +25,7 @@ from .camera_controls import (
     run_autofocus_preflight,
     start_autofocus_after_camera_start,
 )
-from .camera_profiles import apply_camera_profile, configured_profile_name, validate_camera_ir_compatibility
+from .camera_profiles import apply_camera_profile, configured_profile_name
 from .realsense_camera import (
     RealSenseRecordingResult,
     RealSenseRecordingSession,
@@ -43,6 +43,7 @@ from .camera_select import (
     configured_camera_id,
     configured_camera_num,
     picamera2_camera_kwargs,
+    selected_camera_model,
     session_tag,
 )
 from .capture_lock import DEFAULT_LOCK_WAIT_SECONDS, capture_lock, default_lock_path
@@ -64,7 +65,7 @@ from .stream_writer import (
 from .image_controls import apply_image_controls
 from .thermal_camera import resolve_thermal_device_path, _set_v4l2_y16_format
 from .tracking_index import sync_run_summary_file
-from .tuning import resolve_camera_tuning_file
+from .tuning import open_picamera2, resolve_camera_tuning_file
 
 CAMERA_REOPEN_RETRY_ATTEMPTS = 3
 CAMERA_REOPEN_RETRY_DELAY_SECONDS = 0.75
@@ -608,7 +609,14 @@ def _capture_frames_from_started_picamera(
 
 
 class _PicameraCaptureSession:
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any], *, tuning_config: Optional[Dict[str, Any]] = None) -> None:
+        """Open the camera ``config`` describes.
+
+        ``tuning_config`` is the config whose camera section chooses the tuning
+        file, when that is not ``config`` itself: the live monitor opens the
+        camera at a smaller size than a recording does, and has its own NoIR
+        switch.
+        """
         self.config = config
         try:
             from picamera2 import Picamera2
@@ -627,7 +635,14 @@ class _PicameraCaptureSession:
         self.monochrome_output = bool(config["camera"].get("monochrome_output", False))
         self.image_control_notes: list[str] = []
         self.warmup_s = float(config["runtime"].get("camera_warmup_seconds", 2.0))
-        self.resolved_tuning_file = resolve_camera_tuning_file(config)
+        # Ask the camera which sensor it is, so the right tuning file is found
+        # whatever camera.model says and whatever size is being captured.
+        self.detected_sensor = selected_camera_model(config, Picamera2)
+        self.resolved_tuning_file = resolve_camera_tuning_file(
+            tuning_config if tuning_config is not None else config,
+            detected_sensor=self.detected_sensor,
+        )
+        self.tuning_notes: list[str] = []
         self.autofocus_notes: list[str] = []
         self.picam2 = self._open_and_configure()
         self.started = False
@@ -654,10 +669,12 @@ class _PicameraCaptureSession:
 
             try:
                 camera_kwargs = picamera2_camera_kwargs(self.config, self._Picamera2)
-                if self.resolved_tuning_file:
-                    tuning = self._Picamera2.load_tuning_file(str(self.resolved_tuning_file))
-                    return self._Picamera2(tuning=tuning, **camera_kwargs)
-                return self._Picamera2(**camera_kwargs)
+                camera = open_picamera2(
+                    self._Picamera2, self.resolved_tuning_file, camera_kwargs, notes=self.tuning_notes
+                )
+                if self.tuning_notes:
+                    self.resolved_tuning_file = None  # it opened on its standard tuning
+                return camera
             except IndexError as exc:
                 last_error = RuntimeError(
                     "No camera detected by picamera2/libcamera (IndexError during camera open). "
@@ -820,6 +837,7 @@ def _write_autofocus_capture_diagnostics(
         return
     diagnostics["autofocus_preflight"] = session.autofocus_preflight_result.to_dict()
     diagnostics["autofocus_notes"] = list(session.autofocus_notes)
+    diagnostics["resolved_tuning_file"] = session.resolved_tuning_file
 
 
 def _capture_frames_picamera(
@@ -2836,10 +2854,6 @@ def run_once(
             )
         config.setdefault("thermal", {})["enabled"] = "thermal" in assigned_sensors
         config.setdefault("realsense", {})["enabled"] = "realsense" in assigned_sensors
-    ir_error = validate_camera_ir_compatibility(config)
-    if ir_error:
-        raise ValueError(ir_error)
-
     started_at = _now_iso()
     warnings: List[str] = []
     errors: List[str] = []
@@ -3436,7 +3450,8 @@ def run_once(
             else None
         ),
         camera_autofocus_preflight_notes=autofocus_notes,
-        resolved_tuning_file=resolved_tuning_file,
+        # The file the camera was really opened with, where a camera was opened.
+        resolved_tuning_file=capture_diagnostics.get("resolved_tuning_file", resolved_tuning_file),
         frames_captured=frame_count,
         actual_fps=round(actual_fps, 6),
         tracking_elapsed_seconds=round(tracking_elapsed_seconds, 6) if tracking_elapsed_seconds is not None else None,

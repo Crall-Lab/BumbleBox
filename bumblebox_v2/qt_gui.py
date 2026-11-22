@@ -139,6 +139,7 @@ from .recording_options import recording_is_grayscale, set_recording_grayscale
 from .schedule_check import run_schedule_check
 from .status_history import list_recent_run_records, load_run_summary
 from .stream_writer import FRAME_BUFFER_STREAM, frame_buffer_mode
+from .tuning import describe_tuning, infrared_enabled
 from .time_units import (
     DEFAULT_START_TIME,
     DURATION_UNITS,
@@ -192,6 +193,7 @@ PROFILE_CONTROLLED_SETTINGS = {
     "camera.fps_target": "fps_target",
     "camera.codec": "codec",
     "camera.monochrome_output": "monochrome_output",
+    "camera.infrared": "infrared",
 }
 # Cancel asks the command to stop (SIGINT, like Ctrl+C) so it can close files
 # and write its summary, then insists if it does not stop.
@@ -1043,8 +1045,9 @@ class RgbPage(QWizardPage):
         self.description.setWordWrap(True)
         layout.addWidget(self.description)
         visible_note = QLabel(
-            "OwlSight uses visible illumination because the stock OV64A40 camera is treated as IR-cut. "
-            "The HQ NoIR reference profile keeps the established infrared workflow."
+            "The HQ Reference profile switches infrared light on, and the OwlSight Reference profile "
+            "switches it off because the stock OwlSight has an infrared filter. With the Custom profile, "
+            "set Infrared light on the Settings page."
         )
         visible_note.setObjectName("Hint")
         visible_note.setWordWrap(True)
@@ -2331,12 +2334,19 @@ class BumbleBoxQtGUI(QMainWindow):
             "High quality removes the most noise. It can lower the frame rate the camera reaches: "
             "if recordings come out slower than the frame rate set above, choose Fast."
         )
+        self.settings_infrared = QCheckBox("Infrared light (the camera has no infrared filter)")
+        self.settings_infrared.setToolTip(
+            "Tick this for a NoIR camera, or an ordinary camera with its infrared filter taken off. "
+            "The camera then builds its picture with its NoIR tuning file. This works with any camera "
+            "model. The live monitor has its own NoIR Tuning switch, which follows this until it is used."
+        )
         self.settings_picture_hint = hint(
             "These are applied inside the camera, so they change recordings, the live monitor and what "
             "the tag detector sees. To choose fixed values: leave gain and white balance on Automatic, "
             "open the Live Camera Monitor, and copy the numbers shown under the picture once they "
             "settle. Save here before opening the monitor to see a change."
         )
+        picture_form.addRow(row_label("Lighting"), self.settings_infrared)
         picture_form.addRow(row_label("Sensor gain"), field_row(self.settings_gain_mode, self.settings_gain))
         picture_form.addRow(
             row_label("White balance"),
@@ -2493,6 +2503,7 @@ class BumbleBoxQtGUI(QMainWindow):
             combo.setFocusPolicy(Qt.StrongFocus)
             combo.installEventFilter(self._wheel_guard)
         self.settings_monochrome.toggled.connect(lambda *_: self._settings_changed())
+        self.settings_infrared.toggled.connect(lambda *_: self._settings_changed())
         for combo in (self.settings_gain_mode, self.settings_wb_mode):
             combo.currentIndexChanged.connect(lambda *_: self._settings_changed())
             combo.setFocusPolicy(Qt.StrongFocus)
@@ -2523,6 +2534,7 @@ class BumbleBoxQtGUI(QMainWindow):
             "scheduling.start_time": self.settings_start_time.time().toString("HH:mm"),
             "camera.fps_target": round(float(self.settings_fps.value()), 2),
             "camera.monochrome_output": bool(self.settings_monochrome.isChecked()),
+            "camera.infrared": bool(self.settings_infrared.isChecked()),
             "camera.analogue_gain": (
                 round(float(self.settings_gain.value()), 2)
                 if self.settings_gain_mode.currentData() == "fixed"
@@ -2592,6 +2604,7 @@ class BumbleBoxQtGUI(QMainWindow):
             self.settings_start_time.setTime(QTime(start // 60, start % 60))
             self.settings_fps.setValue(float(_get_nested(config, "camera.fps_target", 5.0) or 5.0))
             self.settings_monochrome.setChecked(bool(_get_nested(config, "camera.monochrome_output", False)))
+            self.settings_infrared.setChecked(infrared_enabled(config))
             self._load_picture_settings(config)
             _set_combo_data(self.settings_codec, str(_get_nested(config, "camera.codec", "mp4")).lower())
             _set_combo_data(self.settings_preset, str(_get_nested(config, "camera.mp4_preset", "auto")).lower())
@@ -2670,10 +2683,12 @@ class BumbleBoxQtGUI(QMainWindow):
         self.settings_fps.setEnabled("camera.fps_target" not in fixed)
         self.settings_codec.setEnabled("camera.codec" not in fixed)
         self.settings_monochrome.setEnabled("camera.monochrome_output" not in fixed)
+        self.settings_infrared.setEnabled("camera.infrared" not in fixed)
         profile_label = CAMERA_PROFILES.get(self._settings_profile_key(), CAMERA_PROFILES["custom"]).label
         if fixed:
             self.settings_profile_note.setText(
-                f"Frame rate, video format and grayscale are set by the camera profile “{profile_label}”."
+                "Frame rate, video format, grayscale and infrared light are set by the camera profile "
+                f"“{profile_label}”."
             )
         elif self._settings_profile_override:
             self.settings_profile_note.setText("Custom camera settings will be used from when you save.")
@@ -2757,6 +2772,7 @@ class BumbleBoxQtGUI(QMainWindow):
             lines.append(f"Picture: {image_controls.describe_settings(candidate)}.")
         except image_controls.ImageSettingError:
             pass  # reported with the other config problems
+        lines.append(f"Camera tuning: {describe_tuning(candidate)}.")
         if estimate.level == LEVEL_WARN and estimate.days_left is not None:
             warnings.append(
                 f"Storage: at this rate the drive is full in {describe_days(estimate.days_left)}, "

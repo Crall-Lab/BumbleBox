@@ -12,7 +12,6 @@ from .camera_profiles import (
     camera_profile_choices,
     normalize_camera_model,
     normalize_camera_profile,
-    validate_camera_ir_compatibility,
 )
 from .camera_controls import (
     VALID_AUTOFOCUS_MODES,
@@ -396,9 +395,6 @@ def validate_config(config: Dict[str, Any]) -> None:
         validate_image_settings(config)
     except ImageSettingError as exc:
         raise ConfigError(str(exc)) from exc
-    ir_error = validate_camera_ir_compatibility(config)
-    if ir_error:
-        raise ConfigError(ir_error)
     preview_window = str(config["camera"].get("preview_window", "QT")).upper()
     if preview_window not in VALID_PREVIEW_WINDOWS:
         raise ConfigError(

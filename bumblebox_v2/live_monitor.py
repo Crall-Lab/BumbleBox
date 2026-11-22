@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -11,6 +12,7 @@ import time
 from typing import Any, Callable, Optional
 
 from .image_controls import camera_readout
+from .tuning import infrared_enabled
 
 
 
@@ -24,6 +26,13 @@ class LiveMonitorOptions:
     duration_seconds: float = 0.0
     thermal_override: Optional[bool] = None
     realsense_override: Optional[bool] = None
+    # The monitor's own NoIR tuning switch, for this session: True or False
+    # starts it on or off. ``None`` starts it where it was last left, or, if
+    # it has never been used, where recordings are (camera.infrared).
+    noir_override: Optional[bool] = None
+    # The config file this monitor remembers its NoIR switch for. ``None``
+    # remembers nothing.
+    remember_key: Optional[str] = None
 
     def validate(self) -> None:
         if self.rgb_width <= 0 or self.rgb_height <= 0:
@@ -194,6 +203,42 @@ class LiveMonitorBackend:
         )
         self.stop_event = threading.Event()
         self.threads: list[threading.Thread] = []
+        # NoIR tuning, for this monitor only. It starts where it was last
+        # left, or where recordings are if it has never been used, and never
+        # changes the saved config.
+        self.recording_noir = infrared_enabled(self.config)
+        remembered = remembered_noir(options.remember_key)
+        if options.noir_override is not None:
+            self.noir = bool(options.noir_override)
+        elif remembered is not None:
+            self.noir = remembered
+        else:
+            self.noir = self.recording_noir
+        self._rgb_thread: Optional[threading.Thread] = None
+        self._rgb_restart = threading.Event()
+
+    @property
+    def tuning_file_is_named(self) -> bool:
+        """A tuning file named by hand in the config is used whatever the NoIR switch says."""
+        return self.config.get("camera", {}).get("tuning_file") not in (None, "")
+
+    def set_noir(self, enabled: bool) -> None:
+        """Switch the monitor's camera between its NoIR and its standard tuning.
+
+        A camera reads its tuning file when it is opened, so the camera is
+        closed and opened again. Recordings are not affected.
+        """
+        enabled = bool(enabled)
+        if enabled == self.noir:
+            return
+        self.noir = enabled
+        remember_noir(self.options.remember_key, enabled)
+        if "rgb" not in self.sensor_names or self.stop_event.is_set():
+            return
+        self._rgb_restart.set()
+        if self._rgb_thread is not None and not self._rgb_thread.is_alive():
+            # The camera stopped with an error; try again with the new choice.
+            self._launch("rgb", ("rgb",), self._run_rgb)
 
     def _status(self, stream: str, state: str, message: str) -> None:
         if self.status_callback is not None:
@@ -217,6 +262,8 @@ class LiveMonitorBackend:
 
         thread = threading.Thread(target=wrapped, name=f"bbx-monitor-{name}", daemon=True)
         self.threads.append(thread)
+        if name == "rgb":
+            self._rgb_thread = thread
         thread.start()
 
     def start(self) -> None:
@@ -275,28 +322,45 @@ class LiveMonitorBackend:
         monochrome = bool(preview_config["camera"].get("monochrome_output", False))
         interval = 1.0 / float(self.options.display_fps)
         sequence = 0
-        with _PicameraCaptureSession(preview_config) as session:
-            session.start()
-            self._status(
-                "rgb",
-                "live",
-                f"Live at {self.options.rgb_width} x {self.options.rgb_height}.",
-            )
-            while not self.stop_event.is_set():
-                frame, metadata = capture_frame_and_metadata(session.picam2)
-                captured = time.perf_counter()
-                sequence += 1
-                self._put(
+        while not self.stop_event.is_set():
+            self._rgb_restart.clear()
+            noir = self.noir
+            # The tuning file is chosen from the recording's own camera
+            # settings, not from the smaller size the monitor opens the camera
+            # at, with this monitor's NoIR switch in place of camera.infrared.
+            tuning_config = deepcopy(self.config)
+            tuning_config.setdefault("camera", {})["infrared"] = noir
+            with _PicameraCaptureSession(preview_config, tuning_config=tuning_config) as session:
+                session.start()
+                tuning = monitor_tuning_label(noir, getattr(session, "resolved_tuning_file", None))
+                self._status(
                     "rgb",
-                    _frame_to_bgr(frame, monochrome_output=monochrome),
-                    sequence,
-                    captured,
-                    gray=_frame_luma(frame),
-                    # The gain and white balance the camera is using: the
-                    # numbers to copy when fixing them on the Settings page.
-                    info=camera_readout(metadata),
+                    "live",
+                    f"Live at {self.options.rgb_width} x {self.options.rgb_height}, {tuning}.",
                 )
-                self.stop_event.wait(interval)
+                while not self.stop_event.is_set() and not self._rgb_restart.is_set():
+                    frame, metadata = capture_frame_and_metadata(session.picam2)
+                    captured = time.perf_counter()
+                    sequence += 1
+                    # The tuning in use, then the gain and white balance the
+                    # camera is using: the numbers to copy when fixing them on
+                    # the Settings page.
+                    readout = camera_readout(metadata)
+                    self._put(
+                        "rgb",
+                        _frame_to_bgr(frame, monochrome_output=monochrome),
+                        sequence,
+                        captured,
+                        gray=_frame_luma(frame),
+                        info=f"{tuning}  |  {readout}" if readout else tuning,
+                    )
+                    self.stop_event.wait(interval)
+            if self._rgb_restart.is_set() and not self.stop_event.is_set():
+                self._status(
+                    "rgb",
+                    "starting",
+                    f"Opening the camera again with NoIR tuning {'on' if self.noir else 'off'}...",
+                )
 
     def _run_mock_rgb(self) -> None:
         from .run_engine import _frame_luma, _frame_to_bgr
@@ -523,6 +587,66 @@ STREAM_TITLES = {
 }
 
 
+def monitor_state_path() -> Path:
+    """Where the monitor keeps what it remembers on this computer.
+
+    The same folder as the encode benchmark result. It is kept out of the
+    config file on purpose: the monitor changes no settings.
+    """
+    base = os.environ.get("XDG_DATA_HOME", "").strip()
+    root = Path(base) if base else Path.home() / ".local" / "share"
+    return root / "BumbleBox" / "live_monitor.json"
+
+
+def _read_monitor_state() -> dict[str, Any]:
+    try:
+        state = json.loads(monitor_state_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def remembered_noir(key: Optional[str]) -> Optional[bool]:
+    """Where the NoIR switch was last left for this config file; ``None`` if it was never used."""
+    if not key:
+        return None
+    saved = _read_monitor_state().get("noir")
+    value = saved.get(str(key)) if isinstance(saved, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def remember_noir(key: Optional[str], enabled: bool) -> None:
+    """Remember where the NoIR switch was left. Failing to write is not an error: the monitor carries on."""
+    if not key:
+        return
+    try:
+        state = _read_monitor_state()
+        saved = state.get("noir")
+        if not isinstance(saved, dict):
+            saved = {}
+        saved[str(key)] = bool(enabled)
+        state["noir"] = saved
+        path = monitor_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        scratch = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        scratch.write_text(json.dumps(state, indent=2, sort_keys=True))
+        os.replace(scratch, path)
+    except OSError:
+        pass
+
+
+def monitor_tuning_label(noir: bool, tuning_file: Any) -> str:
+    """The tuning the monitor's camera was opened with, in a few words."""
+    if tuning_file:
+        name = Path(str(tuning_file)).name
+        if name.endswith("_noir.json"):
+            return f"NoIR tuning ({name})"
+        return f"tuning {name}"
+    if noir:
+        return "standard tuning (NoIR tuning was not available for this camera)"
+    return "standard tuning"
+
+
 def capture_frame_and_metadata(picam2: Any) -> tuple[Any, Any]:
     """One frame and what the camera reports about it (``None`` where it reports nothing)."""
     capture_request = getattr(picam2, "capture_request", None)
@@ -539,6 +663,11 @@ def capture_frame_and_metadata(picam2: Any) -> tuple[Any, Any]:
         request.release()
     return frame, metadata
 
+
+PREVIEW_ONLY_NOTE = (
+    "PREVIEW ONLY: no images or video are saved, and nothing here changes how recordings "
+    "are made. Close this monitor before recording."
+)
 
 # Feeds that are real colour images. Thermal and depth are drawn with a false
 # colour scale that carries the measurement, so the grayscale view leaves them.
@@ -830,6 +959,7 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             self.paused = False
             self.grayscale_view = False
             self.contrast_boost = False
+            self.noir = self.backend.noir
             self.full_view: Optional[str] = None
             self._was_maximized = False
             self._build()
@@ -886,21 +1016,38 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             )
             self.boost_button.toggled.connect(self.set_contrast_boost)
             self.boost_button.setVisible(has_colour_feed)
+            self.noir_button = QPushButton("NoIR Tuning")
+            self.noir_button.setCheckable(True)
+            self.noir_button.setChecked(self.noir)
+            if self.backend.tuning_file_is_named:
+                self.noir_button.setEnabled(False)
+                self.noir_button.setToolTip(
+                    "This camera's tuning file is named in the config (camera.tuning_file), "
+                    "so there is nothing to switch here."
+                )
+            else:
+                self.noir_button.setToolTip(
+                    "Open the camera with its NoIR tuning (for a camera with no infrared filter) or with "
+                    "its standard tuning. The camera closes and opens again, which takes a few seconds. "
+                    "This only changes what you see here, and the monitor opens with it where you last "
+                    "left it. Recordings follow Infrared light on the Settings page of the main window. "
+                    "Shortcut: N."
+                )
+            self.noir_button.toggled.connect(self.set_noir)
+            self.noir_button.setVisible("rgb" in self.streams)
             self.pause_button = QPushButton("Pause Display")
             self.pause_button.clicked.connect(self._toggle_pause)
             close_button = QPushButton("Close Monitor")
             close_button.setObjectName("CloseButton")
             close_button.clicked.connect(self.close)
+            header_layout.addWidget(self.noir_button)
             header_layout.addWidget(self.gray_view_button)
             header_layout.addWidget(self.boost_button)
             header_layout.addWidget(self.pause_button)
             header_layout.addWidget(close_button)
             outer.addWidget(header)
 
-            note = QLabel(
-                "PREVIEW ONLY: no images or video are saved, and nothing here changes how recordings "
-                "are made. Close this monitor before recording."
-            )
+            note = QLabel(PREVIEW_ONLY_NOTE)
             note.setObjectName("PrivacyNote")
             note.setWordWrap(True)
             self.note = note
@@ -947,6 +1094,16 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             # The state is in the words as well as the colour.
             self.gray_view_button.setText(f"Grayscale View: {'On' if self.grayscale_view else 'Off'}")
             self.boost_button.setText(f"Contrast Boost: {'On' if self.contrast_boost else 'Off'}")
+            self.noir_button.setText(f"NoIR Tuning: {'On' if self.noir else 'Off'}")
+            # Say so when the picture here is not built the way a recording's is.
+            text = PREVIEW_ONLY_NOTE
+            if "rgb" in self.streams and not self.backend.tuning_file_is_named and self.noir != self.backend.recording_noir:
+                text += (
+                    f" NoIR tuning is {'on' if self.noir else 'off'} here and "
+                    f"{'on' if self.backend.recording_noir else 'off'} for recordings "
+                    "(Infrared light, Settings page)."
+                )
+            self.note.setText(text)
 
         def _apply_view(self) -> None:
             """Push the two view choices to the buttons and the colour feeds."""
@@ -970,6 +1127,16 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
             if not self.grayscale_view:
                 self.contrast_boost = False  # the boost is a grayscale view
             self._apply_view()
+
+        def set_noir(self, enabled: bool) -> None:
+            """Open the camera with its NoIR or its standard tuning. Changes this monitor only."""
+            self.noir = bool(enabled)
+            if self.noir_button.isChecked() != self.noir:
+                self.noir_button.blockSignals(True)
+                self.noir_button.setChecked(self.noir)
+                self.noir_button.blockSignals(False)
+            self.backend.set_noir(self.noir)
+            self._label_toggles()
 
         def set_contrast_boost(self, enabled: bool) -> None:
             """Boost local contrast, in grayscale. Changes the display only."""
@@ -1036,6 +1203,9 @@ def create_live_monitor_window(config: dict[str, Any], options: LiveMonitorOptio
                 return
             if event.key() == Qt.Key_C and not self.boost_button.isHidden():
                 self.set_contrast_boost(not self.contrast_boost)
+                return
+            if event.key() == Qt.Key_N and not self.noir_button.isHidden() and self.noir_button.isEnabled():
+                self.set_noir(not self.noir)
                 return
             super().keyPressEvent(event)
 

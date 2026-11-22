@@ -64,6 +64,19 @@ See `docs/RealSense_Camera.md` for hardware validation and `docs/Multimodal_Cali
       reduction at 4056x3040; fall back to `Fast` if it drops below the target.
 - [ ] On a Pi: try fixed sensor gain, fixed colour gains and contrast under
       infrared and red light.
+- [x] Add **Infrared light** to the Settings page (Picture). It alone chooses
+      the NoIR tuning file, for any camera model; the connected camera is asked
+      which sensor it is, so `camera.model` on `auto` works at any size.
+- [x] Give the live monitor its own **NoIR Tuning** switch (also `--noir`,
+      `--no-noir`, key N), remembered per config file outside the config, and
+      make the monitor use the recording's tuning file.
+- [x] Open the camera so the tuning file is really used: let go of the camera
+      manager that listing the cameras starts, and search only this Pi's
+      tuning folder (`pisp` on a Pi 5, `vc4` on a Pi 4). See
+      `docs/Frame_Processing.md`.
+- [ ] On a Pi: confirm the NoIR file takes effect (the picture and the white
+      balance numbers change when NoIR Tuning is switched in the monitor), on
+      a Pi 4 and a Pi 5, and that recordings open the camera as before.
 - [ ] Mount, keep, forget and remove a real drive through the Data Drive window
       on a Raspberry Pi (exFAT and ext4), including a restart with and without
       the drive connected.

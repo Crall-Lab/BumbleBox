@@ -11,6 +11,8 @@ class CameraModelInfo:
     label: str
     sensor: Optional[str]
     max_resolution: Optional[tuple[int, int]]
+    # Whether the camera is sold without an infrared filter, or with one that
+    # is meant to come off. It no longer limits camera.infrared.
     supports_infrared: bool
     notes: str = ""
 
@@ -220,14 +222,20 @@ def configured_profile_name(config: Dict[str, Any]) -> str:
     return normalize_camera_profile(camera_cfg.get("profile", "custom"))
 
 
-def validate_camera_ir_compatibility(config: Dict[str, Any]) -> Optional[str]:
+def infrared_filter_note(config: Dict[str, Any]) -> Optional[str]:
+    """A reminder when NoIR tuning is asked for on a camera sold with an infrared filter.
+
+    This is allowed: the infrared setting is independent of the camera model,
+    because a filter can be taken off. NoIR tuning on a camera that still has
+    its filter gives the wrong colour balance, so the camera check says so.
+    """
     camera_cfg = config.get("camera", {}) if isinstance(config.get("camera", {}), dict) else {}
     model_info = get_camera_model_info(camera_cfg.get("model", "auto"))
-    if model_info is None:
+    if model_info is None or model_info.supports_infrared:
         return None
-    if bool(camera_cfg.get("infrared", False)) and not model_info.supports_infrared:
-        return (
-            f"camera.model={model_info.key!r} is marked as not IR-capable, but camera.infrared=true. "
-            f"{model_info.notes or 'Use visible illumination or choose an IR-capable camera profile.'}"
-        )
-    return None
+    if camera_cfg.get("infrared") is not True:
+        return None
+    return (
+        f"Infrared light is switched on (camera.infrared), and {model_info.label} is sold with an "
+        "infrared filter. NoIR tuning suits it only if the filter has been removed."
+    )

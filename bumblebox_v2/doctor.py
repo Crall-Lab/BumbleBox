@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .tuning import TUNING_SEARCH_DIRS, inspect_camera_tuning_resolution
+from .camera_select import connected_camera_model
+from .tuning import inspect_camera_tuning_resolution, tuning_search_dirs
 
 
 @dataclass
@@ -274,7 +275,10 @@ def _data_root_check(data_root: str) -> CheckResult:
 
 
 def _camera_tuning_check(config: Dict[str, Any]) -> CheckResult:
-    info = inspect_camera_tuning_resolution(config)
+    mock = bool(config.get("runtime", {}).get("use_mock_camera", False)) if isinstance(config, dict) else False
+    info = inspect_camera_tuning_resolution(
+        config, detected_sensor=None if mock else connected_camera_model(config)
+    )
     source = str(info.get("source", "default"))
     requested = info.get("requested")
     resolved = info.get("resolved")
@@ -282,7 +286,19 @@ def _camera_tuning_check(config: Dict[str, Any]) -> CheckResult:
     camera_model = info.get("camera_model")
     camera_profile = info.get("camera_profile")
     infrared = info.get("infrared")
-    search_paths = ", ".join(str(path) for path in TUNING_SEARCH_DIRS)
+    search_paths = ", ".join(str(path) for path in tuning_search_dirs())
+    missing = info.get("missing")
+
+    if source == "default" and missing and infrared:
+        return CheckResult(
+            "Camera tuning",
+            "WARN",
+            (
+                f"Infrared light is switched on (camera.infrared), but no NoIR tuning file '{missing}' "
+                f"is installed for this camera. Searched: {search_paths}. "
+                "The camera's standard tuning is used instead."
+            ),
+        )
 
     if source == "default":
         return CheckResult(

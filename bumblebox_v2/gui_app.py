@@ -2905,10 +2905,10 @@ class BumbleBoxV2GUI(tk.Tk):
                 "Number of consecutive focused frames required before accepting libcamera's focused state."
             ),
             "camera.infrared": (
-                "Use IR/NoIR sensor tuning when no manual tuning file is set. "
-                "When enabled, BumbleBox auto-resolves the camera's noir tuning file "
-                "(for example imx477_noir.json or imx708_noir.json) for preview, recording, and calibration. "
-                "Do not enable this for stock OwlSight cameras, which have an IR-cut filter."
+                "Use the camera's NoIR tuning file (for example imx477_noir.json) when no manual tuning "
+                "file is set. Enable it for a NoIR camera, or an ordinary camera with its infrared filter "
+                "removed; it works with any camera model. Applies to preview, recording, and calibration. "
+                "Leave it off for a camera that still has its filter, such as a stock OwlSight."
             ),
             "camera.monochrome_output": (
                 "Force grayscale-looking RGB output for preview, recording, and calibration captures. "
@@ -2922,7 +2922,7 @@ class BumbleBoxV2GUI(tk.Tk):
             "camera.preview_window": "Preview backend used by camera preview (fixed to QT for stable GUI behavior).",
             "camera.tuning_file": (
                 "Optional manual libcamera tuning JSON override. "
-                "Leave this blank to let BumbleBox auto-select standard or IR/NoIR tuning from camera model + IR lighting."
+                "Leave this blank to let BumbleBox choose the connected camera's standard or NoIR file from IR lighting."
             ),
             "pipeline.mode": "Main run mode: record only, track only, record+track, or mixed schedule lanes.",
             "pipeline.tracking_source": "Track from in-memory frames (ram) or saved video files (video).",
@@ -3242,7 +3242,7 @@ class BumbleBoxV2GUI(tk.Tk):
         if model_info is not None and not model_info.supports_infrared:
             self.config_output.insert(
                 tk.END,
-                "\n\nNote: this camera profile is marked as not IR-capable; use visible illumination.",
+                "\n\nNote: this camera is sold with an infrared filter, so this profile switches IR lighting off.",
             )
 
     def _infer_camera_model_max_resolution(self, model: str) -> tuple[int, int] | None:

@@ -441,6 +441,67 @@ class SettingsPageTests(QtControlTestCase):
             self.assertEqual(window.settings_noise_reduction.currentData(), "Fast")
             self.assertFalse(window._settings_dirty())
 
+    def test_infrared_light_is_a_checkbox_on_the_settings_page(self) -> None:
+        with self.window() as window:
+            self.assertTrue(window.settings_infrared.isChecked())  # a new setup assumes infrared light
+            self.assertTrue(window.settings_infrared.isEnabled())
+            window._refresh_settings_preview()
+            self.assertIn("Camera tuning: NoIR tuning", window.settings_effects_label.text())
+
+            window.settings_infrared.setChecked(False)
+            self.assertTrue(window._settings_dirty())
+            window._refresh_settings_preview()
+            self.assertIn("Camera tuning: standard tuning.", window.settings_effects_label.text())
+            self.assertTrue(window._save_settings(offer_apply=False))
+            self.assertIs(load_config(window.config_path)["camera"]["infrared"], False)
+
+            window.settings_infrared.setChecked(True)
+            self.assertTrue(window._save_settings(offer_apply=False))
+            self.assertIs(load_config(window.config_path)["camera"]["infrared"], True)
+
+    def test_infrared_light_can_be_switched_on_for_any_camera_model(self) -> None:
+        # An ordinary camera with its infrared filter removed, and one sold
+        # with a filter: neither is refused any more.
+        for model, expected in (("hq", "NoIR tuning (imx477_noir.json)"), ("module3_wide", "NoIR tuning (imx708_noir.json)")):
+            with self.subTest(model=model):
+
+                def filtered(config, model=model):
+                    config["camera"]["model"] = model
+                    config["camera"]["infrared"] = False
+
+                with self.window(filtered) as window:
+                    self.assertFalse(window.settings_infrared.isChecked())
+                    window.settings_infrared.setChecked(True)
+                    window._refresh_settings_preview()
+                    self.assertIn(f"Camera tuning: {expected}.", window.settings_effects_label.text())
+                    self.assertNotIn("Not valid", window.settings_issues_label.text())
+                    self.assertTrue(window._save_settings(offer_apply=False))
+                    saved = load_config(window.config_path)["camera"]
+                    self.assertEqual((saved["model"], saved["infrared"]), (model, True))
+
+    def test_a_named_profile_sets_infrared_light_until_switched_to_custom(self) -> None:
+        def owlsight(config):
+            config["camera"]["profile"] = "owlsight_reference"
+
+        with self.window(owlsight) as window:
+            self.assertFalse(window.settings_infrared.isChecked())
+            self.assertFalse(window.settings_infrared.isEnabled())
+            self.assertIn("infrared light are set by the camera profile", window.settings_profile_note.text())
+
+            window._use_custom_camera_settings()
+            self.assertTrue(window.settings_infrared.isEnabled())
+            window.settings_infrared.setChecked(True)
+            self.assertTrue(window._save_settings(offer_apply=False))
+            saved = load_config(window.config_path)["camera"]
+            self.assertEqual((saved["profile"], saved["infrared"]), ("custom", True))
+
+        def hq(config):
+            config["camera"]["profile"] = "hq_reference"
+
+        with self.window(hq) as window:
+            self.assertTrue(window.settings_infrared.isChecked())
+            self.assertFalse(window.settings_infrared.isEnabled())
+
     def test_profile_settings_are_locked_until_switched_to_custom(self) -> None:
         def hq(config):
             config["camera"]["profile"] = "hq_reference"

@@ -29,6 +29,7 @@ Useful overrides:
 ./bbx live-monitor --rgb-width 1920 --rgb-height 1440 --display-fps 10
 ./bbx live-monitor --no-realsense
 ./bbx live-monitor --thermal --realsense
+./bbx live-monitor --no-noir
 ./bbx live-monitor --seconds 30
 ./bbx live-monitor --mock --seconds 10
 ```
@@ -54,9 +55,38 @@ gets no panel. `--thermal`, `--no-thermal`, `--realsense` and `--no-realsense`
 change this for one session. On a Pi with two RGB cameras, the monitor shows
 the camera that is selected in the GUI.
 
-The line under the RGB camera's picture also shows the sensor gain and white
-balance the camera is using. Those are the numbers to copy when fixing them
-on the Settings page (`docs/Frame_Processing.md`).
+The line under the RGB camera's picture also shows the tuning file the camera
+was opened with, then the sensor gain and white balance it is using. Those
+are the numbers to copy when fixing them on the Settings page
+(`docs/Frame_Processing.md`).
+
+## NoIR Tuning
+
+The monitor has its own NoIR switch, the **NoIR Tuning** button in the header
+(**N** toggles it, including in full screen).
+
+- **On** opens the camera with its NoIR tuning file, for a camera with no
+  infrared filter. **Off** opens it with its standard tuning.
+- The monitor opens with the switch where you last left it. Until you have
+  used it, it follows **Infrared light** on the Settings page
+  (`camera.infrared`).
+- `--noir` and `--no-noir` start it on or off for one session, without
+  changing what is remembered.
+- Switching it closes the camera and opens it again, which takes a few
+  seconds. A camera reads its tuning file only when it is opened.
+- It changes this monitor only. When it differs from the recording setting,
+  the note under the header says so.
+- It is remembered separately for each config file, so two cameras on one Pi
+  each keep their own. The choice is kept in
+  `~/.local/share/BumbleBox/live_monitor.json`, not in the config file;
+  deleting that file makes the switch follow Infrared light again.
+- The monitor uses the same file a recording would, although it opens the
+  camera at a smaller size.
+- If the config names a tuning file by hand (`camera.tuning_file`), that file
+  is used and the button is greyed out.
+- If the camera has no NoIR file, or cannot be opened with it, the line under
+  the picture says "standard tuning (NoIR tuning was not available for this
+  camera)".
 
 ## Full Screen
 
@@ -81,7 +111,8 @@ different windows:
 | **Contrast Boost** | This monitor, in the header | Brings out detail in dark and bright areas of the grayscale view | No; it is for looking only |
 | **Record in Grayscale** | Main window, top right of the **Run** page | Whether this camera's recordings are saved in grayscale (`camera.monochrome_output`) | Yes, straight away |
 
-The monitor only looks: it saves no images and changes no settings. You can
+The monitor only looks: it saves no images and changes no settings (it
+remembers its own NoIR Tuning switch, in a file of its own). You can
 look in grayscale and record in colour, or the other way round.
 
 - **Grayscale View** applies to the RGB camera and the RealSense color feed.

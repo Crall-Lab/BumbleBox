@@ -37,7 +37,6 @@ from .camera_profiles import (
     apply_camera_profile,
     camera_profile_choices,
     get_camera_profile,
-    validate_camera_ir_compatibility,
 )
 from .config import (
     DEFAULT_USER_CONFIG_PATH,
@@ -523,14 +522,6 @@ def _apply_camera_profile_override(
     return True
 
 
-def _check_camera_ir_compatibility_for_cli(config: dict) -> bool:
-    error = validate_camera_ir_compatibility(config)
-    if error:
-        print(f"Camera config error: {error}")
-        return False
-    return True
-
-
 def _apply_monochrome_output_override(
     config: dict,
     *,
@@ -827,8 +818,6 @@ def _cmd_camera_preview(args: argparse.Namespace) -> int:
         context_label="camera-preview",
     ):
         return 1
-    if not _check_camera_ir_compatibility_for_cli(config):
-        return 1
 
     try:
         result = run_camera_preview(
@@ -854,8 +843,6 @@ def _cmd_live_monitor(args: argparse.Namespace) -> int:
         print(f"Config error: {exc}")
         return 1
 
-    if not _check_camera_ir_compatibility_for_cli(config):
-        return 1
     if bool(args.mock):
         config.setdefault("runtime", {})["use_mock_camera"] = True
 
@@ -869,6 +856,9 @@ def _cmd_live_monitor(args: argparse.Namespace) -> int:
             duration_seconds=float(args.seconds),
             thermal_override=args.thermal,
             realsense_override=args.realsense,
+            noir_override=getattr(args, "noir", None),
+            # The simulated camera has no tuning, so it leaves the remembered choice alone.
+            remember_key=None if bool(args.mock) else str(config_path.expanduser().resolve()),
         )
         return launch_live_monitor(config, options)
     except Exception as exc:
@@ -905,7 +895,7 @@ def _cmd_camera_check(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(f"Camera check completed, but failed to write JSON report: {exc}")
             return 1
-    return 0 if result.ir_compatibility_error is None and result.connection_status == "ready" else 1
+    return 0 if result.connection_status == "ready" else 1
 
 
 def _format_camera_reset_result(result) -> str:
@@ -956,8 +946,6 @@ def _cmd_camera_test_tracking(args: argparse.Namespace) -> int:
         requested_profile=getattr(args, "camera_profile", None),
         context_label="camera-test-tracking",
     ):
-        return 1
-    if not _check_camera_ir_compatibility_for_cli(config):
         return 1
 
     box_preset = args.box_preset
@@ -1080,8 +1068,6 @@ def _cmd_tracking_compression_check(args: argparse.Namespace) -> int:
         requested_profile=getattr(args, "camera_profile", None),
         context_label="tracking-compression-check",
     ):
-        return 1
-    if not _check_camera_ir_compatibility_for_cli(config):
         return 1
 
     encoders = [item.strip() for item in str(args.encoders or "").split(",") if item.strip()] or None
@@ -1613,8 +1599,6 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
         requested_monochrome_output=getattr(args, "monochrome_output", None),
         context_label="run-once",
     ):
-        return 1
-    if not _check_camera_ir_compatibility_for_cli(config):
         return 1
     if not _apply_runtime_bool_override(
         config,
@@ -4716,6 +4700,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not open RealSense for this monitor session.",
     )
     live_monitor_parser.set_defaults(realsense=None)
+    noir_monitor_group = live_monitor_parser.add_mutually_exclusive_group()
+    noir_monitor_group.add_argument(
+        "--noir",
+        dest="noir",
+        action="store_true",
+        help="Start the monitor with NoIR camera tuning on, whatever camera.infrared says.",
+    )
+    noir_monitor_group.add_argument(
+        "--no-noir",
+        dest="noir",
+        action="store_false",
+        help="Start the monitor with NoIR camera tuning off, whatever camera.infrared says.",
+    )
+    live_monitor_parser.set_defaults(noir=None)
     live_monitor_parser.add_argument(
         "--mock",
         action="store_true",

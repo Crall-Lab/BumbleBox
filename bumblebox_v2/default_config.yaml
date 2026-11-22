@@ -48,6 +48,10 @@ camera:
   fps_target: 5.0
   shutter_us: 2500
   codec: "mp4"
+  # infrared: true opens the camera with its NoIR tuning file. Use it for a
+  #   NoIR camera, or an ordinary camera with its infrared filter taken off.
+  #   It does not depend on camera.model: the connected camera is asked which
+  #   sensor it is. tuning_file, when set, names a file by hand instead.
   infrared: true
   monochrome_output: false
   # Picture settings applied inside the camera (docs/Frame_Processing.md).
